@@ -650,6 +650,14 @@ def _build_safe_action_eligibility(incident: dict) -> dict | None:
         item for item in (incident.get("runtime_diagnostics") or [])
         if isinstance(item, dict)
     ]
+    resolved_pending_types = sorted(
+        {
+            str(item.get("request_type") or "").strip()
+            for item in runtime_diagnostics
+            if str(item.get("kind") or "").strip() == "resolved_pending_request"
+            and str(item.get("request_type") or "").strip()
+        }
+    )
     if runtime_diagnostics:
         has_resolved_pending_signal = any(
             str(item.get("kind") or "").strip() == "resolved_pending_request"
@@ -662,6 +670,15 @@ def _build_safe_action_eligibility(incident: dict) -> dict | None:
     has_pending_request_reference = bool(
         incident.get("pending_auth_request_id") or incident.get("pending_repair_request_id")
     )
+    pending_reference_types = sorted(
+        filter(
+            None,
+            [
+                "authorization" if incident.get("pending_auth_request_id") else "",
+                "repair" if incident.get("pending_repair_request_id") else "",
+            ],
+        )
+    )
 
     blocking_reasons: list[str] = []
     if not status_retryable:
@@ -670,6 +687,12 @@ def _build_safe_action_eligibility(incident: dict) -> dict | None:
         blocking_reasons.append("pending_request_reference_missing")
     if not has_resolved_pending_signal:
         blocking_reasons.append("resolved_pending_signal_missing")
+    if (
+        resolved_pending_types
+        and pending_reference_types
+        and not set(resolved_pending_types).intersection(pending_reference_types)
+    ):
+        blocking_reasons.append("pending_request_type_mismatch")
 
     return {
         "eligible": not blocking_reasons,
@@ -677,6 +700,8 @@ def _build_safe_action_eligibility(incident: dict) -> dict | None:
         "retryable_job_statuses": retryable_statuses,
         "has_resolved_pending_signal": has_resolved_pending_signal,
         "has_pending_request_reference": has_pending_request_reference,
+        "resolved_pending_types": resolved_pending_types,
+        "pending_reference_types": pending_reference_types,
         "blocking_reasons": blocking_reasons,
     }
 
@@ -805,6 +830,8 @@ def _build_safe_action_note(
                 blockers.append("no pending authorization/repair reference is still attached")
             if "resolved_pending_signal_missing" in (eligibility.get("blocking_reasons") or []):
                 blockers.append("no resolved pending-decision signal is present")
+            if "pending_request_type_mismatch" in (eligibility.get("blocking_reasons") or []):
+                blockers.append("the resolved decision type does not match the remaining pending request reference")
         blocker_text = "; ".join(blockers) if blockers else (
             f"the job is no longer in a retryable paused state ({job_status})"
         )

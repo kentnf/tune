@@ -508,6 +508,7 @@ function formatResumeRetryBlocker(code: string, t: (k: TranslationKey) => string
     job_status_not_retryable: 'tasks_supervisor_resume_retry_blocker_job_status_not_retryable',
     pending_request_reference_missing: 'tasks_supervisor_resume_retry_blocker_pending_reference_missing',
     resolved_pending_signal_missing: 'tasks_supervisor_resume_retry_blocker_resolved_signal_missing',
+    pending_request_type_mismatch: 'tasks_supervisor_resume_retry_blocker_pending_request_type_mismatch',
   }
   return t(keyMap[code] || 'tasks_supervisor_resume_retry_blocker_unknown')
 }
