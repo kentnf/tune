@@ -2318,6 +2318,24 @@ def _build_dossier_summary(dossier: dict) -> str:
     runtime_diagnostics = dossier.get("runtime_diagnostics") or []
     if runtime_diagnostics:
         fragments.append(f"runtime_diagnostics={len(runtime_diagnostics)}")
+    environment_failure = dossier.get("environment_failure") or {}
+    if environment_failure:
+        failure_kind = str(environment_failure.get("failure_kind") or "install_failed").strip()
+        fragments.append(f"env_failure={failure_kind}")
+        failed_packages = [
+            str(pkg).strip()
+            for pkg in (environment_failure.get("failed_packages") or [])
+            if str(pkg).strip()
+        ]
+        if failed_packages:
+            fragments.append(f"env_packages={len(failed_packages)}")
+        implicated_steps = [
+            item
+            for item in (environment_failure.get("implicated_steps") or [])
+            if isinstance(item, dict)
+        ]
+        if implicated_steps:
+            fragments.append(f"env_steps={len(implicated_steps)}")
     pending_requests = dossier.get("pending_requests") or {}
     if pending_requests.get("active_type"):
         fragments.append(f"pending={pending_requests.get('active_type')}")
@@ -2513,6 +2531,9 @@ async def _build_job_dossier(
         _collect_impacted_step_keys(getattr(job, "expanded_dag_json", None), anchor_step_key)
         or _collect_impacted_step_keys(getattr(job, "resolved_plan_json", None), anchor_step_key)
     )
+    environment_failure = _extract_environment_failure_signal(
+        {"runtime_diagnostics": effective.get("runtime_diagnostics") or []}
+    )
 
     dossier = {
         "job_id": job.id,
@@ -2545,6 +2566,7 @@ async def _build_job_dossier(
         ),
         "pending_interaction_payload": effective.get("pending_interaction_payload"),
         "runtime_diagnostics": effective.get("runtime_diagnostics") or [],
+        "environment_failure": environment_failure,
         "auto_recovery_events": auto_recovery_events,
         "similar_resolutions": similar_resolutions,
     }
