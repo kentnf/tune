@@ -578,6 +578,7 @@ function formatPrimaryLane(value: string | null | undefined, t: (k: TranslationK
     confirmation_gates: 'tasks_supervisor_lane_confirmation_gates',
     user_intervention: 'tasks_supervisor_lane_user_intervention',
     resource_readiness: 'tasks_supervisor_lane_resource_readiness',
+    environment_readiness: 'tasks_supervisor_lane_environment_readiness',
     runtime_recovery: 'tasks_supervisor_lane_runtime_recovery',
   }
   return t(keyMap[value || ''] || 'tasks_supervisor_lane_unknown') || humanizeFocusToken(value)
@@ -595,6 +596,7 @@ function formatNextBestMove(value: string | null | undefined, t: (k: Translation
     resolve_ambiguous_resource_candidates: 'tasks_supervisor_move_resolve_ambiguous_resource_candidates',
     refresh_stale_derived_resource: 'tasks_supervisor_move_refresh_stale_derived_resource',
     restore_missing_runtime_resource: 'tasks_supervisor_move_restore_missing_runtime_resource',
+    inspect_environment_failure: 'tasks_supervisor_move_inspect_environment_failure',
     apply_runtime_recovery: 'tasks_supervisor_move_apply_runtime_recovery',
   }
   return t(keyMap[value || ''] || 'tasks_supervisor_move_unknown') || humanizeFocusToken(value)

@@ -623,6 +623,162 @@ describe('TaskMonitor', () => {
     ).toBeInTheDocument()
   })
 
+  it('renders environment readiness focus summary and project playbook from supervisor review', async () => {
+    mockUseProjectTaskFeed.mockReturnValue({
+      jobs: [
+        {
+          id: 'job-env',
+          name: 'Prepare fastqc runtime',
+          status: 'queued',
+          goal: 'Run QC on apple RNA-seq data',
+          thread_id: 'thread-env',
+          created_at: '2026-03-27T10:00:00Z',
+        },
+      ],
+      attentionSummary: {
+        signal: 'warning',
+        count: 1,
+        counts: {
+          running: 0,
+          authorization: 0,
+          repair: 0,
+          confirmation: 0,
+          clarification: 0,
+          warning: 1,
+          needs_input: 0,
+          needs_review: 1,
+        },
+        needs_input: [],
+        needs_review: [
+          {
+            key: 'job-env:failed',
+            job_id: 'job-env',
+            job_name: 'Prepare fastqc runtime',
+            incident_type: 'failed',
+            reason: 'warning',
+            age_seconds: 120,
+            summary: 'Environment preparation failed.',
+            severity: 'warning',
+            owner: 'system',
+          },
+        ],
+        reminders: [],
+        auto_authorize_commands: false,
+      },
+      incidents: [
+        {
+          job_id: 'job-env',
+          job_name: 'Prepare fastqc runtime',
+          job_status: 'queued',
+          incident_type: 'failed',
+          severity: 'warning',
+          owner: 'system',
+          summary: 'Environment preparation failed.',
+          next_action: 'inspect_failure_and_retry',
+          age_seconds: 120,
+          thread_id: 'thread-env',
+        },
+      ],
+      incidentSummary: { total_open: 1, critical: 0, warning: 1, info: 0 },
+      overview: { total: 1, active: 1, by_status: { queued: 1 } },
+      eventVersion: 0,
+      totalCount: 1,
+      getJobsPage: () => [
+        {
+          id: 'job-env',
+          name: 'Prepare fastqc runtime',
+          status: 'queued',
+          goal: 'Run QC on apple RNA-seq data',
+          thread_id: 'thread-env',
+          created_at: '2026-03-27T10:00:00Z',
+        },
+      ],
+      getPageHasMore: () => false,
+      patchJob: vi.fn(),
+      locateJobPage: vi.fn().mockResolvedValue(1),
+      refreshJobPage: vi.fn().mockResolvedValue([
+        {
+          id: 'job-env',
+          name: 'Prepare fastqc runtime',
+          status: 'queued',
+          goal: 'Run QC on apple RNA-seq data',
+          thread_id: 'thread-env',
+          created_at: '2026-03-27T10:00:00Z',
+        },
+      ]),
+      refreshJobs: vi.fn().mockResolvedValue([]),
+      refreshAttentionSummary: vi.fn().mockResolvedValue(undefined),
+      refreshIncidents: vi.fn().mockResolvedValue(undefined),
+      refreshAll: vi.fn().mockResolvedValue(undefined),
+    })
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL) => {
+        const url = String(input)
+        if (url.includes('/api/jobs/supervisor-review?project=proj-1')) {
+          return Promise.resolve({
+            ok: true,
+            json: async () => ({
+              mode: 'heuristic',
+              generated_at: '2026-03-27T13:00:00Z',
+              overview: '1 open incident.',
+              supervisor_message: 'Inspect the environment preparation failure before retrying.',
+              focus_summary: {
+                primary_lane: 'environment_readiness',
+                top_owner: 'system',
+                top_incident_type: 'failed',
+                high_confidence_total: 0,
+                auto_recoverable_total: 0,
+                user_wait_total: 0,
+                next_best_operator_move: 'inspect_environment_failure',
+                lane_reason: 'Environment readiness is dominated by missing or mismatched runtime packages.',
+                next_best_operator_reason:
+                  'Inspect the failed package mapping, candidate aliases, and implicated step requirements for package(s) fastqc before retrying environment preparation.',
+              },
+              project_playbook: {
+                goal: 'environment_readiness',
+                next_move: 'inspect_environment_failure',
+                step_codes: ['open_task', 'inspect_environment_failure', 'recheck_task_state'],
+              },
+              recommendations: [
+                {
+                  priority: 1,
+                  job_id: 'job-env',
+                  job_name: 'Prepare fastqc runtime',
+                  incident_type: 'failed',
+                  severity: 'warning',
+                  owner: 'system',
+                  diagnosis: 'Environment preparation failed before execution could start.',
+                  immediate_action: 'inspect_failure_and_retry',
+                  why_now: 'QC cannot begin until the runtime packages are resolved.',
+                  rollback_target: 'runtime_environment',
+                },
+              ],
+              dossiers: [],
+            }),
+          })
+        }
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({}),
+        })
+      }),
+    )
+
+    renderTaskMonitor({
+      projectId: 'proj-1',
+      onOpenThread: vi.fn(),
+    })
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Supervisor Review' }))
+
+    expect(await screen.findByText(/lane=environment readiness/)).toBeInTheDocument()
+    expect(screen.getByText(/next=inspect environment failure/)).toBeInTheDocument()
+    expect(screen.getByText('Project Playbook')).toBeInTheDocument()
+    expect(screen.getByText('2. Next: inspect environment diagnostics, package mapping, and implicated steps.')).toBeInTheDocument()
+  })
+
   it('surfaces pending command authorization at the top of the task panel with a scrollable command box', async () => {
     const refreshAll = vi.fn().mockResolvedValue(undefined)
     const refreshJobPage = vi.fn().mockResolvedValue([
