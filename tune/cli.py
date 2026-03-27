@@ -14,6 +14,14 @@ from rich.prompt import Confirm, Prompt
 console = Console()
 
 
+def _require_config_input(workspace_root: str | None, analysis_dir: str | None) -> Path:
+    raw = workspace_root or analysis_dir
+    if not raw:
+        console.print("[red]Error:[/red] provide --workspace-root or --analysis-dir.")
+        sys.exit(1)
+    return Path(raw).expanduser().resolve()
+
+
 @click.group()
 def cli():
     """Tune — AI-powered bioinformatics analysis platform."""
@@ -25,11 +33,9 @@ def init():
     console.print("\n[bold cyan]Welcome to Tune[/bold cyan] — bioinformatics analysis platform\n")
 
     # --- directories ---
-    data_dir = Prompt.ask(
-        "Path to your [bold]data directory[/bold] (read-only, existing biological data)"
-    )
-    analysis_dir = Prompt.ask(
-        "Path to your [bold]analysis directory[/bold] (Tune will write outputs here)"
+    workspace_root = Prompt.ask(
+        "Path to your [bold]workspace root[/bold] (Tune will use data/ and workspace/ under this directory)",
+        default=str((Path.cwd() / "analysis").resolve()),
     )
 
     # --- database ---
@@ -80,7 +86,13 @@ def init():
     pixi_path = Prompt.ask("Path to pixi executable", default="pixi")
 
     # --- build and save config ---
-    from tune.core.config import ApiConfig, TuneConfig, save_config, validate_config
+    from tune.core.config import (
+        ApiConfig,
+        TuneConfig,
+        derive_workspace_dirs,
+        save_config,
+        validate_config,
+    )
 
     # Determine api_style from provider
     primary_api_style = "anthropic" if primary_provider == "anthropic" else "openai_compatible"
@@ -97,7 +109,13 @@ def init():
     llm_configs = [primary_cfg]
     active_id = primary_cfg.id
 
+    root_path = Path(workspace_root).expanduser().resolve()
+    data_dir, analysis_dir = derive_workspace_dirs(root_path)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+
     cfg_data = {
+        "workspace_root": str(root_path),
         "data_dir": data_dir,
         "analysis_dir": analysis_dir,
         "database_url": db_url,
@@ -120,20 +138,24 @@ def init():
         sys.exit(1)
 
     save_config(cfg)
-    console.print(f"\n[green]✓[/green] Config saved to {cfg.analysis_dir / '.tune' / 'config.yaml'}")
+    config_root = cfg.workspace_root or cfg.analysis_dir
+    console.print(f"\n[green]✓[/green] Config saved to {config_root / '.tune' / 'config.yaml'}")
+    console.print(f"[green]✓[/green] Data directory: {cfg.data_dir}")
+    console.print(f"[green]✓[/green] Analysis directory: {cfg.analysis_dir}")
     console.print("\nRun [bold]tune start[/bold] to launch the server.")
 
 
 @cli.command("sync-resource-entities")
-@click.option("--analysis-dir", required=True, help="Analysis directory (must match tune init)")
+@click.option("--workspace-root", default=None, help="Workspace root containing .tune/config.yaml")
+@click.option("--analysis-dir", default=None, help="Legacy config path (analysis/workspace or workspace root)")
 @click.option("--project-id", default=None, help="Sync only one project")
-def sync_resource_entities(analysis_dir: str, project_id: str | None):
+def sync_resource_entities(workspace_root: str | None, analysis_dir: str | None, project_id: str | None):
     """Backfill / reconcile resource entities for one project or all projects."""
     from tune.core.config import load_config, set_config
 
-    cfg_dir = Path(analysis_dir).expanduser().resolve()
+    cfg_input = _require_config_input(workspace_root, analysis_dir)
     try:
-        cfg = load_config(cfg_dir)
+        cfg = load_config(cfg_input)
     except FileNotFoundError as exc:
         console.print(f"[red]Error:[/red] {exc}")
         sys.exit(1)
@@ -179,17 +201,18 @@ def sync_resource_entities(analysis_dir: str, project_id: str | None):
 
 
 @cli.command()
-@click.option("--analysis-dir", required=True, help="Analysis directory (must match tune init)")
+@click.option("--workspace-root", default=None, help="Workspace root containing .tune/config.yaml")
+@click.option("--analysis-dir", default=None, help="Legacy config path (analysis/workspace or workspace root)")
 @click.option("--host", default="0.0.0.0", help="Bind host")
 @click.option("--port", default=8000, type=int, help="Bind port")
 @click.option("--reload", is_flag=True, default=False, help="Enable auto-reload (development)")
-def start(analysis_dir: str, host: str, port: int, reload: bool):
+def start(workspace_root: str | None, analysis_dir: str | None, host: str, port: int, reload: bool):
     """Start the Tune server (FastAPI + Procrastinate worker)."""
     from tune.core.config import load_config, set_config, validate_config
 
-    cfg_dir = Path(analysis_dir).expanduser().resolve()
+    cfg_input = _require_config_input(workspace_root, analysis_dir)
     try:
-        cfg = load_config(cfg_dir)
+        cfg = load_config(cfg_input)
     except FileNotFoundError as e:
         console.print(f"[red]Error:[/red] {e}")
         sys.exit(1)
@@ -204,7 +227,9 @@ def start(analysis_dir: str, host: str, port: int, reload: bool):
     set_config(cfg)
 
     # Export env var so uvicorn --reload child processes can re-load config without CLI
-    os.environ["TUNE_ANALYSIS_DIR"] = str(cfg_dir)
+    if cfg.workspace_root:
+        os.environ["TUNE_WORKSPACE_ROOT"] = str(cfg.workspace_root)
+    os.environ["TUNE_ANALYSIS_DIR"] = str(cfg_input)
 
     # Run Alembic migrations
     console.print("[cyan]Applying database migrations…[/cyan]")
@@ -249,4 +274,3 @@ async def _apply_procrastinate_schema(db_url: str):
                     raise
     finally:
         await pool.close()
-

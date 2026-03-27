@@ -7,7 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 usage() {
   cat <<'EOF'
 Usage:
-  bash scripts/dev.sh [--analysis-dir PATH] [--host HOST] [--backend-port PORT] [--frontend-port PORT]
+  bash scripts/dev.sh [--workspace-root PATH] [--analysis-dir PATH] [--host HOST] [--backend-port PORT] [--frontend-port PORT]
 
 Behavior:
   - Always performs a full development restart.
@@ -15,6 +15,7 @@ Behavior:
   - Restarts backend with --reload and frontend with Vite hot reload.
 
 Examples:
+  bash scripts/dev.sh --workspace-root analysis
   bash scripts/dev.sh --analysis-dir analysis/workspace
   bash scripts/dev.sh
 EOF

@@ -21,13 +21,15 @@ Usage:
   bash scripts/service.sh <start|stop|restart|status> [all|backend|frontend] [options]
 
 Examples:
+  bash scripts/service.sh start --workspace-root analysis
   bash scripts/service.sh start --analysis-dir analysis/workspace
   bash scripts/service.sh restart
   bash scripts/service.sh stop frontend
   bash scripts/service.sh status
 
 Options:
-  --analysis-dir PATH   Analysis directory used by the backend.
+  --workspace-root PATH Workspace root containing data/, workspace/, and .tune/config.yaml
+  --analysis-dir PATH   Legacy config path; also accepts the workspace root for compatibility.
   --host HOST           Host for backend and frontend. Default: 0.0.0.0
   --backend-port PORT   Backend port. Default: 8000
   --frontend-port PORT  Frontend port. Default: 5173
@@ -159,7 +161,7 @@ component_selected() {
 
 require_backend_analysis_dir() {
   if [[ -z "$ANALYSIS_DIR" ]]; then
-    echo "Backend start requires --analysis-dir, or a previously saved value in .run/service.env." >&2
+    echo "Backend start requires --workspace-root/--analysis-dir, or a previously saved value in .run/service.env." >&2
     exit 1
   fi
 }
@@ -620,6 +622,11 @@ RELOAD=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --workspace-root)
+      [[ $# -ge 2 ]] || { echo "Missing value for --workspace-root" >&2; exit 1; }
+      ANALYSIS_DIR="$2"
+      shift 2
+      ;;
     --analysis-dir)
       [[ $# -ge 2 ]] || { echo "Missing value for --analysis-dir" >&2; exit 1; }
       ANALYSIS_DIR="$2"

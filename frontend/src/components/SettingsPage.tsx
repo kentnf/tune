@@ -5,6 +5,7 @@ import type { SystemHealth } from '../hooks/useSystemHealth'
 import ApiConfigList from './settings/ApiConfigList'
 
 interface Config {
+  workspace_root: string | null
   data_dir: string
   analysis_dir: string
   pixi_path: string
@@ -84,9 +85,17 @@ function FieldRow({
 const inputCls = 'w-full bg-surface-overlay border border-border-subtle rounded-lg px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-1 focus:ring-accent placeholder-text-muted'
 const selectCls = 'w-full bg-surface-overlay border border-border-subtle rounded-lg px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-1 focus:ring-accent'
 
+function joinWorkspacePath(root: string, child: string): string {
+  const trimmed = root.trim()
+  if (!trimmed) return ''
+  const normalized = trimmed.replace(/[\\/]+$/, '')
+  return `${normalized}/${child}`
+}
+
 export default function SettingsPage() {
   const { t } = useLanguage()
   const [config, setConfig] = useState<Config | null>(null)
+  const [workspaceRoot, setWorkspaceRoot] = useState('')
   const [dataDir, setDataDir] = useState('')
   const [analysisDir, setAnalysisDir] = useState('')
   const [pixiPath, setPixiPath] = useState('')
@@ -108,6 +117,7 @@ export default function SettingsPage() {
       .then((r) => r.json())
       .then((cfg: Config) => {
         setConfig(cfg)
+        setWorkspaceRoot(cfg.workspace_root || '')
         setDataDir(cfg.data_dir)
         setAnalysisDir(cfg.analysis_dir)
         setPixiPath(cfg.pixi_path)
@@ -130,12 +140,21 @@ export default function SettingsPage() {
   const saveWorkspace = async () => {
     setWorkspaceState('saving')
     try {
+      const body = workspaceRoot.trim()
+        ? { workspace_root: workspaceRoot.trim() }
+        : { data_dir: dataDir, analysis_dir: analysisDir }
       const res = await fetch('/api/config/', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ data_dir: dataDir, analysis_dir: analysisDir }),
+        body: JSON.stringify(body),
       }).then((r) => r.json())
       if (res.ok) {
+        setConfig((prev) => (prev ? {
+          ...prev,
+          workspace_root: workspaceRoot.trim() || null,
+          data_dir: dataDir,
+          analysis_dir: analysisDir,
+        } : prev))
         setWorkspaceState('saved')
         setTimeout(() => setWorkspaceState('idle'), 2000)
       } else {
@@ -207,11 +226,26 @@ export default function SettingsPage() {
         saveState={workspaceState}
         onSave={saveWorkspace}
       >
+        <FieldRow label={t('settings_workspace_root')}>
+          <DirectoryPicker
+            label=""
+            value={workspaceRoot}
+            onChange={(path) => {
+              setWorkspaceRoot(path)
+              setDataDir(joinWorkspacePath(path, 'data'))
+              setAnalysisDir(joinWorkspacePath(path, 'workspace'))
+            }}
+          />
+        </FieldRow>
         <FieldRow label={t('settings_data_dir')}>
-          <DirectoryPicker label="" value={dataDir} onChange={setDataDir} />
+          <div className="bg-surface-overlay rounded p-3 text-sm text-white font-mono break-all">
+            {dataDir || <span className="text-text-muted">—</span>}
+          </div>
         </FieldRow>
         <FieldRow label={t('settings_analysis_dir')}>
-          <DirectoryPicker label="" value={analysisDir} onChange={setAnalysisDir} />
+          <div className="bg-surface-overlay rounded p-3 text-sm text-white font-mono break-all">
+            {analysisDir || <span className="text-text-muted">—</span>}
+          </div>
         </FieldRow>
       </SettingSection>
 

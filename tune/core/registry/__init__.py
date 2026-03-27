@@ -37,9 +37,14 @@ def _bind_exports(steps_module) -> None:
 
 
 def _resolve_runtime_analysis_dir() -> Path | None:
-    analysis_dir_env = os.environ.get("TUNE_ANALYSIS_DIR")
-    if analysis_dir_env:
-        return Path(analysis_dir_env).expanduser().resolve()
+    try:
+        from tune.core.config import resolve_runtime_analysis_dir_from_env
+
+        resolved = resolve_runtime_analysis_dir_from_env()
+        if resolved is not None:
+            return resolved
+    except Exception:
+        pass
     try:
         from tune.core.config import get_config
         return get_config().analysis_dir

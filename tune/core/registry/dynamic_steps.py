@@ -17,11 +17,14 @@ _SAFE_NAME_RE = re.compile(r"[^a-zA-Z0-9_.-]+")
 
 
 def _resolve_analysis_dir() -> Path | None:
-    import os
+    try:
+        from tune.core.config import resolve_runtime_analysis_dir_from_env
 
-    analysis_dir_env = os.environ.get("TUNE_ANALYSIS_DIR")
-    if analysis_dir_env:
-        return Path(analysis_dir_env).expanduser().resolve()
+        resolved = resolve_runtime_analysis_dir_from_env()
+        if resolved is not None:
+            return resolved
+    except Exception:
+        pass
     try:
         from tune.core.config import get_config
 

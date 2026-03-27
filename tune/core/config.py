@@ -57,6 +57,7 @@ class ApiConfig(BaseModel):
 
 
 class TuneConfig(BaseModel):
+    workspace_root: Optional[Path] = None
     data_dir: Path
     analysis_dir: Path
     llm_configs: list[ApiConfig] = []
@@ -67,9 +68,11 @@ class TuneConfig(BaseModel):
     host: str = "0.0.0.0"
     port: int = 8000
 
-    @field_validator("data_dir", "analysis_dir", mode="before")
+    @field_validator("workspace_root", "data_dir", "analysis_dir", mode="before")
     @classmethod
     def expand_path(cls, v):
+        if v is None or v == "":
+            return None
         return Path(v).expanduser().resolve()
 
     @model_validator(mode="after")
@@ -78,6 +81,20 @@ class TuneConfig(BaseModel):
             raise ValueError("data_dir and analysis_dir must be different paths")
         if str(self.analysis_dir).startswith(str(self.data_dir) + os.sep):
             raise ValueError("analysis_dir must not be inside data_dir")
+        inferred_root = self.workspace_root
+        if inferred_root is None and self.data_dir.parent == self.analysis_dir.parent:
+            expected_data, expected_analysis = derive_workspace_dirs(self.data_dir.parent)
+            if self.data_dir == expected_data and self.analysis_dir == expected_analysis:
+                inferred_root = self.data_dir.parent
+
+        if inferred_root is not None:
+            expected_data, expected_analysis = derive_workspace_dirs(inferred_root)
+            if self.data_dir != expected_data or self.analysis_dir != expected_analysis:
+                raise ValueError(
+                    "workspace_root requires data_dir=<workspace_root>/data and "
+                    "analysis_dir=<workspace_root>/workspace"
+                )
+            self.workspace_root = inferred_root
         return self
 
     @property
@@ -140,12 +157,31 @@ def _migrate_legacy_llm_config(data: dict) -> dict:
     return data
 
 
-def _config_path(analysis_dir: Path) -> Path:
-    return analysis_dir / ".tune" / "config.yaml"
+def derive_workspace_dirs(workspace_root: Path) -> tuple[Path, Path]:
+    root = Path(workspace_root).expanduser().resolve()
+    return root / "data", root / "workspace"
 
 
-def load_config(analysis_dir: Path) -> TuneConfig:
-    path = _config_path(analysis_dir)
+def _config_path(config_root: Path) -> Path:
+    return config_root / ".tune" / "config.yaml"
+
+
+def _resolve_config_path(path: Path) -> Path:
+    resolved = Path(path).expanduser().resolve()
+    direct = _config_path(resolved)
+    if direct.exists():
+        return direct
+
+    legacy_workspace = resolved / "workspace"
+    legacy = _config_path(legacy_workspace)
+    if legacy.exists():
+        return legacy
+
+    return direct
+
+
+def load_config(config_root_or_analysis_dir: Path) -> TuneConfig:
+    path = _resolve_config_path(config_root_or_analysis_dir)
     if not path.exists():
         raise FileNotFoundError(f"Config not found at {path}. Run 'tune init' first.")
     with open(path) as f:
@@ -159,7 +195,8 @@ def load_config(analysis_dir: Path) -> TuneConfig:
 
 
 def save_config(cfg: TuneConfig) -> None:
-    path = _config_path(cfg.analysis_dir)
+    config_root = cfg.workspace_root or cfg.analysis_dir
+    path = _config_path(config_root)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
         yaml.safe_dump(cfg.model_dump(mode="json"), f, default_flow_style=False)
@@ -174,13 +211,28 @@ def set_config(cfg: TuneConfig) -> None:
     _runtime_config = cfg
 
 
+def resolve_runtime_analysis_dir_from_env() -> Path | None:
+    for env_name in ("TUNE_WORKSPACE_ROOT", "TUNE_ANALYSIS_DIR"):
+        raw = os.environ.get(env_name)
+        if not raw:
+            continue
+        raw_path = Path(raw).expanduser().resolve()
+        try:
+            return load_config(raw_path).analysis_dir
+        except Exception:
+            if env_name == "TUNE_WORKSPACE_ROOT":
+                return derive_workspace_dirs(raw_path)[1]
+            return raw_path
+    return None
+
+
 def get_config() -> TuneConfig:
     global _runtime_config
     if _runtime_config is None:
-        # Fallback: load from env var set by CLI (supports uvicorn --reload child processes)
-        analysis_dir_env = os.environ.get("TUNE_ANALYSIS_DIR")
-        if analysis_dir_env:
-            _runtime_config = load_config(Path(analysis_dir_env))
+        # Fallback: load from env vars set by CLI (supports uvicorn --reload child processes)
+        config_input = os.environ.get("TUNE_WORKSPACE_ROOT") or os.environ.get("TUNE_ANALYSIS_DIR")
+        if config_input:
+            _runtime_config = load_config(Path(config_input))
         else:
             raise RuntimeError("Config not loaded. Start the server with 'tune start'.")
     return _runtime_config
