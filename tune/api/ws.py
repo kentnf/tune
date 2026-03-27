@@ -1522,15 +1522,23 @@ async def _handle_confirm_plan(websocket: WebSocket, msg: dict, state: dict) -> 
             materialize_job_execution_plan,
             summarize_expanded_dag_for_confirmation,
         )
+        from tune.core.registry.spec_generation import augment_plan_with_dynamic_specs
         from tune.core.workflow import transition_job
+
+        plan, dynamic_issues = await augment_plan_with_dynamic_specs(
+            plan,
+            context_hint=f"Goal: {goal}\nProject ID: {project_id or ''}",
+        )
+        if dynamic_issues:
+            raise RuntimeError("; ".join(dynamic_issues))
 
         async with get_session_factory()() as session:
             project_name = "default"
-            if project_id:
+            if project_id and hasattr(session, "execute"):
                 project = (
                     await session.execute(select(Project).where(Project.id == project_id))
                 ).scalar_one_or_none()
-                if project:
+                if project and getattr(project, "name", None):
                     project_name = project.name
             job = None
             if existing_job_id:
@@ -1539,11 +1547,11 @@ async def _handle_confirm_plan(websocket: WebSocket, msg: dict, state: dict) -> 
                         select(AnalysisJob).where(AnalysisJob.id == existing_job_id)
                     )
                 ).scalar_one_or_none()
-                if job and job.project_id and not project_id:
+                if job and job.project_id and not project_id and hasattr(session, "execute"):
                     project = (
                         await session.execute(select(Project).where(Project.id == job.project_id))
                     ).scalar_one_or_none()
-                    if project:
+                    if project and getattr(project, "name", None):
                         project_name = project.name
             if job is None:
                 created_at = datetime.now(tz=timezone.utc)

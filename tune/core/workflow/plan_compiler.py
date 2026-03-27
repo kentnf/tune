@@ -220,6 +220,7 @@ def _compile_step(step: dict) -> dict:
     defn = get_step_type(step.get("step_type", ""))
 
     compiled = dict(step)
+    compiled.pop("dynamic_spec", None)
 
     # Ensure all expected fields are present
     compiled.setdefault("depends_on", [])

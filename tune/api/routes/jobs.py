@@ -9,6 +9,7 @@ import uuid
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from fastapi.responses import FileResponse
@@ -34,6 +35,14 @@ _WATCHDOG_AUTO_NORMALIZED_RE = re.compile(
     r"\(status=(?P<resulting_status>[^,]+), pending=(?P<pending_types>[^)]+)\)\.$"
 )
 _RUN_DIR_NAME_RE = re.compile(r"^\d{8}_\d{6}_.+")
+_PIXI_INSTALL_ERROR_RE = re.compile(
+    r"Pixi install failed for package\(s\) \[(?P<packages>[^\]]*)\](?:: (?P<detail>.*))?$",
+    re.IGNORECASE,
+)
+_PIXI_MISSING_PACKAGE_RE = re.compile(
+    r"PackagesNotFoundError|No package named|Could not find package|No candidates were found for",
+    re.IGNORECASE,
+)
 
 
 class JobCreate(BaseModel):
@@ -175,6 +184,99 @@ def _delete_job_output_dirs(output_dirs: list[Path], analysis_dir: Path) -> list
     return deleted
 
 
+def _build_environment_failure_diagnostic(job: AnalysisJob) -> dict | None:
+    from tune.core.env_planner.planner import candidate_package_specs, build_env_spec, normalize_package_spec
+
+    env_status = str(getattr(job, "env_status", "") or "").strip().lower()
+    if env_status != "failed":
+        return None
+
+    raw_error = str(getattr(job, "error_message", "") or "").strip()
+    failed_packages: list[str] = []
+    detail = raw_error
+    match = _PIXI_INSTALL_ERROR_RE.match(raw_error)
+    if match:
+        failed_packages = [
+            item.strip()
+            for item in str(match.group("packages") or "").split(",")
+            if item.strip()
+        ]
+        parsed_detail = str(match.group("detail") or "").strip()
+        if parsed_detail:
+            detail = parsed_detail
+
+    combined_text = "\n".join(item for item in [raw_error, detail] if item).strip()
+    failure_kind = "missing_package" if _PIXI_MISSING_PACKAGE_RE.search(combined_text) else "install_failed"
+    retryable = failure_kind == "missing_package"
+    package_candidates: dict[str, list[str]] = {}
+    if failure_kind == "missing_package":
+        for package in failed_packages:
+            candidates = [
+                candidate
+                for candidate in candidate_package_specs(package)
+                if str(candidate).strip()
+            ]
+            if candidates:
+                package_candidates[package] = candidates
+    implicated_steps: list[dict[str, Any]] = []
+    plan_steps = extract_plan_steps(getattr(job, "resolved_plan_json", None) or getattr(job, "plan", None))
+    if plan_steps and failed_packages:
+        try:
+            env_spec = build_env_spec(plan_steps)
+            step_meta = {
+                str(step.get("step_key") or ""): {
+                    "step_type": str(step.get("step_type") or "").strip() or None,
+                    "display_name": str(
+                        step.get("display_name")
+                        or step.get("name")
+                        or step.get("step_key")
+                        or step.get("step_type")
+                        or ""
+                    ).strip() or None,
+                }
+                for step in plan_steps
+                if str(step.get("step_key") or "").strip()
+            }
+            for step_key, packages in (env_spec.step_package_map or {}).items():
+                matched_failed: list[str] = []
+                for failed_package in failed_packages:
+                    normalized_failed = normalize_package_spec(failed_package)
+                    candidate_set = set(package_candidates.get(failed_package) or candidate_package_specs(failed_package))
+                    candidate_set.add(normalized_failed)
+                    if any(pkg in candidate_set for pkg in (packages or [])):
+                        matched_failed.append(failed_package)
+                if matched_failed:
+                    meta = step_meta.get(step_key, {})
+                    implicated_steps.append(
+                        {
+                            "step_key": step_key,
+                            "step_type": meta.get("step_type"),
+                            "display_name": meta.get("display_name"),
+                            "packages": list(packages or []),
+                            "matched_failed_packages": matched_failed,
+                        }
+                    )
+        except Exception:
+            log.exception("Failed to infer implicated steps for environment preparation failure")
+
+    diagnostic = {
+        "kind": "environment_prepare_failed",
+        "env_status": env_status,
+        "stage": "pixi_install",
+        "failure_kind": failure_kind,
+        "retryable": retryable,
+        "failed_packages": failed_packages,
+        "detail": detail or "Pixi environment preparation failed.",
+    }
+    if package_candidates:
+        diagnostic["package_candidates"] = package_candidates
+    if implicated_steps:
+        diagnostic["implicated_steps"] = implicated_steps
+    if raw_error:
+        diagnostic["error_message"] = raw_error
+    return diagnostic
+
+
 async def _get_effective_job_state(session: AsyncSession, job: AnalysisJob) -> dict:
     from tune.core.models import CommandAuthorizationRequest, RepairRequest
 
@@ -183,6 +285,10 @@ async def _get_effective_job_state(session: AsyncSession, job: AnalysisJob) -> d
     pending_type = job.pending_interaction_type
     pending_payload = job.pending_interaction_payload_json
     runtime_diagnostics: list[dict] = []
+
+    environment_failure = _build_environment_failure_diagnostic(job)
+    if environment_failure is not None:
+        runtime_diagnostics.append(environment_failure)
 
     if job.status == "awaiting_plan_confirmation":
         execution_summary = _serialize_execution_plan(job)["summary"]
@@ -428,8 +534,77 @@ def _recommendation_fields_from_incident(incident: dict) -> tuple[str, str, str]
         "interrupted": "The job stopped before reaching a terminal state and should be resumed from persisted state.",
         "failed": "The job exited in a failed state and needs diagnosis before retry.",
     }.get(incident["incident_type"], incident["summary"])
+    if incident.get("incident_type") == "failed":
+        env_failure = _extract_environment_failure_signal(incident)
+        if env_failure is not None:
+            stage = str(env_failure.get("stage") or "environment preparation").strip()
+            failed_packages = [
+                str(pkg).strip()
+                for pkg in (env_failure.get("failed_packages") or [])
+                if str(pkg).strip()
+            ]
+            package_text = ", ".join(failed_packages)
+            failure_kind = str(env_failure.get("failure_kind") or "").strip()
+            package_candidates = {
+                str(package).strip(): [
+                    str(candidate).strip()
+                    for candidate in candidates
+                    if str(candidate).strip()
+                ]
+                for package, candidates in (env_failure.get("package_candidates") or {}).items()
+                if str(package).strip()
+            }
+            implicated_steps = [
+                item
+                for item in (env_failure.get("implicated_steps") or [])
+                if isinstance(item, dict)
+            ]
+            if failure_kind == "missing_package" and package_text:
+                candidate_fragments = []
+                for package, candidates in package_candidates.items():
+                    alternatives = [candidate for candidate in candidates if candidate != package]
+                    if alternatives:
+                        candidate_fragments.append(f"{package} -> {', '.join(alternatives[:2])}")
+                candidate_note = (
+                    f" Suggested package candidates: {'; '.join(candidate_fragments)}."
+                    if candidate_fragments else ""
+                )
+                implicated_note = ""
+                if implicated_steps:
+                    implicated_labels = [
+                        str(item.get("display_name") or item.get("step_key") or "").strip()
+                        for item in implicated_steps[:3]
+                        if str(item.get("display_name") or item.get("step_key") or "").strip()
+                    ]
+                    if implicated_labels:
+                        implicated_note = f" Check these step definitions first: {', '.join(implicated_labels)}."
+                diagnosis = (
+                    f"Environment preparation failed during {stage} because Pixi could not resolve "
+                    f"required package(s) [{package_text}] before execution started. Check step-to-package "
+                    f"mapping and dynamic spec pixi_packages.{implicated_note}{candidate_note}"
+                )
+            elif failure_kind == "missing_package":
+                diagnosis = (
+                    f"Environment preparation failed during {stage} because Pixi could not resolve "
+                    "a required package before execution started. Check step-to-package mapping and dynamic "
+                    "spec pixi_packages."
+                )
+            else:
+                diagnosis = (
+                    f"Environment preparation failed during {stage} before execution started, "
+                    "and the installer error needs manual diagnosis before retry."
+                )
     rollback_level = _infer_rollback_level(incident["incident_type"])
     return rollback_target, rollback_level, diagnosis
+
+
+def _extract_environment_failure_signal(incident: dict) -> dict | None:
+    for item in (incident.get("runtime_diagnostics") or []):
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("kind") or "").strip() == "environment_prepare_failed":
+            return item
+    return None
 
 
 def _build_safe_action_eligibility(incident: dict) -> dict | None:
@@ -498,6 +673,11 @@ def _infer_safe_supervisor_action(incident: dict, rollback_level: str) -> str | 
     if incident.get("owner") != "system":
         return None
     if rollback_level != "step":
+        return None
+    if (
+        incident.get("incident_type") == "failed"
+        and _extract_environment_failure_signal(incident) is not None
+    ):
         return None
     if incident.get("incident_type") in {"failed", "binding_required", "interrupted"}:
         return "step_reenter"
@@ -583,6 +763,7 @@ def _build_safe_action_note(
     incident_type = str(incident.get("incident_type") or "").strip()
     job_status = str(incident.get("job_status") or "unknown").strip() or "unknown"
     eligibility = _build_safe_action_eligibility(incident)
+    env_failure = _extract_environment_failure_signal(incident)
 
     if incident_type == "resume_failed" and safe_action == "retry_resume_chain":
         return (
@@ -614,6 +795,36 @@ def _build_safe_action_note(
         return (
             f"{safe_action} remains operator-triggered because it can affect execution state at rollback level "
             f"{rollback_level}."
+        )
+    if incident_type == "failed" and env_failure is not None:
+        failure_kind = str(env_failure.get("failure_kind") or "").strip()
+        package_candidates = {
+            str(package).strip(): [
+                str(candidate).strip()
+                for candidate in candidates
+                if str(candidate).strip()
+            ]
+            for package, candidates in (env_failure.get("package_candidates") or {}).items()
+            if str(package).strip()
+        }
+        if bool(env_failure.get("retryable")) and failure_kind == "missing_package":
+            candidate_fragments = []
+            for package, candidates in package_candidates.items():
+                alternatives = [candidate for candidate in candidates if candidate != package]
+                if alternatives:
+                    candidate_fragments.append(f"{package} -> {', '.join(alternatives[:3])}")
+            if candidate_fragments:
+                candidate_note = " Suggested package candidates: " + "; ".join(candidate_fragments) + "."
+            else:
+                candidate_note = ""
+            return (
+                "This environment failure looks retryable after correcting package resolution, step-to-package "
+                "mapping, or dynamic spec pixi_packages, but no safe automatic environment repair is enabled yet."
+                f"{candidate_note}"
+            )
+        return (
+            "This environment failure occurred before execution started and still requires manual environment "
+            "diagnosis before retry."
         )
     return None
 
@@ -1813,6 +2024,7 @@ def _build_job_timeline(
     repair_requests: list[dict] | None = None,
     step_runs: list[dict] | None = None,
     artifacts: list[dict] | None = None,
+    runtime_diagnostics: list[dict] | None = None,
 ) -> list[dict]:
     events: list[dict] = []
     step_display_by_key = {
@@ -1949,6 +2161,38 @@ def _build_job_timeline(
                 "category": "result",
                 "result_kind": _artifact_result_kind(path),
                 "title": _artifact_timeline_title(path),
+                "detail": detail,
+            }
+        )
+
+    for item in runtime_diagnostics or []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("kind") or "").strip() != "environment_prepare_failed":
+            continue
+        detail_parts: list[str] = []
+        stage = str(item.get("stage") or "").strip()
+        if stage:
+            detail_parts.append(f"stage={stage}")
+        failed_packages = [
+            str(pkg).strip()
+            for pkg in (item.get("failed_packages") or [])
+            if str(pkg).strip()
+        ]
+        if failed_packages:
+            detail_parts.append("packages=" + ",".join(failed_packages))
+        detail = " · ".join(detail_parts) or (
+            str(item.get("detail") or "").strip()
+            or str(item.get("error_message") or "").strip()
+            or None
+        )
+        events.append(
+            {
+                "ts": item.get("detected_at") or item.get("ts") or getattr(job, "ended_at", None) or getattr(job, "updated_at", None),
+                "kind": "runtime_diagnostic",
+                "source": "runtime_diagnostic",
+                "category": "recovery",
+                "title": "Environment preparation failed",
                 "detail": detail,
             }
         )
@@ -2359,6 +2603,16 @@ def _derive_job_incident(
             f"Resolved {pending_request_types or 'pending request'} is still attached to the job, so the worker may need manual resume or cleanup."
         )
         next_action = "inspect_resume_chain"
+    elif any(item.get("kind") == "environment_prepare_failed" for item in runtime_diagnostics):
+        env_failure = next(
+            item for item in runtime_diagnostics if item.get("kind") == "environment_prepare_failed"
+        )
+        incident_type = "failed"
+        severity = "critical"
+        owner = "system"
+        summary = "Environment preparation failed before execution could start."
+        detail = str(env_failure.get("error_message") or env_failure.get("detail") or summary)
+        next_action = "inspect_failure_and_retry"
 
     if incident_type == "resume_failed":
         pass
@@ -2989,7 +3243,7 @@ async def submit_job(body: JobCreate, session: AsyncSession = Depends(get_sessio
         project = (
             await session.execute(select(Project).where(Project.id == body.project_id))
         ).scalar_one_or_none()
-        if project:
+        if project and getattr(project, "name", None):
             project_name = project.name
 
     if body.thread_id:
@@ -3245,6 +3499,7 @@ async def get_job(job_id: str, session: AsyncSession = Depends(get_session)):
             repair_requests=repair_requests,
             step_runs=step_runs,
             artifacts=artifacts,
+            runtime_diagnostics=effective.get("runtime_diagnostics") or [],
         ),
     }
 
@@ -3646,6 +3901,7 @@ async def supervisor_revalidate_abstract_plan(
     from tune.core.models import UserDecision
     from tune.core.orchestration import replace_plan_steps
     from tune.core.resources.planner_adapter import enforce_planner_constraints
+    from tune.core.registry.spec_generation import augment_plan_with_dynamic_specs
     from tune.core.workflow.plan_compiler import compile_plan
     from tune.api.ws import sync_supervisor_thread_state
 
@@ -3665,6 +3921,20 @@ async def supervisor_revalidate_abstract_plan(
 
     draft_payload = j.plan_draft_json or j.resolved_plan_json or j.plan
     current_steps = extract_plan_steps(draft_payload)
+    current_steps, dynamic_issues = await augment_plan_with_dynamic_specs(
+        current_steps,
+        context_hint=(
+            f"Goal: {getattr(j, 'goal', '') or ''}\n"
+            f"Project ID: {getattr(j, 'project_id', '') or ''}"
+        ),
+    )
+    if dynamic_issues:
+        return {
+            "ok": False,
+            "status": j.status,
+            "rollback_level": rollback_level,
+            "issues": dynamic_issues,
+        }
     compile_result = compile_plan(current_steps)
     if not compile_result.ok:
         return {
@@ -4113,6 +4383,7 @@ async def confirm_plan(
     from tune.core.context.builder import PlannerContextBuilder
     from tune.core.context.models import ContextScope
     from tune.core.resources.planner_adapter import enforce_planner_constraints
+    from tune.core.registry.spec_generation import augment_plan_with_dynamic_specs
     from tune.core.workflow.plan_compiler import compile_plan
 
     j = (await session.execute(select(AnalysisJob).where(AnalysisJob.id == job_id))).scalar_one_or_none()
@@ -4141,6 +4412,27 @@ async def confirm_plan(
     # First confirmation: validate abstract plan and materialize execution objects.
     draft = j.plan_draft_json or j.plan
     current_steps = draft.get("steps", []) if isinstance(draft, dict) else list(draft or [])
+    current_steps, dynamic_issues = await augment_plan_with_dynamic_specs(
+        current_steps,
+        context_hint=(
+            f"Goal: {getattr(j, 'goal', '') or ''}\n"
+            f"Project ID: {getattr(j, 'project_id', '') or ''}"
+        ),
+    )
+    if dynamic_issues:
+        return {
+            "ok": False,
+            "requires_confirmation": False,
+            "issues": [
+                {
+                    "kind": "dynamic_step_spec_error",
+                    "title": "Dynamic step generation failed",
+                    "description": error,
+                    "suggestion": "Revise the plan or use a built-in step type.",
+                }
+                for error in dynamic_issues
+            ],
+        }
     compile_result = compile_plan(current_steps)
     if not compile_result.ok:
         return {
@@ -4480,6 +4772,7 @@ async def get_bindings(
                 repair_requests=repair_requests,
                 step_runs=step_runs,
                 artifacts=artifacts,
+                runtime_diagnostics=effective.get("runtime_diagnostics") or [],
             ),
             "confirmation_phase": confirmation["confirmation_phase"],
             "confirmation_plan": confirmation["confirmation_plan"],
@@ -4541,6 +4834,7 @@ async def get_bindings(
             repair_requests=repair_requests,
             step_runs=step_runs,
             artifacts=artifacts,
+            runtime_diagnostics=effective.get("runtime_diagnostics") or [],
         ),
         "confirmation_phase": confirmation["confirmation_phase"],
         "confirmation_plan": confirmation["confirmation_plan"],

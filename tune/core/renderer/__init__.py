@@ -19,6 +19,7 @@ import os
 import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 
 @dataclass
@@ -79,6 +80,104 @@ def _stage_gzip_file(
 def _stage_gzip_annotation(annotation_path: str, output_dir: str) -> tuple[str, str] | None:
     """Return (prepare_cmd, staged_path) when a gzipped annotation must be unpacked."""
     return _stage_gzip_file(annotation_path, output_dir, "annotation.gtf")
+
+
+def _stringify_template_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (list, tuple, set)):
+        return " ".join(_stringify_template_value(item) for item in value)
+    return str(value)
+
+
+def _shell_quote_template_value(value: Any) -> str:
+    if isinstance(value, (list, tuple, set)):
+        return " ".join(shlex.quote(_stringify_template_value(item)) for item in value)
+    return shlex.quote(_stringify_template_value(value))
+
+
+def _format_template(template: str, context: dict[str, str], label: str) -> str:
+    try:
+        return template.format_map(context)
+    except KeyError as exc:
+        raise RendererError(f"Template field '{exc.args[0]}' is not available in {label}") from exc
+
+
+def _build_declarative_context(
+    step_type: str,
+    params: dict[str, Any],
+    bindings: dict[str, Any],
+    output_dir: str,
+) -> tuple[dict[str, str], dict[str, str]]:
+    raw_context = {
+        "step_type": step_type,
+        "output_dir": output_dir,
+    }
+    quoted_context = {
+        "step_type": step_type,
+        "output_dir": shlex.quote(output_dir),
+    }
+
+    for source_name, source_values in (
+        ("param", params or {}),
+        ("binding", bindings or {}),
+    ):
+        for key, value in source_values.items():
+            key_name = str(key)
+            raw_value = _stringify_template_value(value)
+            quoted_value = _shell_quote_template_value(value)
+            raw_context[key_name] = raw_value
+            quoted_context[key_name] = quoted_value
+            raw_context[f"{source_name}_{key_name}"] = raw_value
+            quoted_context[f"{source_name}_{key_name}"] = quoted_value
+
+    return raw_context, quoted_context
+
+
+def render_declarative_step(
+    step_type: str,
+    renderer_spec: dict[str, Any],
+    params: dict,
+    bindings: dict,
+    output_dir: str,
+) -> RenderedCommand:
+    command_template = str(renderer_spec.get("command") or "").strip()
+    if not command_template:
+        raise RendererError(f"Declarative renderer for '{step_type}' is missing template.command")
+
+    raw_context, quoted_context = _build_declarative_context(step_type, params, bindings, output_dir)
+
+    output_bindings_raw: dict[str, str] = {}
+    for slot_name, output_template in (renderer_spec.get("output_bindings") or {}).items():
+        slot_key = str(slot_name)
+        output_bindings_raw[slot_key] = _format_template(
+            str(output_template),
+            raw_context,
+            f"{step_type} output binding '{slot_key}'",
+        )
+
+    for slot_key, raw_value in output_bindings_raw.items():
+        quoted_value = shlex.quote(raw_value)
+        raw_context[slot_key] = raw_value
+        quoted_context[slot_key] = quoted_value
+        raw_context[f"output_{slot_key}"] = raw_value
+        quoted_context[f"output_{slot_key}"] = quoted_value
+
+    command = _format_template(command_template, quoted_context, f"{step_type} command")
+    env_vars = {
+        str(key): _format_template(str(value), raw_context, f"{step_type} env var '{key}'")
+        for key, value in (renderer_spec.get("env_vars") or {}).items()
+    }
+
+    expected_outputs = list(output_bindings_raw.values()) or [output_dir]
+    return RenderedCommand(
+        command_text=command,
+        env_vars=env_vars,
+        expected_outputs=expected_outputs,
+        renderer_version=int(renderer_spec.get("renderer_version", 1)),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -772,12 +871,15 @@ def render_step(
     defn = get_step_type(step_type)
 
     renderer_fn = (defn.renderer if defn and defn.renderer else None) or RENDERER_REGISTRY.get(step_type)
-    if renderer_fn is None:
+    if renderer_fn is None and defn and defn.renderer_spec:
+        result = render_declarative_step(step_type, defn.renderer_spec, params, bindings, output_dir)
+    elif renderer_fn is None:
         raise RendererError(
             f"No renderer registered for step_type '{step_type}'. "
             f"Available: {sorted(RENDERER_REGISTRY)}"
         )
-    result = renderer_fn(params, bindings, output_dir)
+    else:
+        result = renderer_fn(params, bindings, output_dir)
 
     # Fill Phase-3 metadata fields if not already set by the renderer
     if not result.template_type:

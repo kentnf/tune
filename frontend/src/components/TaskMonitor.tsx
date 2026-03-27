@@ -70,6 +70,11 @@ interface RuntimeDiagnostic {
   request_id?: string | null
   request_status?: string | null
   resolved_at?: string | null
+  stage?: string | null
+  failure_kind?: string | null
+  retryable?: boolean | null
+  failed_packages?: string[] | null
+  package_candidates?: Record<string, string[] | null> | null
 }
 
 interface AutoRecoveryEvent {
@@ -247,8 +252,32 @@ function formatRuntimeDiagnostic(item: RuntimeDiagnostic, t: (k: TranslationKey)
   const labelMap: Record<string, TranslationKey> = {
     resolved_pending_request: 'tasks_runtime_diag_resolved_pending_request',
     orphan_pending_request: 'tasks_runtime_diag_orphan_pending_request',
+    environment_prepare_failed: 'tasks_runtime_diag_environment_prepare_failed',
   }
   const label = t(labelMap[kind] || 'tasks_runtime_diag_unknown')
+  if (kind === 'environment_prepare_failed') {
+    const detailParts: string[] = []
+    if (item.stage) {
+      detailParts.push(`stage=${item.stage}`)
+    }
+    const failedPackages = (item.failed_packages ?? []).filter(Boolean)
+    if (failedPackages.length > 0) {
+      detailParts.push(`packages=${failedPackages.join(', ')}`)
+    }
+    const candidateEntries = Object.entries(item.package_candidates ?? {})
+      .map(([pkg, candidates]) => {
+        const cleaned = (candidates ?? []).filter(Boolean)
+        if (!pkg || cleaned.length === 0) return null
+        const alternatives = cleaned.filter((candidate) => candidate !== pkg)
+        if (alternatives.length === 0) return null
+        return `${pkg} -> ${alternatives.join(', ')}`
+      })
+      .filter(Boolean) as string[]
+    if (candidateEntries.length > 0) {
+      detailParts.push(`candidates=${candidateEntries.join('; ')}`)
+    }
+    return detailParts.length > 0 ? `${label}: ${detailParts.join(' · ')}` : label
+  }
   return `${label}: ${requestType}${requestStatus}`
 }
 

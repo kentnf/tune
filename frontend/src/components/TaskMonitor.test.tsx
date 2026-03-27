@@ -217,6 +217,62 @@ describe('TaskMonitor', () => {
     expect(screen.getByText('Execution graph is waiting for final confirmation.')).toBeInTheDocument()
   })
 
+  it('renders environment failure diagnostics with package candidates in the task panel', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL) => {
+        const url = String(input)
+        if (url.includes('/api/jobs/job-1/bindings?detailed=1')) {
+          return Promise.resolve({
+            ok: true,
+            json: async () => ({
+              job_status: 'queued',
+              error_message: 'Pixi install failed for package(s) [featureCounts]: PackagesNotFoundError: featureCounts',
+              pending_interaction_type: null,
+              pending_interaction_payload: null,
+              runtime_diagnostics: [
+                {
+                  kind: 'environment_prepare_failed',
+                  stage: 'pixi_install',
+                  failure_kind: 'missing_package',
+                  retryable: true,
+                  failed_packages: ['featureCounts'],
+                  package_candidates: {
+                    featureCounts: ['subread', 'featurecounts'],
+                  },
+                },
+              ],
+              auto_recovery_events: [],
+              timeline: [],
+              confirmation_phase: null,
+              confirmation_plan: [],
+              execution_plan_summary: null,
+              steps: [],
+            }),
+          })
+        }
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({}),
+        })
+      }),
+    )
+
+    renderTaskMonitor({
+      projectId: 'proj-1',
+      onOpenThread: vi.fn(),
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: /logs/i }))
+
+    expect(await screen.findByText('Runtime Diagnostics')).toBeInTheDocument()
+    expect(
+      screen.getByText(
+        'Environment preparation failed: stage=pixi_install · packages=featureCounts · candidates=featureCounts -> subread, featurecounts',
+      ),
+    ).toBeInTheDocument()
+  })
+
   it('emits resource workspace navigation requests from supervisor review', async () => {
     const onOpenResourceWorkspace = vi.fn()
 

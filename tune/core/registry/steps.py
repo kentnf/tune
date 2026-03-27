@@ -14,7 +14,7 @@ packages, and the renderer callable.  This is the single source of truth for:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +110,7 @@ class StepTypeDefinition:
     repair_policy: RepairPolicy = field(default_factory=RepairPolicy)
     safety_policy: SafetyPolicy = field(default_factory=SafetyPolicy)
     renderer: Optional[Callable] = field(default=None, repr=False)
+    renderer_spec: dict[str, Any] = field(default_factory=dict, repr=False)
 
     pixi_packages: list[str] = field(default_factory=list)
 
@@ -148,11 +149,26 @@ class StepTypeDefinition:
 # ---------------------------------------------------------------------------
 
 _REGISTRY: dict[str, StepTypeDefinition] = {}
+_CUSTOM_STEP_TYPES: set[str] = set()
 
 
 def register(defn: StepTypeDefinition) -> StepTypeDefinition:
     _REGISTRY[defn.step_type] = defn
     return defn
+
+
+def register_custom(defn: StepTypeDefinition) -> StepTypeDefinition:
+    if defn.step_type in _REGISTRY and defn.step_type not in _CUSTOM_STEP_TYPES:
+        raise ValueError(f"Custom step_type '{defn.step_type}' conflicts with a built-in step")
+    _CUSTOM_STEP_TYPES.add(defn.step_type)
+    _REGISTRY[defn.step_type] = defn
+    return defn
+
+
+def reset_custom() -> None:
+    for step_type in list(_CUSTOM_STEP_TYPES):
+        _REGISTRY.pop(step_type, None)
+    _CUSTOM_STEP_TYPES.clear()
 
 
 def get_step_type(step_type: str) -> StepTypeDefinition | None:

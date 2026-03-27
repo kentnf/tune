@@ -23,6 +23,34 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
+_PACKAGE_ALIASES: dict[str, str] = {
+    "featurecounts": "subread",
+    "feature-counts": "subread",
+    "feature_counts": "subread",
+    "rscript": "r-base",
+    "r-script": "r-base",
+    "r_script": "r-base",
+    "hisat2-build": "hisat2",
+    "hisat2_build": "hisat2",
+    "hisat2.build": "hisat2",
+    "star-genome": "star",
+    "star_genome": "star",
+    "star.genome": "star",
+    "starlong": "star",
+    "bowtie2-build": "bowtie2",
+    "bowtie2_build": "bowtie2",
+    "bowtie2.build": "bowtie2",
+}
+
+_PACKAGE_SUFFIX_REWRITES = (
+    "-build",
+    "_build",
+    ".build",
+    "-genome",
+    "_genome",
+    ".genome",
+)
+
 
 @dataclass
 class EnvSpec:
@@ -44,6 +72,48 @@ def _parse_package_name(package: str) -> tuple[str, str]:
     if m:
         return m.group(1).lower(), m.group(2).strip()
     return package.lower(), ""
+
+
+def _candidate_package_names(name: str) -> list[str]:
+    base = name.lower().strip()
+    if not base:
+        return []
+
+    raw_forms = list(
+        dict.fromkeys(
+            [
+                base,
+                base.replace("_", "-"),
+                base.replace(".", "-"),
+                base.replace("_", "-").replace(".", "-"),
+            ]
+        )
+    )
+
+    preferred: list[str] = []
+    for form in raw_forms:
+        alias = _PACKAGE_ALIASES.get(form)
+        if alias:
+            preferred.append(alias)
+        for suffix in _PACKAGE_SUFFIX_REWRITES:
+            if form.endswith(suffix):
+                stripped = form[: -len(suffix)].strip("._-")
+                if stripped:
+                    preferred.append(_PACKAGE_ALIASES.get(stripped, stripped))
+
+    return list(dict.fromkeys([item for item in preferred + raw_forms if item]))
+
+
+def candidate_package_specs(package: str) -> list[str]:
+    """Return ordered safe package candidates for installation retries."""
+    name, ver = _parse_package_name(package)
+    return [f"{candidate}{ver}" for candidate in _candidate_package_names(name)]
+
+
+def normalize_package_spec(package: str) -> str:
+    """Normalize a requested package name to the Pixi/conda package we should install."""
+    candidates = candidate_package_specs(package)
+    return candidates[0] if candidates else package.lower()
 
 
 def _detect_conflicts(packages: list[str]) -> list[str]:
@@ -101,7 +171,7 @@ def build_env_spec(
         if step_type:
             defn = registry.get_step_type(step_type)
             if defn:
-                step_pkgs = list(defn.pixi_packages)
+                step_pkgs = [normalize_package_spec(pkg) for pkg in defn.pixi_packages]
                 packages.update(step_pkgs)
             else:
                 log.debug("Unknown step_type '%s' — no packages added", step_type)
@@ -119,8 +189,9 @@ def build_env_spec(
             }
             for key, pkgs in legacy_map.items():
                 if key in tool:
-                    step_pkgs.extend(pkgs)
-                    packages.update(pkgs)
+                    normalized = [normalize_package_spec(pkg) for pkg in pkgs]
+                    step_pkgs.extend(normalized)
+                    packages.update(normalized)
 
         if step_pkgs:
             step_package_map[step_key] = sorted(set(step_pkgs))

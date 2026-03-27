@@ -22,6 +22,7 @@ TYPED_STEP_SCHEMA = {
         "depends_on":     {"type": "array", "items": {"type": "string"}},
         "params":         {"type": "object"},
         "supports_fan_out": {"type": "boolean"},
+        "dynamic_spec":   {"type": "object"},
     },
     "required": ["step_key", "step_type"],
 }
@@ -39,9 +40,12 @@ TYPED_PLAN_SCHEMA = {
 def validate_plan(plan_steps: list[dict]) -> list[str]:
     """Validate typed plan steps against the registry. Returns list of error strings."""
     from tune.core.registry import get_step_type
+    from tune.core.registry.dynamic_steps import materialize_dynamic_step_types
 
     errors: list[str] = []
     seen_keys: set[str] = set()
+
+    errors.extend(materialize_dynamic_step_types(plan_steps))
 
     for i, step in enumerate(plan_steps):
         prefix = f"Step {i + 1} ('{step.get('step_key', '?')}')"

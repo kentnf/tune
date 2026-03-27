@@ -1392,11 +1392,27 @@ async def prepare_environment_task(job_id: str) -> None:
         if success:
             job.env_status = "ready"
             job.env_spec_hash = env_spec.hash
+            job.error_message = None
             write_env_cache(env_dir, env_spec.hash)
             log.info("prepare_environment_task: env ready for job %s", job_id)
         else:
             job.env_status = "failed"
-            log.error("prepare_environment_task: env failed for job %s", job_id)
+            failed_packages = list(getattr(pixi, "last_failed_packages", []) or [])
+            install_error = str(getattr(pixi, "last_install_error", "") or "").strip()
+            if not install_error and failed_packages:
+                install_error = (
+                    "Pixi environment preparation failed for package(s): "
+                    + ", ".join(failed_packages)
+                )
+            elif not install_error:
+                install_error = "Pixi environment preparation failed."
+            job.error_message = install_error
+            log.error(
+                "prepare_environment_task: env failed for job %s packages=%s detail=%s",
+                job_id,
+                failed_packages,
+                install_error,
+            )
         await session.commit()
 
     if success:

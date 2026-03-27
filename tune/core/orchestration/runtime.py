@@ -461,9 +461,19 @@ async def materialize_job_execution_plan(
     job,
     plan_payload: Any,
 ) -> OrchestrationBundle:
+    from tune.core.registry.spec_generation import augment_plan_with_dynamic_specs
     from tune.core.workflow.plan_compiler import compile_plan
 
     raw_steps = extract_plan_steps(plan_payload)
+    raw_steps, dynamic_issues = await augment_plan_with_dynamic_specs(
+        raw_steps,
+        context_hint=(
+            f"Goal: {getattr(job, 'goal', '') or ''}\n"
+            f"Project ID: {getattr(job, 'project_id', '') or ''}"
+        ),
+    )
+    if dynamic_issues:
+        raise ValueError("; ".join(dynamic_issues) or "Failed to generate dynamic step specs")
     compile_result = compile_plan(raw_steps)
     if not compile_result.ok:
         raise ValueError("; ".join(compile_result.errors) or "Failed to compile confirmed plan")
