@@ -110,9 +110,31 @@ port_for_component() {
 }
 
 load_config() {
+  local cli_analysis_dir="${ANALYSIS_DIR:-}"
+  local cli_host="${HOST:-}"
+  local cli_backend_port="${BACKEND_PORT:-}"
+  local cli_frontend_port="${FRONTEND_PORT:-}"
+  local cli_reload="${RELOAD:-}"
+
   if [[ -f "$CONFIG_FILE" ]]; then
     # shellcheck disable=SC1090
     source "$CONFIG_FILE"
+  fi
+
+  if [[ -n "$cli_analysis_dir" ]]; then
+    ANALYSIS_DIR="$cli_analysis_dir"
+  fi
+  if [[ -n "$cli_host" ]]; then
+    HOST="$cli_host"
+  fi
+  if [[ -n "$cli_backend_port" ]]; then
+    BACKEND_PORT="$cli_backend_port"
+  fi
+  if [[ -n "$cli_frontend_port" ]]; then
+    FRONTEND_PORT="$cli_frontend_port"
+  fi
+  if [[ -n "$cli_reload" ]]; then
+    RELOAD="$cli_reload"
   fi
 
   HOST="${HOST:-$DEFAULT_HOST}"
