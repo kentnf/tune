@@ -1838,6 +1838,9 @@ async def _handle_chat(websocket: WebSocket, msg: dict, state: dict) -> None:
 
     state["_last_user_text"] = user_text
 
+    if thread_payload is not None:
+        await websocket.send_json({"type": "thread_bound", "thread": thread_payload})
+
     await websocket.send_json({"type": "start"})
     assistant_chunks: list[str] = []
     try:
@@ -1888,6 +1891,3 @@ async def _handle_chat(websocket: WebSocket, msg: dict, state: dict) -> None:
                     await session.commit()
         except Exception:
             log.exception("Failed to persist messages for thread_id=%s", thread_id)
-
-    if thread_payload is not None:
-        await websocket.send_json({"type": "thread_bound", "thread": thread_payload})
