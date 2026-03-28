@@ -261,6 +261,7 @@ def build_expanded_dag(
                     "group_key": origin_step_key,
                     "scope": scope,
                     "origin_step_type": step_type,
+                    "origin_display_name": _step_display_name(step),
                     "node_keys": group_node_keys,
                 }
             )
@@ -275,6 +276,7 @@ def build_expanded_dag(
                     "group_key": origin_step_key,
                     "scope": scope,
                     "origin_step_type": step_type,
+                    "origin_display_name": _step_display_name(step),
                     "node_keys": [origin_step_key],
                 }
             )
@@ -358,7 +360,10 @@ def summarize_expanded_dag_for_confirmation(expanded_dag: dict[str, Any] | None)
             continue
 
         first_node = nodes.get(node_keys[0], {})
-        raw_depends_on = list(first_node.get("depends_on") or [])
+        raw_depends_on: list[str] = []
+        for node_key in node_keys:
+            node = nodes.get(node_key, {})
+            raw_depends_on.extend(str(dep) for dep in (node.get("depends_on") or []))
         depends_on: list[str] = []
         seen_dep_keys: set[str] = set()
         for dep in raw_depends_on:
@@ -383,7 +388,7 @@ def summarize_expanded_dag_for_confirmation(expanded_dag: dict[str, Any] | None)
             {
                 "step_key": group_key,
                 "step_type": group.get("origin_step_type") or first_node.get("step_type") or "",
-                "display_name": first_node.get("display_name") or group_key,
+                "display_name": group.get("origin_display_name") or first_node.get("display_name") or group_key,
                 "description": " | ".join(description_parts),
                 "depends_on": depends_on,
                 "node_count": len(node_keys),
