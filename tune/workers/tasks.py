@@ -1308,6 +1308,7 @@ async def prepare_environment_task(job_id: str) -> None:
     On failure sets env_status='failed'.
     """
     import os
+    import shutil
     import sys
     import platform as _platform
     from pathlib import Path
@@ -1359,6 +1360,19 @@ async def prepare_environment_task(job_id: str) -> None:
     else:
         run_dir = cfg.analysis_dir / "tmp" / job_id
     env_dir = run_dir.parent / ".pixi-env"
+    origin_file = env_dir / ".env_origin_path"
+    current_origin = str(env_dir.resolve())
+
+    if env_dir.exists():
+        stored_origin = origin_file.read_text().strip() if origin_file.exists() else None
+        if stored_origin != current_origin:
+            log.info(
+                "prepare_environment_task: rebuilding stale pixi env for job %s env_dir=%s stored_origin=%s",
+                job_id,
+                env_dir,
+                stored_origin,
+            )
+            shutil.rmtree(env_dir, ignore_errors=True)
 
     # Cache check
     if check_env_cache(env_dir, env_spec.hash):
@@ -1768,6 +1782,7 @@ async def run_analysis_task(job_id: str) -> None:
         else:
             out_dir = make_output_dir(cfg.analysis_dir, project_name, job.name)
             job.output_dir = str(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
         await session.commit()
 
     async def _broadcast_job_chat(event: dict[str, object]) -> bool:

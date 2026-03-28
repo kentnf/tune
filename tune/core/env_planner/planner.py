@@ -23,6 +23,9 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
+_ENV_HASH_FILE = ".env_spec_hash"
+_ENV_ORIGIN_FILE = ".env_origin_path"
+
 _PACKAGE_ALIASES: dict[str, str] = {
     "featurecounts": "subread",
     "feature-counts": "subread",
@@ -214,21 +217,25 @@ def build_env_spec(
 def check_env_cache(env_dir: Path, env_spec_hash: str) -> bool:
     """Return True if a Pixi environment with the given hash already exists.
 
-    The hash is stored in ``{env_dir}/.env_spec_hash``. If the file exists and
-    matches, the environment is ready. This avoids re-running ``pixi install``
-    for the same package set.
+    The hash is stored in ``{env_dir}/.env_spec_hash`` and the resolved env path
+    is stored in ``{env_dir}/.env_origin_path``. Both must match the current
+    location. This avoids reusing moved environments whose binary link paths
+    still point at an older workspace path.
     """
-    hash_file = env_dir / ".env_spec_hash"
-    if not hash_file.exists():
+    hash_file = env_dir / _ENV_HASH_FILE
+    origin_file = env_dir / _ENV_ORIGIN_FILE
+    if not hash_file.exists() or not origin_file.exists():
         return False
     stored = hash_file.read_text().strip()
-    return stored == env_spec_hash
+    stored_origin = origin_file.read_text().strip()
+    return stored == env_spec_hash and stored_origin == str(env_dir.resolve())
 
 
 def write_env_cache(env_dir: Path, env_spec_hash: str) -> None:
     """Persist the env spec hash after a successful install."""
     env_dir.mkdir(parents=True, exist_ok=True)
-    (env_dir / ".env_spec_hash").write_text(env_spec_hash)
+    (env_dir / _ENV_HASH_FILE).write_text(env_spec_hash)
+    (env_dir / _ENV_ORIGIN_FILE).write_text(str(env_dir.resolve()))
 
 
 def format_env_spec_summary(spec: EnvSpec) -> str:
