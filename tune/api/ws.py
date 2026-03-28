@@ -479,6 +479,10 @@ async def sync_supervisor_thread_state(
                     "type": "execution_plan",
                     "job_id": job_id,
                     "execution_plan_summary": pending_analysis_plan.get("execution_plan_summary"),
+                    "execution_confirmation_overview": pending_analysis_plan.get("execution_confirmation_overview"),
+                    "execution_ir_review": pending_analysis_plan.get("execution_ir_review"),
+                    "execution_plan_delta": pending_analysis_plan.get("execution_plan_delta"),
+                    "execution_plan_changes": pending_analysis_plan.get("execution_plan_changes"),
                     "requires_confirmation": True,
                 },
             )
@@ -681,7 +685,13 @@ async def _load_thread_rehydration_snapshot(thread_id: str) -> dict[str, Any] | 
                 pending_plan_job.plan_draft_json or pending_plan_job.plan or []
             )
             if plan_steps:
-                from tune.core.orchestration import summarize_expanded_dag_for_confirmation
+                from tune.core.orchestration import (
+                    summarize_execution_confirmation_overview,
+                    summarize_execution_plan_delta,
+                    summarize_execution_ir_for_confirmation,
+                    summarize_execution_review_changes,
+                    summarize_expanded_dag_for_confirmation,
+                )
 
                 has_execution_plan = bool(
                     getattr(pending_plan_job, "execution_ir_json", None)
@@ -694,6 +704,21 @@ async def _load_thread_rehydration_snapshot(thread_id: str) -> dict[str, Any] | 
                     "plan": plan_steps,
                     "phase": "execution" if has_execution_plan else "abstract",
                     "review_plan": summarize_expanded_dag_for_confirmation(
+                        getattr(pending_plan_job, "expanded_dag_json", None)
+                    ) if has_execution_plan else None,
+                    "execution_confirmation_overview": summarize_execution_confirmation_overview(
+                        plan_payload=getattr(pending_plan_job, "resolved_plan_json", None) or getattr(pending_plan_job, "plan", None),
+                        execution_ir=getattr(pending_plan_job, "execution_ir_json", None),
+                        expanded_dag=getattr(pending_plan_job, "expanded_dag_json", None),
+                    ) if has_execution_plan else None,
+                    "execution_ir_review": summarize_execution_ir_for_confirmation(
+                        getattr(pending_plan_job, "execution_ir_json", None)
+                    ) if has_execution_plan else None,
+                    "execution_plan_delta": summarize_execution_plan_delta(
+                        getattr(pending_plan_job, "resolved_plan_json", None) or getattr(pending_plan_job, "plan", None),
+                        getattr(pending_plan_job, "expanded_dag_json", None),
+                    ) if has_execution_plan else None,
+                    "execution_plan_changes": summarize_execution_review_changes(
                         getattr(pending_plan_job, "expanded_dag_json", None)
                     ) if has_execution_plan else None,
                     "execution_plan_summary": {
@@ -840,6 +865,10 @@ def _apply_thread_rehydration_snapshot(
                     "type": "execution_plan",
                     "job_id": pending_plan.get("job_id"),
                     "execution_plan_summary": pending_plan.get("execution_plan_summary"),
+                    "execution_confirmation_overview": pending_plan.get("execution_confirmation_overview"),
+                    "execution_ir_review": pending_plan.get("execution_ir_review"),
+                    "execution_plan_delta": pending_plan.get("execution_plan_delta"),
+                    "execution_plan_changes": pending_plan.get("execution_plan_changes"),
                     "requires_confirmation": True,
                 }
             )
@@ -1735,6 +1764,10 @@ async def _handle_confirm_plan(websocket: WebSocket, msg: dict, state: dict) -> 
                 "phase": "execution",
                 "review_plan": review_plan,
                 "execution_plan_summary": execution_payload["summary"],
+                "execution_confirmation_overview": execution_payload.get("review_overview"),
+                "execution_ir_review": execution_payload.get("review_ir"),
+                "execution_plan_delta": execution_payload.get("review_delta"),
+                "execution_plan_changes": execution_payload.get("review_changes"),
             }
             await broadcast_project_task_event(job_id, reason="awaiting_execution_confirmation")
             execution_plan_text = (
@@ -1750,6 +1783,10 @@ async def _handle_confirm_plan(websocket: WebSocket, msg: dict, state: dict) -> 
                 "type": "execution_plan",
                 "job_id": job_id,
                 "execution_plan": execution_payload,
+                "execution_confirmation_overview": execution_payload.get("review_overview"),
+                "execution_ir_review": execution_payload.get("review_ir"),
+                "execution_plan_delta": execution_payload.get("review_delta"),
+                "execution_plan_changes": execution_payload.get("review_changes"),
                 "requires_confirmation": True,
             })
             await websocket.send_json({

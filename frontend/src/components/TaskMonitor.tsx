@@ -5,6 +5,11 @@ import type { ResourceWorkspaceRequest } from './DataBrowser'
 import { PROJECT_TASK_PAGE_SIZE, useProjectTaskFeed, type ProjectTaskJob } from '../hooks/useProjectTaskFeed'
 import { useLanguage } from '../i18n/LanguageContext'
 import type { TranslationKey } from '../i18n/translations'
+import {
+  formatOperatorChatActionCta,
+  formatOperatorChatActionHint,
+  resolveOperatorChatActionCode,
+} from '../lib/taskAttention'
 
 type Job = ProjectTaskJob
 
@@ -38,6 +43,14 @@ interface SupervisorRecommendation {
     current_safe_action?: string | null
     current_supported_count?: number | null
     aligns_with_current?: boolean | null
+    preferred_rollback_level?: string | null
+    current_rollback_level?: string | null
+    rollback_level_supported_count?: number | null
+    rollback_level_aligns_with_current?: boolean | null
+    preferred_rollback_target?: string | null
+    current_rollback_target?: string | null
+    rollback_target_supported_count?: number | null
+    rollback_target_aligns_with_current?: boolean | null
   } | null
   auto_recoverable?: boolean
   auto_recovery_kind?: string | null
@@ -104,6 +117,17 @@ interface TimelineEvent {
   result_kind?: string | null
   title?: string | null
   detail?: string | null
+}
+
+interface RollbackGuidance {
+  level?: string | null
+  target?: string | null
+  reconfirmation_required?: boolean | null
+  reason?: string | null
+  historical_matches?: number | null
+  historical_same_level_count?: number | null
+  historical_same_target_count?: number | null
+  summary?: string | null
 }
 
 type TimelineCategory = 'all' | 'step' | 'result' | 'recovery' | 'confirmation'
@@ -195,6 +219,14 @@ interface SupervisorDossier {
   } | null
   runtime_diagnostics?: RuntimeDiagnostic[]
   auto_recovery_events?: AutoRecoveryEvent[]
+  rollback_hint?: {
+    suggested_level?: string | null
+    reason?: string | null
+  } | null
+  execution_confirmation_overview?: ExecutionConfirmationOverview | null
+  execution_ir_review?: ExecutionIrReviewItem[] | null
+  execution_plan_delta?: ExecutionPlanDelta | null
+  execution_plan_changes?: ExecutionPlanChangeItem[] | null
   similar_resolutions?: Array<{
     event_type?: string | null
     description?: string | null
@@ -217,11 +249,23 @@ interface SupervisorReview {
     high_confidence_total?: number | null
     auto_recoverable_total?: number | null
     user_wait_total?: number | null
+    top_failure_layer?: string | null
     top_safe_action?: string | null
+    top_rollback_level?: string | null
+    top_rollback_target?: string | null
+    top_historical_rollback_level?: string | null
+    top_historical_rollback_alignment?: boolean | null
+    top_historical_rollback_target?: string | null
+    top_historical_rollback_target_alignment?: boolean | null
     primary_lane?: string | null
     lane_reason?: string | null
     next_best_operator_move?: string | null
     next_best_operator_reason?: string | null
+    latest_auto_recovery_issue?: string | null
+    latest_auto_recovery_action?: string | null
+    latest_auto_recovery_status?: string | null
+    latest_auto_recovery_pending_types?: string | null
+    latest_auto_recovery_job_id?: string | null
   } | null
   project_playbook?: {
     goal?: string | null
@@ -237,6 +281,65 @@ interface ExecutionPlanSummary {
   has_expanded_dag?: boolean
   node_count?: number
   group_count?: number
+}
+
+interface ExecutionConfirmationOverview {
+  abstract_step_count?: number | null
+  execution_ir_step_count?: number | null
+  execution_group_count?: number | null
+  unchanged_group_count?: number | null
+  changed_group_count?: number | null
+  added_group_count?: number | null
+  per_sample_step_count?: number | null
+  aggregate_step_count?: number | null
+  global_step_count?: number | null
+  fan_out_change_count?: number | null
+  aggregate_change_count?: number | null
+  auto_injected_change_count?: number | null
+}
+
+interface ExecutionIrReviewItem {
+  step_key?: string | null
+  step_type?: string | null
+  display_name?: string | null
+  description?: string | null
+  scope?: string | null
+  execution_kind?: string | null
+  aggregation_mode?: string | null
+  input_semantics?: string[] | null
+  depends_on?: string[] | null
+}
+
+interface ExecutionPlanDeltaGroupItem {
+  group_key?: string | null
+  display_name?: string | null
+  step_type?: string | null
+  change_kinds?: string[] | null
+}
+
+interface ExecutionPlanDelta {
+  abstract_step_count?: number | null
+  execution_group_count?: number | null
+  added_group_count?: number | null
+  changed_group_count?: number | null
+  unchanged_group_count?: number | null
+  added_groups?: ExecutionPlanDeltaGroupItem[] | null
+  changed_groups?: ExecutionPlanDeltaGroupItem[] | null
+}
+
+interface ExecutionPlanChangeItem {
+  group_key?: string | null
+  step_type?: string | null
+  display_name?: string | null
+  change_kinds?: string[] | null
+  summary?: string | null
+  depends_on?: string[] | null
+  node_count?: number | null
+  scope?: string | null
+  fan_out_mode?: string | null
+  aggregate_mode?: string | null
+  auto_injected_reasons?: string[] | null
+  auto_injected_cause?: string | null
 }
 
 interface ConfirmationPlanItem {
@@ -349,7 +452,7 @@ function buildConfirmationLayers(
 }
 
 function formatAttentionReasonLabel(
-  reason: 'authorization' | 'repair' | 'confirmation' | 'clarification' | 'warning',
+  reason: 'authorization' | 'repair' | 'confirmation' | 'clarification' | 'rollback_review' | 'warning',
   t: (key: TranslationKey) => string,
 ): string {
   switch (reason) {
@@ -361,10 +464,19 @@ function formatAttentionReasonLabel(
       return t('status_awaiting_plan_confirmation')
     case 'clarification':
       return t('tasks_attention_reason_clarification')
+    case 'rollback_review':
+      return t('tasks_attention_reason_rollback_review')
     case 'warning':
     default:
       return t('tasks_tray_warning')
   }
+}
+
+function pendingOperatorPriority(reason: 'confirmation' | 'clarification' | 'rollback_review' | string): number {
+  if (reason === 'rollback_review') return 0
+  if (reason === 'confirmation') return 1
+  if (reason === 'clarification') return 2
+  return 3
 }
 
 interface BindingMatchMetadata {
@@ -424,18 +536,144 @@ interface JobBindingResponse {
   pending_interaction_type?: string | null
   pending_interaction_payload?: PendingInteractionPayload | null
   runtime_diagnostics?: RuntimeDiagnostic[]
+  rollback_guidance?: RollbackGuidance | null
   auto_recovery_events?: AutoRecoveryEvent[]
   timeline?: TimelineEvent[]
   confirmation_phase?: 'abstract' | 'execution' | null
   confirmation_plan?: ConfirmationPlanItem[]
   execution_plan_summary?: ExecutionPlanSummary | null
+  execution_confirmation_overview?: ExecutionConfirmationOverview | null
+  execution_ir_review?: ExecutionIrReviewItem[] | null
+  execution_plan_delta?: ExecutionPlanDelta | null
+  execution_plan_changes?: ExecutionPlanChangeItem[] | null
   steps?: JobBindingStep[]
 }
 
+function formatExecutionPlanChangeSummary(
+  item: ExecutionPlanChangeItem,
+  t: (k: TranslationKey) => string,
+): string {
+  const changeKinds = new Set((item.change_kinds ?? []).filter(Boolean))
+  const detailParts: string[] = []
+
+  if (changeKinds.has('fan_out')) {
+    detailParts.push(
+      (
+        item.fan_out_mode === 'per_sample'
+          ? t('tasks_confirmation_change_detail_fan_out_per_sample')
+          : t('tasks_confirmation_change_detail_fan_out')
+      ).replace('{count}', String(item.node_count ?? 0)),
+    )
+  }
+
+  if (changeKinds.has('aggregate')) {
+    const sources = (item.depends_on ?? []).filter(Boolean)
+    detailParts.push(
+      sources.length > 0
+        ? t('tasks_confirmation_change_detail_aggregate_with_sources').replace('{sources}', sources.join(', '))
+        : t('tasks_confirmation_change_detail_aggregate'),
+    )
+  }
+
+  if (changeKinds.has('auto_injected')) {
+    const causeMap: Record<string, TranslationKey> = {
+      missing_hisat2_index: 'tasks_confirmation_change_detail_auto_injected_missing_hisat2_index',
+      missing_star_genome: 'tasks_confirmation_change_detail_auto_injected_missing_star_genome',
+      derivable_hisat2_index: 'tasks_confirmation_change_detail_auto_injected_derivable_hisat2_index',
+      derivable_star_genome: 'tasks_confirmation_change_detail_auto_injected_derivable_star_genome',
+      stale_derived_resource: 'tasks_confirmation_change_detail_auto_injected_stale_derived_resource',
+    }
+    if (item.auto_injected_cause && causeMap[item.auto_injected_cause]) {
+      detailParts.push(t(causeMap[item.auto_injected_cause]))
+      return detailParts.join(' · ') || item.summary || ''
+    }
+    const sourceLabels = (item.auto_injected_reasons ?? [])
+      .filter(Boolean)
+      .map((reason) => (
+        reason === 'preflight'
+          ? t('tasks_confirmation_change_source_preflight')
+          : reason === 'resource_readiness'
+            ? t('tasks_confirmation_change_source_resource_readiness')
+            : reason
+      ))
+    detailParts.push(
+      sourceLabels.length > 0
+        ? t('tasks_confirmation_change_detail_auto_injected_with_sources').replace('{sources}', sourceLabels.join(', '))
+        : t('tasks_confirmation_change_detail_auto_injected'),
+    )
+  }
+
+  return detailParts.join(' · ') || item.summary || ''
+}
+
+function formatExecutionPlanChangeKind(
+  kind: string,
+  t: (k: TranslationKey) => string,
+): string {
+  const keyMap: Record<string, TranslationKey> = {
+    fan_out: 'tasks_confirmation_change_fan_out',
+    aggregate: 'tasks_confirmation_change_aggregate',
+    auto_injected: 'tasks_confirmation_change_auto_injected',
+  }
+  return t(keyMap[kind] || 'tasks_confirmation_change_auto_injected')
+}
+
+function buildExecutionPlanDeltaStatusMap(delta: ExecutionPlanDelta | null | undefined): Record<string, 'added' | 'changed'> {
+  const statusMap: Record<string, 'added' | 'changed'> = {}
+  for (const item of delta?.added_groups ?? []) {
+    if (item.group_key) statusMap[item.group_key] = 'added'
+  }
+  for (const item of delta?.changed_groups ?? []) {
+    if (item.group_key && !statusMap[item.group_key]) statusMap[item.group_key] = 'changed'
+  }
+  return statusMap
+}
+
+function formatTaskStatusLabel(status: string | null | undefined, t: (k: TranslationKey) => string): string {
+  const keyMap: Record<string, TranslationKey> = {
+    running: 'status_running',
+    completed: 'status_completed',
+    failed: 'status_failed',
+    cancelled: 'status_cancelled',
+    interrupted: 'status_interrupted',
+    queued: 'status_queued',
+    binding_required: 'status_binding_required',
+    resource_clarification_required: 'status_binding_required',
+    waiting_for_authorization: 'status_waiting_for_authorization',
+    waiting_for_repair: 'status_waiting_for_repair',
+    awaiting_plan_confirmation: 'status_awaiting_plan_confirmation',
+  }
+  const key = keyMap[status || '']
+  return key ? t(key) : (status || 'unknown')
+}
+
+function formatSafeActionLabel(action: string | null | undefined, t: (k: TranslationKey) => string): string {
+  const keyMap: Record<string, TranslationKey> = {
+    step_reenter: 'tasks_supervisor_retry_from_step',
+    refresh_execution_graph: 'tasks_supervisor_refresh_execution_graph',
+    refresh_execution_plan: 'tasks_supervisor_refresh_execution_plan',
+    revalidate_abstract_plan: 'tasks_supervisor_revalidate_abstract_plan',
+    normalize_orphan_pending_state: 'tasks_supervisor_normalize_orphan_pending_state',
+    normalize_terminal_state: 'tasks_supervisor_normalize_terminal_state',
+    retry_resume_chain: 'tasks_supervisor_retry_resume_chain',
+  }
+  const key = keyMap[action || '']
+  return key ? t(key) : (action || 'unknown')
+}
+
+function formatAutoRecoveryIssueKind(issueKind: string | null | undefined, t: (k: TranslationKey) => string): string {
+  const keyMap: Record<string, TranslationKey> = {
+    resume_failed: 'tasks_auto_recovery_issue_resume_failed',
+    orphan_pending_request: 'tasks_auto_recovery_issue_orphan_pending_request',
+    job_status_mismatch: 'tasks_auto_recovery_issue_job_status_mismatch',
+  }
+  return t(keyMap[issueKind || ''] || 'tasks_auto_recovery_issue_unknown')
+}
+
 function formatAutoRecoveryEvent(item: AutoRecoveryEvent, t: (k: TranslationKey) => string): string {
-  const safeAction = item.safe_action || 'unknown'
-  const issueKind = item.issue_kind || 'unknown'
-  const resultingStatus = item.resulting_status || 'unknown'
+  const safeAction = formatSafeActionLabel(item.safe_action, t)
+  const issueKind = formatAutoRecoveryIssueKind(item.issue_kind, t)
+  const resultingStatus = formatTaskStatusLabel(item.resulting_status, t)
   const pendingTypes = item.pending_types ? ` · pending=${item.pending_types}` : ''
   return t('tasks_auto_recovery_entry')
     .replace('{issue}', issueKind)
@@ -448,6 +686,25 @@ function formatAutoRecoveryKind(kind: string | null | undefined, t: (k: Translat
     metadata_normalization: 'tasks_supervisor_auto_recovery_kind_metadata_normalization',
   }
   return t(keyMap[kind || ''] || 'tasks_supervisor_auto_recovery_kind_unknown')
+}
+
+function formatFocusSummaryAutoRecovery(
+  focusSummary: SupervisorReview['focus_summary'] | null | undefined,
+  t: (k: TranslationKey) => string,
+): string | null {
+  if (!focusSummary?.latest_auto_recovery_issue || !focusSummary.latest_auto_recovery_action || !focusSummary.latest_auto_recovery_status) {
+    return null
+  }
+  return formatAutoRecoveryEvent(
+    {
+      source: 'watchdog',
+      issue_kind: focusSummary.latest_auto_recovery_issue,
+      safe_action: focusSummary.latest_auto_recovery_action,
+      resulting_status: focusSummary.latest_auto_recovery_status,
+      pending_types: focusSummary.latest_auto_recovery_pending_types ?? undefined,
+    },
+    t,
+  )
 }
 
 function formatResourceBlocker(item: SupervisorDossierResourceNode): string {
@@ -494,6 +751,18 @@ function buildResourceWorkspaceRequest(item: SupervisorDossierResourceSummary): 
     tab: 'project-info',
     focusSection: section === 'registry' ? 'registry' : 'recognized',
     key: item.registry_key || undefined,
+    path: item.preferred_candidate?.path || undefined,
+    description: item.label || item.kind || item.id,
+  }
+}
+
+function buildRegistryWorkspaceRequest(item: SupervisorDossierResourceSummary): ResourceWorkspaceRequest | null {
+  if (!item.registry_key) return null
+  return {
+    nonce: Date.now() + 1,
+    tab: 'project-info',
+    focusSection: 'registry',
+    key: item.registry_key,
     path: item.preferred_candidate?.path || undefined,
     description: item.label || item.kind || item.id,
   }
@@ -547,6 +816,10 @@ function formatRecommendationBasis(code: string, t: (k: TranslationKey) => strin
     eligibility_blocked: 'tasks_supervisor_recommendation_basis_eligibility_blocked',
     historical_alignment: 'tasks_supervisor_recommendation_basis_historical_alignment',
     historical_divergence: 'tasks_supervisor_recommendation_basis_historical_divergence',
+    historical_rollback_alignment: 'tasks_supervisor_recommendation_basis_historical_rollback_alignment',
+    historical_rollback_divergence: 'tasks_supervisor_recommendation_basis_historical_rollback_divergence',
+    historical_target_alignment: 'tasks_supervisor_recommendation_basis_historical_target_alignment',
+    historical_target_divergence: 'tasks_supervisor_recommendation_basis_historical_target_divergence',
     historical_confidence_high: 'tasks_supervisor_recommendation_basis_historical_confidence_high',
     historical_confidence_medium: 'tasks_supervisor_recommendation_basis_historical_confidence_medium',
     historical_confidence_low: 'tasks_supervisor_recommendation_basis_historical_confidence_low',
@@ -580,6 +853,7 @@ function formatPrimaryLane(value: string | null | undefined, t: (k: TranslationK
     resource_readiness: 'tasks_supervisor_lane_resource_readiness',
     environment_readiness: 'tasks_supervisor_lane_environment_readiness',
     runtime_recovery: 'tasks_supervisor_lane_runtime_recovery',
+    rollback_review: 'tasks_supervisor_lane_rollback_review',
   }
   return t(keyMap[value || ''] || 'tasks_supervisor_lane_unknown') || humanizeFocusToken(value)
 }
@@ -592,12 +866,15 @@ function formatNextBestMove(value: string | null | undefined, t: (k: Translation
     resolve_repair_request: 'tasks_supervisor_move_resolve_repair_request',
     resolve_resource_clarification: 'tasks_supervisor_move_resolve_resource_clarification',
     resolve_resource_readiness: 'tasks_supervisor_move_resolve_resource_readiness',
+    resolve_resource_registration_mismatch: 'tasks_supervisor_move_resolve_resource_registration_mismatch',
     register_primary_resource: 'tasks_supervisor_move_register_primary_resource',
     resolve_ambiguous_resource_candidates: 'tasks_supervisor_move_resolve_ambiguous_resource_candidates',
+    review_stale_resource_decision: 'tasks_supervisor_move_review_stale_resource_decision',
     refresh_stale_derived_resource: 'tasks_supervisor_move_refresh_stale_derived_resource',
     restore_missing_runtime_resource: 'tasks_supervisor_move_restore_missing_runtime_resource',
     inspect_environment_failure: 'tasks_supervisor_move_inspect_environment_failure',
     apply_runtime_recovery: 'tasks_supervisor_move_apply_runtime_recovery',
+    review_rollback_scope: 'tasks_supervisor_move_review_rollback_scope',
   }
   return t(keyMap[value || ''] || 'tasks_supervisor_move_unknown') || humanizeFocusToken(value)
 }
@@ -606,10 +883,39 @@ function formatFocusCause(value: string | null | undefined, t: (k: TranslationKe
   const keyMap: Record<string, TranslationKey> = {
     missing_primary_resource: 'tasks_supervisor_cause_missing_primary_resource',
     ambiguous_candidates: 'tasks_supervisor_cause_ambiguous_candidates',
+    registered_path_mismatch: 'tasks_supervisor_cause_registered_path_mismatch',
+    stale_resource_decision: 'tasks_supervisor_cause_stale_resource_decision',
     stale_derived_resource: 'tasks_supervisor_cause_stale_derived_resource',
     missing_runtime_resource: 'tasks_supervisor_cause_missing_runtime_resource',
   }
   return t(keyMap[value || ''] || 'tasks_supervisor_cause_unknown') || humanizeFocusToken(value)
+}
+
+function formatFailureLayer(value: string | null | undefined, t: (k: TranslationKey) => string): string {
+  const keyMap: Record<string, TranslationKey> = {
+    abstract_plan: 'tasks_supervisor_failure_layer_abstract_plan',
+    execution_ir: 'tasks_supervisor_failure_layer_execution_ir',
+    expanded_dag: 'tasks_supervisor_failure_layer_expanded_dag',
+    resource_binding: 'tasks_supervisor_failure_layer_resource_binding',
+    step_execution: 'tasks_supervisor_failure_layer_step_execution',
+  }
+  return t(keyMap[value || ''] || 'tasks_supervisor_failure_layer_unknown') || humanizeFocusToken(value)
+}
+
+function formatRollbackTarget(value: string | null | undefined): string {
+  const raw = String(value || '').trim()
+  if (!raw) return ''
+  return humanizeFocusToken(raw)
+}
+
+function formatPendingTypeLabel(value: string | null | undefined, t: (k: TranslationKey) => string): string {
+  if (value === 'authorization') return t('tasks_tray_metric_authorization')
+  if (value === 'repair') return t('tasks_tray_metric_repair')
+  return humanizeFocusToken(value)
+}
+
+function formatRequestStatusLabel(value: string | null | undefined): string {
+  return humanizeFocusToken(value) || 'unknown'
 }
 
 function formatTimelineTimestamp(ts: string | null | undefined, lang: 'en' | 'zh'): string {
@@ -709,6 +1015,7 @@ interface Props {
   onAutoSelectConsumed?: () => void
   onOpenThread?: (threadId: string | null, jobId?: string | null) => void
   onOpenResourceWorkspace?: (request: ResourceWorkspaceRequest) => void
+  onOpenSettingsDiagnostics?: () => void
 }
 
 const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled', 'interrupted'])
@@ -808,9 +1115,41 @@ function formatSupervisorAction(action: string | undefined, t: (k: TranslationKe
 }
 
 function formatSupervisorPlaybookStep(code: string, t: (k: TranslationKey) => string): string {
+  if (code === 'open_task') return t('tasks_supervisor_open_task')
+  if (code === 'open_chat') return t('tasks_supervisor_open_chat')
+  if (code === 'resume_job') return t('tasks_supervisor_resume_job')
+  if (code === 'review_historical_policy') return t('tasks_incident_action_review_historical_policy')
   if (code === 'apply_safe_action') return t('tasks_supervisor_playbook_apply_safe_action')
   if (code === 'recheck_task_state') return t('tasks_supervisor_playbook_recheck_task_state')
   return formatSupervisorAction(code, t)
+}
+
+function safeActionNextStatus(recommendation: SupervisorRecommendation): string | undefined {
+  if (recommendation.safe_action === 'step_reenter') return 'queued'
+  if (recommendation.safe_action === 'normalize_orphan_pending_state') return 'interrupted'
+  if (recommendation.safe_action === 'normalize_terminal_state') return 'completed'
+  if (recommendation.safe_action === 'retry_resume_chain') {
+    return recommendation.safe_action_eligibility?.current_job_status || 'interrupted'
+  }
+  return undefined
+}
+
+function formatStatusList(
+  values: Array<string | null | undefined> | null | undefined,
+  t: (k: TranslationKey) => string,
+): string {
+  const items = (values || [])
+    .map((item) => formatTaskStatusLabel(item, t))
+    .filter(Boolean)
+  return items.join(', ')
+}
+
+function formatSimilarResolution(item: NonNullable<SupervisorDossier['similar_resolutions']>[number], t: (k: TranslationKey) => string): string {
+  if (item.safe_action) return formatSafeActionLabel(item.safe_action, t)
+  if (item.description) return item.description
+  if (item.resolution) return item.resolution
+  if (item.event_type) return humanizeFocusToken(item.event_type)
+  return 'memory'
 }
 
 function splitIssueText(errorMessage: string | null | undefined): string[] {
@@ -1019,6 +1358,7 @@ function JobCard({
   const [pendingInteraction, setPendingInteraction] = useState<PendingInteractionPayload | null>(null)
   const [pendingInteractionType, setPendingInteractionType] = useState<string | null>(null)
   const [runtimeDiagnostics, setRuntimeDiagnostics] = useState<RuntimeDiagnostic[]>([])
+  const [rollbackGuidance, setRollbackGuidance] = useState<RollbackGuidance | null>(null)
   const [autoRecoveryEvents, setAutoRecoveryEvents] = useState<AutoRecoveryEvent[]>([])
   const [timeline, setTimeline] = useState<TimelineEvent[]>([])
   const [timelineFilter, setTimelineFilter] = useState<TimelineCategory>('all')
@@ -1028,8 +1368,16 @@ function JobCard({
   const [confirmationPhase, setConfirmationPhase] = useState<'abstract' | 'execution' | null>(null)
   const [confirmationPlan, setConfirmationPlan] = useState<ConfirmationPlanItem[]>([])
   const [executionPlanSummary, setExecutionPlanSummary] = useState<ExecutionPlanSummary | null>(null)
+  const [executionConfirmationOverview, setExecutionConfirmationOverview] = useState<ExecutionConfirmationOverview | null>(null)
+  const [executionIrReview, setExecutionIrReview] = useState<ExecutionIrReviewItem[]>([])
+  const [executionPlanDelta, setExecutionPlanDelta] = useState<ExecutionPlanDelta | null>(null)
+  const [executionPlanChanges, setExecutionPlanChanges] = useState<ExecutionPlanChangeItem[]>([])
   const logRef = useRef<HTMLDivElement>(null)
   const wsRef = useRef<WebSocket | null>(null)
+  const executionPlanStatusMap = useMemo(
+    () => buildExecutionPlanDeltaStatusMap(executionPlanDelta),
+    [executionPlanDelta],
+  )
 
   const filteredTimeline = useMemo(() => (
     timeline.filter((item) => timelineFilter === 'all' || classifyTimelineEvent(item) === timelineFilter)
@@ -1054,6 +1402,7 @@ function JobCard({
         setPendingInteraction(data.pending_interaction_payload ?? null)
         setPendingInteractionType(data.pending_interaction_type ?? null)
         setRuntimeDiagnostics(Array.isArray(data.runtime_diagnostics) ? data.runtime_diagnostics : [])
+        setRollbackGuidance(data.rollback_guidance ?? null)
         setAutoRecoveryEvents(Array.isArray(data.auto_recovery_events) ? data.auto_recovery_events : [])
         setTimeline(Array.isArray(data.timeline) ? data.timeline : [])
         setTimelineFilter('all')
@@ -1061,6 +1410,10 @@ function JobCard({
         setConfirmationPhase(data.confirmation_phase ?? null)
         setConfirmationPlan(Array.isArray(data.confirmation_plan) ? data.confirmation_plan : [])
         setExecutionPlanSummary(data.execution_plan_summary ?? null)
+        setExecutionConfirmationOverview(data.execution_confirmation_overview ?? null)
+        setExecutionIrReview(Array.isArray(data.execution_ir_review) ? data.execution_ir_review : [])
+        setExecutionPlanDelta(data.execution_plan_delta ?? null)
+        setExecutionPlanChanges(Array.isArray(data.execution_plan_changes) ? data.execution_plan_changes : [])
       })
       .catch(() => {
         setBindingSteps([])
@@ -1069,6 +1422,7 @@ function JobCard({
         setPendingInteraction(null)
         setPendingInteractionType(null)
         setRuntimeDiagnostics([])
+        setRollbackGuidance(null)
         setAutoRecoveryEvents([])
         setTimeline([])
         setTimelineFilter('all')
@@ -1076,6 +1430,10 @@ function JobCard({
         setConfirmationPhase(null)
         setConfirmationPlan([])
         setExecutionPlanSummary(null)
+        setExecutionConfirmationOverview(null)
+        setExecutionIrReview([])
+        setExecutionPlanDelta(null)
+        setExecutionPlanChanges([])
       })
       .finally(() => setBindingsLoading(false))
   }, [job.id, job.error_message, job.status, job.pending_interaction_type, detailRefreshNonce, onJobStateSync])
@@ -1125,6 +1483,10 @@ function JobCard({
     setConfirmationPhase(null)
     setConfirmationPlan([])
     setExecutionPlanSummary(null)
+    setExecutionConfirmationOverview(null)
+    setExecutionIrReview([])
+    setExecutionPlanDelta(null)
+    setExecutionPlanChanges([])
     if (!logsOpen) return
     loadBindings()
   }, [logsOpen, loadBindings])
@@ -1302,6 +1664,41 @@ function JobCard({
                   </div>
                 </div>
               )}
+              {rollbackGuidance && (
+                <div className="mb-4 rounded-lg border border-sky-500/20 bg-sky-500/8 p-3">
+                  <div className="text-[11px] font-semibold uppercase tracking-wide text-sky-300 mb-2">
+                    {t('tasks_rollback_guidance_heading')}
+                  </div>
+                  <div className="text-xs text-sky-100 break-words">
+                    {[
+                      `${t('tasks_supervisor_rollback_level')} ${formatRollbackLevel(rollbackGuidance.level ?? undefined, t)}`,
+                      rollbackGuidance.target
+                        ? `${t('tasks_rollback_guidance_target')} ${rollbackGuidance.target}`
+                        : null,
+                      `${t('tasks_rollback_guidance_reconfirm')} ${formatEligibilityBool(rollbackGuidance.reconfirmation_required, t)}`,
+                    ].filter(Boolean).join(' · ')}
+                  </div>
+                  {rollbackGuidance.reason && (
+                    <div className="mt-1 text-xs text-sky-100 break-words">
+                      {rollbackGuidance.reason}
+                    </div>
+                  )}
+                  {(rollbackGuidance.historical_matches || 0) > 0 && (
+                    <div className="mt-1 text-xs text-sky-100 break-words">
+                      {t('tasks_rollback_guidance_history')}{' '}
+                      {[
+                        t('tasks_rollback_guidance_matches').replace('{count}', String(rollbackGuidance.historical_matches ?? 0)),
+                        typeof rollbackGuidance.historical_same_level_count === 'number'
+                          ? t('tasks_rollback_guidance_same_level').replace('{count}', String(rollbackGuidance.historical_same_level_count))
+                          : null,
+                        typeof rollbackGuidance.historical_same_target_count === 'number'
+                          ? t('tasks_rollback_guidance_same_target').replace('{count}', String(rollbackGuidance.historical_same_target_count))
+                          : null,
+                      ].filter(Boolean).join(' · ')}
+                    </div>
+                  )}
+                </div>
+              )}
               {timeline.length > 0 && (
                 <div className="mb-4 rounded-lg border border-border-subtle bg-surface-overlay/60 p-3">
                   <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
@@ -1397,6 +1794,54 @@ function JobCard({
                       {t('tasks_confirmation_scope').replace('{items}', String(confirmationPlan.length))}
                     </span>
                   </div>
+                  {confirmationPhase === 'execution' && executionConfirmationOverview && (
+                    <div className="mb-3 rounded-md border border-cyan-500/15 bg-cyan-500/6 px-3 py-2 text-[11px] text-cyan-100/90">
+                      {t('tasks_confirmation_overview_summary')
+                        .replace('{abstract}', String(executionConfirmationOverview.abstract_step_count ?? 0))
+                        .replace('{ir}', String(executionConfirmationOverview.execution_ir_step_count ?? 0))
+                        .replace('{groups}', String(executionConfirmationOverview.execution_group_count ?? 0))
+                        .replace('{per_sample}', String(executionConfirmationOverview.per_sample_step_count ?? 0))
+                        .replace('{aggregate}', String(executionConfirmationOverview.aggregate_step_count ?? 0))
+                        .replace('{added}', String(executionConfirmationOverview.added_group_count ?? 0))
+                        .replace('{changed}', String(executionConfirmationOverview.changed_group_count ?? 0))}
+                    </div>
+                  )}
+                  {confirmationPhase === 'execution' && executionPlanDelta && (
+                    <div className="mb-3 rounded-md border border-border-subtle/70 bg-surface-base/30 px-3 py-2 text-[11px] text-text-muted">
+                      {t('tasks_confirmation_delta_summary')
+                        .replace('{abstract}', String(executionPlanDelta.abstract_step_count ?? 0))
+                        .replace('{execution}', String(executionPlanDelta.execution_group_count ?? 0))
+                        .replace('{unchanged}', String(executionPlanDelta.unchanged_group_count ?? 0))
+                        .replace('{changed}', String(executionPlanDelta.changed_group_count ?? 0))
+                        .replace('{added}', String(executionPlanDelta.added_group_count ?? 0))}
+                    </div>
+                  )}
+                  {confirmationPhase === 'execution' && executionIrReview.length > 0 && (
+                    <div className="space-y-2 mb-3">
+                      <div className="text-[11px] font-semibold uppercase tracking-wide text-text-muted">
+                        {t('tasks_confirmation_execution_ir_review')}
+                      </div>
+                      {executionIrReview.map((item, index) => {
+                        const title = item.display_name || item.step_key || item.step_type || t('chat_plan_step_fallback')
+                        const meta = [item.step_type, item.description].filter(Boolean).join(' · ')
+                        return (
+                          <div
+                            key={`${job.id}-execution-ir-${item.step_key ?? item.step_type ?? index}`}
+                            className="rounded-md border border-cyan-500/10 bg-surface-raised/80 p-2"
+                          >
+                            <div className="text-xs font-medium text-text-primary">
+                              {index + 1}. {title}
+                            </div>
+                            {meta && (
+                              <div className="mt-1 text-[11px] text-text-muted break-words">
+                                {meta}
+                              </div>
+                            )}
+                          </div>
+                        )
+                      })}
+                    </div>
+                  )}
                   <div className="mb-3 rounded-md border border-border-subtle/70 bg-surface-base/30 px-3 py-2">
                     <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-text-muted">
                       {t('tasks_confirmation_layers')}
@@ -1420,6 +1865,43 @@ function JobCard({
                   <div className="text-xs text-amber-100 whitespace-pre-wrap mb-3">
                     {pendingInteraction?.prompt_text || t('tasks_confirmation_waiting')}
                   </div>
+                  {confirmationPhase === 'execution' && executionPlanChanges.length > 0 && (
+                    <div className="space-y-2 mb-3">
+                      <div className="text-[11px] font-semibold uppercase tracking-wide text-text-muted">
+                        {t('tasks_confirmation_changes')}
+                      </div>
+                      {executionPlanChanges.map((item, index) => {
+                        const title = item.display_name || item.group_key || item.step_type || t('chat_plan_step_fallback')
+                        const summary = formatExecutionPlanChangeSummary(item, t)
+                        const changeKinds = (item.change_kinds ?? []).filter(Boolean)
+                        return (
+                          <div
+                            key={`${job.id}-confirmation-change-${item.group_key ?? item.step_type ?? index}`}
+                            className="rounded-md border border-sky-500/10 bg-surface-raised/80 p-2"
+                          >
+                            <div className="flex flex-wrap items-center gap-2">
+                              <div className="text-xs font-medium text-text-primary">
+                                {title}
+                              </div>
+                              {changeKinds.map((kind) => (
+                                <span
+                                  key={`${job.id}-confirmation-change-kind-${item.group_key ?? index}-${kind}`}
+                                  className="rounded-full border border-sky-500/20 bg-sky-500/10 px-2 py-0.5 text-[10px] font-medium text-sky-200"
+                                >
+                                  {formatExecutionPlanChangeKind(kind, t)}
+                                </span>
+                              ))}
+                            </div>
+                            {summary && (
+                              <div className="mt-1 text-[11px] text-text-muted break-words">
+                                {summary}
+                              </div>
+                            )}
+                          </div>
+                        )
+                      })}
+                    </div>
+                  )}
                   {confirmationPlan.length > 0 && (
                     <div className="space-y-2 mb-3">
                       <div className="text-[11px] font-semibold uppercase tracking-wide text-text-muted">
@@ -1428,13 +1910,26 @@ function JobCard({
                       {confirmationPlan.map((item, index) => {
                         const title = item.display_name || item.name || item.step_key || item.step_type || t('chat_plan_step_fallback')
                         const meta = [item.step_type, item.description].filter(Boolean).join(' · ')
+                        const status = item.step_key ? executionPlanStatusMap[item.step_key] : undefined
                         return (
                           <div
                             key={`${job.id}-confirmation-${item.step_key ?? item.step_type ?? index}`}
                             className="rounded-md border border-amber-500/10 bg-surface-raised/80 p-2"
                           >
-                            <div className="text-xs font-medium text-text-primary">
-                              {index + 1}. {title}
+                            <div className="flex flex-wrap items-center gap-2">
+                              <div className="text-xs font-medium text-text-primary">
+                                {index + 1}. {title}
+                              </div>
+                              {status === 'added' && (
+                                <span className="rounded-full border border-sky-500/20 bg-sky-500/10 px-2 py-0.5 text-[10px] font-medium text-sky-200">
+                                  {t('tasks_confirmation_status_added')}
+                                </span>
+                              )}
+                              {status === 'changed' && (
+                                <span className="rounded-full border border-amber-500/20 bg-amber-500/10 px-2 py-0.5 text-[10px] font-medium text-amber-200">
+                                  {t('tasks_confirmation_status_changed')}
+                                </span>
+                              )}
                             </div>
                             {meta && (
                               <div className="mt-1 text-[11px] text-text-muted break-words">
@@ -1589,6 +2084,7 @@ export default function TaskMonitor({
   onAutoSelectConsumed,
   onOpenThread,
   onOpenResourceWorkspace,
+  onOpenSettingsDiagnostics,
 }: Props) {
   const { t, lang } = useLanguage()
   const {
@@ -1623,9 +2119,9 @@ export default function TaskMonitor({
   const listRef = useRef<HTMLDivElement>(null)
   const projectEventRefreshTimerRef = useRef<number | null>(null)
   const jobs = getJobsPage(page) as Job[]
-  const recentJobsById = useMemo(
-    () => Object.fromEntries(recentJobs.map((job) => [job.id, job])),
-    [recentJobs],
+  const knownJobsById = useMemo(
+    () => Object.fromEntries([...recentJobs, ...jobs].map((job) => [job.id, job])),
+    [jobs, recentJobs],
   )
   const incidentsByKey = useMemo(
     () => Object.fromEntries(incidents.map((incident) => [`${incident.job_id}:${incident.incident_type}`, incident])),
@@ -1638,36 +2134,41 @@ export default function TaskMonitor({
       .filter((item) => item.reason === 'authorization')
       .map((item) => ({
         item,
-        job: recentJobsById[item.job_id] ?? null,
+        job: knownJobsById[item.job_id] ?? null,
       })),
-    [attentionNeedsInput, recentJobsById],
+    [attentionNeedsInput, knownJobsById],
   )
   const pendingRepairEntries = useMemo(
     () => attentionNeedsInput
       .filter((item) => item.reason === 'repair')
       .map((item) => ({
         item,
-        job: recentJobsById[item.job_id] ?? null,
+        job: knownJobsById[item.job_id] ?? null,
       })),
-    [attentionNeedsInput, recentJobsById],
+    [attentionNeedsInput, knownJobsById],
   )
   const pendingOperatorEntries = useMemo(
     () => attentionNeedsInput
-      .filter((item) => item.reason === 'confirmation' || item.reason === 'clarification')
+      .filter((item) => item.reason === 'confirmation' || item.reason === 'clarification' || item.reason === 'rollback_review')
       .map((item) => ({
         item,
-        job: recentJobsById[item.job_id] ?? null,
+        job: knownJobsById[item.job_id] ?? null,
         incident: incidentsByKey[`${item.job_id}:${item.incident_type}`],
-      })),
-    [attentionNeedsInput, incidentsByKey, recentJobsById],
+      }))
+      .sort((left, right) => {
+        const reasonDelta = pendingOperatorPriority(left.item.reason) - pendingOperatorPriority(right.item.reason)
+        if (reasonDelta !== 0) return reasonDelta
+        return (right.item.age_seconds ?? 0) - (left.item.age_seconds ?? 0)
+      }),
+    [attentionNeedsInput, incidentsByKey, knownJobsById],
   )
   const reviewEntries = useMemo(
     () => attentionNeedsReview.map((item) => ({
       item,
-      job: recentJobsById[item.job_id] ?? null,
+      job: knownJobsById[item.job_id] ?? null,
       incident: incidentsByKey[`${item.job_id}:${item.incident_type}`],
     })),
-    [attentionNeedsReview, incidentsByKey, recentJobsById],
+    [attentionNeedsReview, incidentsByKey, knownJobsById],
   )
   const autoAuthorizeCommands = attentionSummary?.auto_authorize_commands ?? false
   const attentionCounts = attentionSummary?.counts ?? {
@@ -1676,6 +2177,7 @@ export default function TaskMonitor({
     repair: 0,
     confirmation: 0,
     clarification: 0,
+    rollback_review: 0,
     warning: 0,
     needs_input: 0,
     needs_review: 0,
@@ -1689,6 +2191,12 @@ export default function TaskMonitor({
       return acc
     }, { total: 0, critical: 0, warning: 0, info: 0 }),
     [reviewEntries],
+  )
+  const supervisorCandidateTotal = (
+    reviewEntries.length
+    + pendingAuthorizationEntries.length
+    + pendingRepairEntries.length
+    + pendingOperatorEntries.length
   )
 
   const loadJobsPage = useCallback((pageNumber: number, options?: { force?: boolean }) => {
@@ -1728,10 +2236,10 @@ export default function TaskMonitor({
   }, [projectId])
 
   useEffect(() => {
-    if (reviewSummary.total === 0) {
+    if (supervisorCandidateTotal === 0) {
       setSupervisorReview(null)
     }
-  }, [reviewSummary.total])
+  }, [supervisorCandidateTotal])
 
   useEffect(() => {
     void loadJobsPage(page)
@@ -1751,7 +2259,7 @@ export default function TaskMonitor({
   useEffect(() => {
     if (eventVersion === 0) return
 
-    const shouldRefreshSupervisor = Boolean(supervisorReview) || reviewSummary.total > 0
+    const shouldRefreshSupervisor = Boolean(supervisorReview) || supervisorCandidateTotal > 0
 
     if (projectEventRefreshTimerRef.current !== null) {
       window.clearTimeout(projectEventRefreshTimerRef.current)
@@ -1764,7 +2272,7 @@ export default function TaskMonitor({
       }
       projectEventRefreshTimerRef.current = null
     }, 250)
-  }, [eventVersion, loadJobsPage, loadSupervisorReview, page, refreshIncidents, reviewSummary.total, supervisorReview])
+  }, [eventVersion, loadJobsPage, loadSupervisorReview, page, refreshIncidents, supervisorCandidateTotal, supervisorReview])
 
   useEffect(() => {
     if (!autoSelectJobId) return
@@ -2073,54 +2581,91 @@ export default function TaskMonitor({
             </div>
             <div className="mt-3 space-y-3">
               {pendingOperatorEntries.map(({ item, job, incident }) => (
-                <div
-                  key={`pending-input-${item.key}`}
-                  className="rounded-lg border border-violet-500/10 bg-surface-raised/80 p-3"
-                >
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span className="text-xs font-semibold text-text-primary">{job?.name ?? item.job_name ?? item.job_id}</span>
-                    {job?.status && <StatusBadge status={job.status} />}
-                    <span className="rounded-full bg-violet-500/12 px-2 py-0.5 text-[10px] text-violet-200">
-                      {formatAttentionReasonLabel(item.reason, t)}
-                    </span>
-                  </div>
-                  {job?.goal && (
-                    <div className="mt-1 text-[11px] text-text-muted break-words">
-                      {job.goal}
-                    </div>
-                  )}
-                  <div className="mt-2 text-xs text-text-primary">
-                    {item.summary}
-                  </div>
-                  {incident?.current_step_name && (
-                    <div className="mt-1 text-[11px] text-text-muted">
-                      {t('tasks_incident_current_step').replace('{step}', incident.current_step_name)}
-                    </div>
-                  )}
-                  {incident?.next_action && (
-                    <div className="mt-1 text-[11px] text-text-muted">
-                      {t(`tasks_incident_action_${incident.next_action}` as TranslationKey)}
-                    </div>
-                  )}
-                  <div className="mt-3 flex flex-wrap gap-2">
-                    <button
-                      type="button"
-                      onClick={() => focusJob(item.job_id)}
-                      className="rounded-lg border border-border-subtle px-3 py-1.5 text-xs text-text-primary transition-colors hover:bg-surface-hover"
+                (() => {
+                  const chatActionCode = resolveOperatorChatActionCode({
+                    reason: item.reason,
+                    rollbackLevel: item.rollback_level,
+                    nextAction: incident?.next_action ?? item.next_action,
+                  })
+                  const chatHint = formatOperatorChatActionHint(chatActionCode, t)
+                  return (
+                    <div
+                      key={`pending-input-${item.key}`}
+                      className="rounded-lg border border-violet-500/10 bg-surface-raised/80 p-3"
                     >
-                      {t('tasks_supervisor_open_task')}
-                    </button>
-                    {(job?.thread_id || incident?.thread_id) && onOpenThread && (
-                      <button
-                        type="button"
-                        onClick={() => onOpenThread((job?.thread_id ?? incident?.thread_id) || null, item.job_id)}
-                        className="rounded-lg border border-violet-500/25 px-3 py-1.5 text-xs text-violet-100 transition-colors hover:bg-violet-500/10"
-                      >
-                        {t('tasks_supervisor_open_chat')}
-                      </button>
-                    )}
-                  </div>
-                </div>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="text-xs font-semibold text-text-primary">{job?.name ?? item.job_name ?? item.job_id}</span>
+                        {job?.status && <StatusBadge status={job.status} />}
+                        <span className="rounded-full bg-violet-500/12 px-2 py-0.5 text-[10px] text-violet-200">
+                          {formatAttentionReasonLabel(item.reason, t)}
+                        </span>
+                      </div>
+                      {job?.goal && (
+                        <div className="mt-1 text-[11px] text-text-muted break-words">
+                          {job.goal}
+                        </div>
+                      )}
+                      <div className="mt-2 text-xs text-text-primary">
+                        {item.summary}
+                      </div>
+                      {item.reason === 'rollback_review' && (
+                        <div className="mt-1 space-y-1 text-[11px] text-text-muted">
+                          <div>
+                            {t('tasks_attention_rollback_scope')}{' '}
+                            {[
+                              item.rollback_level
+                                ? `${t('tasks_supervisor_rollback_level')} ${formatRollbackLevel(item.rollback_level, t)}`
+                                : null,
+                              item.rollback_target ? `target=${item.rollback_target}` : null,
+                              item.reconfirmation_required !== undefined && item.reconfirmation_required !== null
+                                ? `${t('tasks_rollback_guidance_reconfirm')} ${formatEligibilityBool(item.reconfirmation_required, t)}`
+                                : null,
+                            ].filter(Boolean).join(' · ')}
+                          </div>
+                          {item.rollback_reason && (
+                            <div>
+                              {t('tasks_attention_rollback_reason')}{' '}
+                              {item.rollback_reason}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                      {incident?.current_step_name && (
+                        <div className="mt-1 text-[11px] text-text-muted">
+                          {t('tasks_incident_current_step').replace('{step}', incident.current_step_name)}
+                        </div>
+                      )}
+                      {incident?.next_action && (
+                        <div className="mt-1 text-[11px] text-text-muted">
+                          {t(`tasks_incident_action_${incident.next_action}` as TranslationKey)}
+                        </div>
+                      )}
+                      {chatHint && (
+                        <div className="mt-1 text-[11px] text-violet-100/90">
+                          {chatHint}
+                        </div>
+                      )}
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        <button
+                          type="button"
+                          onClick={() => focusJob(item.job_id)}
+                          className="rounded-lg border border-border-subtle px-3 py-1.5 text-xs text-text-primary transition-colors hover:bg-surface-hover"
+                        >
+                          {t('tasks_supervisor_open_task')}
+                        </button>
+                        {(job?.thread_id || item.thread_id || incident?.thread_id) && onOpenThread && (
+                          <button
+                            type="button"
+                            onClick={() => onOpenThread((job?.thread_id ?? item.thread_id ?? incident?.thread_id) || null, item.job_id)}
+                            className="rounded-lg border border-violet-500/25 px-3 py-1.5 text-xs text-violet-100 transition-colors hover:bg-violet-500/10"
+                          >
+                            {formatOperatorChatActionCta(chatActionCode, t)}
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  )
+                })()
               ))}
             </div>
           </div>
@@ -2295,20 +2840,26 @@ export default function TaskMonitor({
             </div>
           </div>
         )}
-        {reviewEntries.length > 0 && (
+        {supervisorCandidateTotal > 0 && (
           <div className="rounded-xl border border-amber-500/20 bg-amber-500/8 p-4">
             <div className="flex flex-wrap items-center gap-2 justify-between">
               <div>
                 <div className="text-xs font-semibold uppercase tracking-wide text-amber-300">
-                  {t('tasks_incident_heading')}
+                  {reviewEntries.length > 0 ? t('tasks_incident_heading') : t('tasks_supervisor_heading')}
                 </div>
-                <div className="mt-1 text-sm text-text-primary">
-                  {t('tasks_incident_summary')
-                    .replace('{total}', String(reviewSummary.total))
-                    .replace('{critical}', String(reviewSummary.critical))
-                    .replace('{warning}', String(reviewSummary.warning))
-                    .replace('{info}', String(reviewSummary.info))}
-                </div>
+                {reviewEntries.length > 0 ? (
+                  <div className="mt-1 text-sm text-text-primary">
+                    {t('tasks_incident_summary')
+                      .replace('{total}', String(reviewSummary.total))
+                      .replace('{critical}', String(reviewSummary.critical))
+                      .replace('{warning}', String(reviewSummary.warning))
+                      .replace('{info}', String(reviewSummary.info))}
+                  </div>
+                ) : (
+                  <div className="mt-1 text-xs text-text-muted">
+                    {t('tasks_attention_hint')}
+                  </div>
+                )}
               </div>
               <button
                 type="button"
@@ -2319,49 +2870,51 @@ export default function TaskMonitor({
                 {t(supervisorLoading ? 'tasks_supervisor_reviewing' : 'tasks_supervisor_review')}
               </button>
             </div>
-            <div className="mt-3 space-y-2">
-              {reviewEntries.slice(0, 5).map(({ item, job, incident }) => {
-                const ageMinutes = item.age_seconds != null ? Math.max(1, Math.floor(item.age_seconds / 60)) : null
-                const severityClass = item.severity === 'critical'
-                  ? 'border-red-500/20 bg-red-500/8'
-                  : item.severity === 'warning'
-                    ? 'border-amber-500/20 bg-amber-500/8'
-                    : 'border-sky-500/20 bg-sky-500/8'
-                const badgeClass = item.owner === 'user'
-                  ? 'bg-indigo-500/15 text-indigo-300'
-                  : 'bg-surface-overlay text-text-muted'
-                return (
-                  <div
-                    key={item.key}
-                    className={`rounded-lg border p-3 ${severityClass}`}
-                  >
-                    <div className="flex flex-wrap items-center gap-2">
-                      <span className="text-xs font-semibold text-text-primary">{job?.name ?? item.job_name}</span>
-                      {job?.status && <StatusBadge status={job.status} />}
-                      <span className={`rounded-full px-2 py-0.5 text-[10px] ${badgeClass}`}>
-                        {item.owner === 'user' ? t('tasks_incident_owner_user') : t('tasks_incident_owner_system')}
-                      </span>
-                      {ageMinutes != null && (
-                        <span className="text-[11px] text-text-muted">
-                          {t('tasks_incident_age_minutes').replace('{minutes}', String(ageMinutes))}
+            {reviewEntries.length > 0 && (
+              <div className="mt-3 space-y-2">
+                {reviewEntries.slice(0, 5).map(({ item, job, incident }) => {
+                  const ageMinutes = item.age_seconds != null ? Math.max(1, Math.floor(item.age_seconds / 60)) : null
+                  const severityClass = item.severity === 'critical'
+                    ? 'border-red-500/20 bg-red-500/8'
+                    : item.severity === 'warning'
+                      ? 'border-amber-500/20 bg-amber-500/8'
+                      : 'border-sky-500/20 bg-sky-500/8'
+                  const badgeClass = item.owner === 'user'
+                    ? 'bg-indigo-500/15 text-indigo-300'
+                    : 'bg-surface-overlay text-text-muted'
+                  return (
+                    <div
+                      key={item.key}
+                      className={`rounded-lg border p-3 ${severityClass}`}
+                    >
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="text-xs font-semibold text-text-primary">{job?.name ?? item.job_name}</span>
+                        {job?.status && <StatusBadge status={job.status} />}
+                        <span className={`rounded-full px-2 py-0.5 text-[10px] ${badgeClass}`}>
+                          {item.owner === 'user' ? t('tasks_incident_owner_user') : t('tasks_incident_owner_system')}
                         </span>
+                        {ageMinutes != null && (
+                          <span className="text-[11px] text-text-muted">
+                            {t('tasks_incident_age_minutes').replace('{minutes}', String(ageMinutes))}
+                          </span>
+                        )}
+                      </div>
+                      <div className="mt-2 text-xs text-text-primary">{item.summary}</div>
+                      {incident?.current_step_name && (
+                        <div className="mt-1 text-[11px] text-text-muted">
+                          {t('tasks_incident_current_step').replace('{step}', incident.current_step_name)}
+                        </div>
+                      )}
+                      {incident?.next_action && (
+                        <div className="mt-1 text-[11px] text-text-muted">
+                          {t(`tasks_incident_action_${incident.next_action}` as TranslationKey)}
+                        </div>
                       )}
                     </div>
-                    <div className="mt-2 text-xs text-text-primary">{item.summary}</div>
-                    {incident?.current_step_name && (
-                      <div className="mt-1 text-[11px] text-text-muted">
-                        {t('tasks_incident_current_step').replace('{step}', incident.current_step_name)}
-                      </div>
-                    )}
-                    {incident?.next_action && (
-                      <div className="mt-1 text-[11px] text-text-muted">
-                        {t(`tasks_incident_action_${incident.next_action}` as TranslationKey)}
-                      </div>
-                    )}
-                  </div>
-                )
-              })}
-            </div>
+                  )
+                })}
+              </div>
+            )}
             {supervisorReview && (
               <div className="mt-4 rounded-lg border border-indigo-500/20 bg-indigo-500/8 p-4">
                 <div className="flex flex-wrap items-center gap-2 justify-between">
@@ -2376,6 +2929,10 @@ export default function TaskMonitor({
                 <div className="mt-2 text-xs text-text-muted">{supervisorReview.supervisor_message}</div>
                 {supervisorReview.focus_summary && (
                   <div className="mt-2 text-[11px] text-text-muted">
+                    {(() => {
+                      const focusSummaryAutoRecovery = formatFocusSummaryAutoRecovery(supervisorReview.focus_summary, t)
+                      return (
+                        <>
                     {t('tasks_supervisor_focus_summary')}{' '}
                     {[
                       supervisorReview.focus_summary.primary_lane
@@ -2399,13 +2956,41 @@ export default function TaskMonitor({
                       typeof supervisorReview.focus_summary.user_wait_total === 'number'
                         ? `user_wait=${supervisorReview.focus_summary.user_wait_total}`
                         : null,
+                      supervisorReview.focus_summary.top_failure_layer
+                        ? `layer=${formatFailureLayer(supervisorReview.focus_summary.top_failure_layer, t)}`
+                        : null,
                       supervisorReview.focus_summary.top_safe_action
-                        ? `safe_action=${supervisorReview.focus_summary.top_safe_action}`
+                        ? `safe_action=${formatSafeActionLabel(supervisorReview.focus_summary.top_safe_action, t)}`
+                        : null,
+                      supervisorReview.focus_summary.top_rollback_level
+                        ? `rollback=${formatRollbackLevel(supervisorReview.focus_summary.top_rollback_level, t)}`
+                        : null,
+                      supervisorReview.focus_summary.top_historical_rollback_level
+                        ? `history_rollback=${formatRollbackLevel(supervisorReview.focus_summary.top_historical_rollback_level, t)}`
+                        : null,
+                      supervisorReview.focus_summary.top_historical_rollback_alignment !== undefined
+                        && supervisorReview.focus_summary.top_historical_rollback_alignment !== null
+                        ? `history_align=${formatHistoricalAlignment(supervisorReview.focus_summary.top_historical_rollback_alignment, t)}`
+                        : null,
+                      supervisorReview.focus_summary.top_rollback_target
+                        ? `target=${formatRollbackTarget(supervisorReview.focus_summary.top_rollback_target)}`
+                        : null,
+                      supervisorReview.focus_summary.top_historical_rollback_target
+                        ? `history_target=${formatRollbackTarget(supervisorReview.focus_summary.top_historical_rollback_target)}`
+                        : null,
+                      supervisorReview.focus_summary.top_historical_rollback_target_alignment !== undefined
+                        && supervisorReview.focus_summary.top_historical_rollback_target_alignment !== null
+                        ? `target_align=${formatHistoricalAlignment(supervisorReview.focus_summary.top_historical_rollback_target_alignment, t)}`
                         : null,
                       supervisorReview.focus_summary.next_best_operator_move
                         ? `next=${formatNextBestMove(supervisorReview.focus_summary.next_best_operator_move, t)}`
                         : null,
                     ].filter(Boolean).join(' · ')}
+                    {focusSummaryAutoRecovery && (
+                      <>
+                        {' '}· {t('tasks_supervisor_auto_recovery')} {focusSummaryAutoRecovery}
+                      </>
+                    )}
                     {supervisorReview.focus_summary.lane_reason && (
                       <>
                         {' '}· {supervisorReview.focus_summary.lane_reason}
@@ -2416,21 +3001,242 @@ export default function TaskMonitor({
                         {' '}· {supervisorReview.focus_summary.next_best_operator_reason}
                       </>
                     )}
+                        </>
+                      )
+                    })()}
                   </div>
                 )}
                 {supervisorReview.project_playbook?.step_codes && supervisorReview.project_playbook.step_codes.length > 0 && (
-                  <div className="mt-3 rounded-md border border-border-subtle/70 bg-surface-base/40 px-3 py-2">
-                    <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-text-muted">
-                      {t('tasks_supervisor_project_playbook')}
-                    </div>
-                    <div className="space-y-1">
-                      {supervisorReview.project_playbook.step_codes.map((stepCode, index) => (
-                        <div key={`project-playbook-${stepCode}-${index}`} className="text-[11px] text-text-muted">
-                          {index + 1}. {formatSupervisorPlaybookStep(stepCode, t)}
+                  (() => {
+                    const topRecommendation = supervisorReview.recommendations[0]
+                    const topJob = recentJobs.find((item) => item.id === topRecommendation?.job_id) ?? null
+                    const topDossier = supervisorReview.dossiers?.find((item) => item.job_id === topRecommendation?.job_id)
+                    const topPendingAuthorizationEntry = (
+                      topRecommendation?.job_id
+                        ? pendingAuthorizationEntries.find(({ item }) => item.job_id === topRecommendation.job_id)
+                        : null
+                    ) ?? pendingAuthorizationEntries[0] ?? null
+                    const topAuthorizationSnapshot = topPendingAuthorizationEntry ? authorizationSnapshots[topPendingAuthorizationEntry.item.job_id] : null
+                    const topAuthorizationRequestId = topAuthorizationSnapshot?.auth_request_id ?? null
+                    const topPendingRepairEntry = (
+                      topRecommendation?.job_id
+                        ? pendingRepairEntries.find(({ item }) => item.job_id === topRecommendation.job_id)
+                        : null
+                    ) ?? pendingRepairEntries[0] ?? null
+                    const topRepairSnapshot = topPendingRepairEntry ? repairSnapshots[topPendingRepairEntry.item.job_id] : null
+                    const topRepairRequestId = topRepairSnapshot?.repair_request_id ?? null
+                    const topBlockingSummary = topDossier?.resource_graph?.blocking_summary ?? []
+                    const topDominantBlocker = topDossier?.resource_graph?.dominant_blocker ?? topBlockingSummary[0] ?? null
+                    const topWorkspaceRequest = topDominantBlocker ? buildResourceWorkspaceRequest(topDominantBlocker) : null
+                    const topRegistryRequest = topDominantBlocker ? buildRegistryWorkspaceRequest(topDominantBlocker) : null
+                    const topThreadId = topRecommendation?.thread_id ?? topJob?.thread_id ?? null
+                    const showOpenTaskShortcut = Boolean(topRecommendation?.job_id)
+                    const showOpenChatShortcut = supervisorReview.project_playbook?.step_codes?.includes('open_chat') && Boolean(topThreadId) && Boolean(onOpenThread)
+                    const showApplySafeActionShortcut = supervisorReview.project_playbook?.step_codes?.includes('apply_safe_action') && Boolean(topRecommendation?.job_id) && Boolean(topRecommendation?.safe_action)
+                    const showResumeJobShortcut = supervisorReview.project_playbook?.step_codes?.includes('resume_job') && Boolean(topRecommendation?.job_id) && topRecommendation?.immediate_action === 'resume_job'
+                    const showAuthorizationPromptShortcut = supervisorReview.project_playbook?.step_codes?.includes('review_and_authorize_command') && Boolean(topPendingAuthorizationEntry)
+                    const showRepairPromptShortcut = supervisorReview.project_playbook?.step_codes?.includes('review_failure_and_choose_repair') && Boolean(topPendingRepairEntry)
+                    const showEnvironmentDiagnosticsShortcut = (
+                      supervisorReview.focus_summary?.primary_lane === 'environment_readiness'
+                      || supervisorReview.focus_summary?.next_best_operator_move === 'inspect_environment_failure'
+                      || supervisorReview.project_playbook?.goal === 'environment_readiness'
+                      || supervisorReview.project_playbook?.next_move === 'inspect_environment_failure'
+                    )
+
+                    return (
+                      <div className="mt-3 rounded-md border border-border-subtle/70 bg-surface-base/40 px-3 py-2">
+                        <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-text-muted">
+                          {t('tasks_supervisor_project_playbook')}
                         </div>
-                      ))}
-                    </div>
-                  </div>
+                        {(supervisorReview.project_playbook.goal || supervisorReview.project_playbook.next_move) && (
+                          <div className="mb-2 text-[11px] text-text-muted">
+                            {[
+                              supervisorReview.project_playbook.goal
+                                ? `${t('tasks_supervisor_project_goal')} ${formatPrimaryLane(supervisorReview.project_playbook.goal, t)}`
+                                : null,
+                              supervisorReview.project_playbook.next_move
+                                ? `${t('tasks_supervisor_project_next_move')} ${formatNextBestMove(supervisorReview.project_playbook.next_move, t)}`
+                                : null,
+                            ].filter(Boolean).join(' · ')}
+                          </div>
+                        )}
+                        <div className="space-y-1">
+                          {supervisorReview.project_playbook.step_codes.map((stepCode, index) => (
+                            <div key={`project-playbook-${stepCode}-${index}`} className="text-[11px] text-text-muted">
+                              {index + 1}. {formatSupervisorPlaybookStep(stepCode, t)}
+                            </div>
+                          ))}
+                        </div>
+                        {showAuthorizationPromptShortcut && topPendingAuthorizationEntry && (
+                          <div className="mt-3">
+                            {topAuthorizationSnapshot?.command && topAuthorizationRequestId ? (
+                              <AuthorizationPromptCard
+                                title={t('status_waiting_for_authorization')}
+                                subtitle={topAuthorizationSnapshot.command_type || topAuthorizationSnapshot.step_key || 'command'}
+                                command={topAuthorizationSnapshot.command}
+                                onAuthorize={() => {
+                                  void resolveAuthorizationFromQueue(topPendingAuthorizationEntry.item.job_id, topAuthorizationRequestId, 'approved')
+                                }}
+                                onReject={() => {
+                                  void resolveAuthorizationFromQueue(topPendingAuthorizationEntry.item.job_id, topAuthorizationRequestId, 'rejected')
+                                }}
+                                authActionLoading={authorizationActionLoading[topPendingAuthorizationEntry.item.job_id] ?? null}
+                                actionRow={(
+                                  <>
+                                    <button
+                                      type="button"
+                                      onClick={() => focusJob(topPendingAuthorizationEntry.item.job_id)}
+                                      className="rounded-lg border border-border-subtle px-3 py-1.5 text-xs text-text-primary transition-colors hover:bg-surface-hover"
+                                    >
+                                      {t('tasks_supervisor_open_task')}
+                                    </button>
+                                    {(topPendingAuthorizationEntry.job?.thread_id || topThreadId) && onOpenThread && (
+                                      <button
+                                        type="button"
+                                        onClick={() => onOpenThread(topPendingAuthorizationEntry.job?.thread_id ?? topThreadId ?? null, topPendingAuthorizationEntry.item.job_id)}
+                                        className="rounded-lg border border-sky-500/25 px-3 py-1.5 text-xs text-sky-100 transition-colors hover:bg-sky-500/10"
+                                      >
+                                        {t('tasks_supervisor_open_chat')}
+                                      </button>
+                                    )}
+                                  </>
+                                )}
+                              />
+                            ) : (
+                              <div className="rounded-lg border border-border-subtle/70 bg-surface-base/40 px-3 py-2 text-xs text-text-muted">
+                                {authorizationSnapshotLoading[topPendingAuthorizationEntry.item.job_id]
+                                  ? t('settings_loading')
+                                  : t('tasks_pending_authorizations_loading_command')}
+                              </div>
+                            )}
+                          </div>
+                        )}
+                        {showRepairPromptShortcut && topPendingRepairEntry && (
+                          <div className="mt-3">
+                            {topRepairRequestId ? (
+                              <RepairPromptCard
+                                title={t('status_waiting_for_repair')}
+                                subtitle={topRepairSnapshot?.step_key}
+                                failedCommand={topRepairSnapshot?.failed_command}
+                                stderrExcerpt={topRepairSnapshot?.stderr_excerpt}
+                                repairCommand={repairDrafts[topPendingRepairEntry.item.job_id] ?? ''}
+                                onRepairCommandChange={(value) => {
+                                  setRepairDrafts((prev) => ({ ...prev, [topPendingRepairEntry.item.job_id]: value }))
+                                }}
+                                onSendRetry={() => {
+                                  void resolveRepairFromQueue(topPendingRepairEntry.item.job_id, topRepairRequestId, 'modify_params')
+                                }}
+                                onRetryOriginal={() => {
+                                  void resolveRepairFromQueue(topPendingRepairEntry.item.job_id, topRepairRequestId, 'retry_original')
+                                }}
+                                onCancelJob={() => {
+                                  void resolveRepairFromQueue(topPendingRepairEntry.item.job_id, topRepairRequestId, 'cancel_job')
+                                }}
+                                repairActionLoading={repairActionLoadingByJob[topPendingRepairEntry.item.job_id] ?? null}
+                                actionRow={(
+                                  <>
+                                    <button
+                                      type="button"
+                                      onClick={() => focusJob(topPendingRepairEntry.item.job_id)}
+                                      className="rounded-lg border border-border-subtle px-3 py-1.5 text-xs text-text-primary transition-colors hover:bg-surface-hover"
+                                    >
+                                      {t('tasks_supervisor_open_task')}
+                                    </button>
+                                    {(topPendingRepairEntry.job?.thread_id || topThreadId) && onOpenThread && (
+                                      <button
+                                        type="button"
+                                        onClick={() => onOpenThread(topPendingRepairEntry.job?.thread_id ?? topThreadId ?? null, topPendingRepairEntry.item.job_id)}
+                                        className="rounded-lg border border-rose-500/25 px-3 py-1.5 text-xs text-rose-100 transition-colors hover:bg-rose-500/10"
+                                      >
+                                        {t('tasks_supervisor_open_chat')}
+                                      </button>
+                                    )}
+                                  </>
+                                )}
+                              />
+                            ) : (
+                              <div className="rounded-lg border border-border-subtle/70 bg-surface-base/40 px-3 py-2 text-xs text-text-muted">
+                                {repairSnapshotLoading[topPendingRepairEntry.item.job_id]
+                                  ? t('settings_loading')
+                                  : t('tasks_pending_repairs_loading_payload')}
+                              </div>
+                            )}
+                          </div>
+                        )}
+                        {showOpenTaskShortcut || showOpenChatShortcut || showApplySafeActionShortcut || showResumeJobShortcut || (showEnvironmentDiagnosticsShortcut && onOpenSettingsDiagnostics) || (topDominantBlocker && onOpenResourceWorkspace) ? (
+                          <div className="mt-3 flex flex-wrap gap-2">
+                            {showOpenTaskShortcut && topRecommendation?.job_id && (
+                              <button
+                                type="button"
+                                onClick={() => focusJob(topRecommendation.job_id)}
+                                className="rounded-lg border border-border-subtle px-3 py-1.5 text-xs text-text-primary transition-colors hover:bg-surface-hover"
+                              >
+                                {t('tasks_supervisor_open_task')}
+                              </button>
+                            )}
+                            {showOpenChatShortcut && topRecommendation?.job_id && topThreadId && onOpenThread && (
+                              <button
+                                type="button"
+                                onClick={() => onOpenThread(topThreadId, topRecommendation.job_id)}
+                                className="rounded-lg border border-violet-500/25 px-3 py-1.5 text-xs text-violet-100 transition-colors hover:bg-violet-500/10"
+                              >
+                                {t('tasks_supervisor_open_chat')}
+                              </button>
+                            )}
+                            {showApplySafeActionShortcut && topRecommendation?.job_id && topRecommendation?.safe_action && (
+                              <button
+                                type="button"
+                                onClick={() => executeSupervisorSafeAction(topRecommendation.job_id, topRecommendation.safe_action as string, safeActionNextStatus(topRecommendation))}
+                                className="rounded-lg bg-violet-700/80 px-3 py-1.5 text-xs text-white transition-colors hover:bg-violet-600/80"
+                              >
+                                {formatSafeActionLabel(topRecommendation.safe_action, t)}
+                              </button>
+                            )}
+                            {showResumeJobShortcut && topRecommendation?.job_id && (
+                              <button
+                                type="button"
+                                onClick={() => executeResumeById(topRecommendation.job_id)}
+                                className="rounded-lg bg-emerald-700/70 px-3 py-1.5 text-xs text-white transition-colors hover:bg-emerald-600/70"
+                              >
+                                {t('tasks_supervisor_resume_job')}
+                              </button>
+                            )}
+                            {showEnvironmentDiagnosticsShortcut && onOpenSettingsDiagnostics && (
+                              <button
+                                type="button"
+                                onClick={onOpenSettingsDiagnostics}
+                                className="rounded-lg border border-violet-500/25 px-3 py-1.5 text-xs text-violet-200 transition-colors hover:bg-violet-500/10"
+                              >
+                                {t('tasks_supervisor_open_settings')}
+                              </button>
+                            )}
+                            {topWorkspaceRequest && (
+                              <button
+                                type="button"
+                                onClick={() => onOpenResourceWorkspace(topWorkspaceRequest)}
+                                className="rounded-lg border border-emerald-500/25 px-3 py-1.5 text-xs text-emerald-200 transition-colors hover:bg-emerald-500/10"
+                              >
+                                {topDominantBlocker.workspace_section === 'files'
+                                  ? t('tasks_supervisor_open_data_files')
+                                  : topDominantBlocker.workspace_section === 'registry'
+                                    ? t('tasks_supervisor_open_resource_registry')
+                                    : t('tasks_supervisor_review_recognized_resources')}
+                              </button>
+                            )}
+                            {topRegistryRequest && topDominantBlocker.workspace_section !== 'registry' && (
+                              <button
+                                type="button"
+                                onClick={() => onOpenResourceWorkspace(topRegistryRequest)}
+                                className="rounded-lg border border-sky-500/25 px-3 py-1.5 text-xs text-sky-200 transition-colors hover:bg-sky-500/10"
+                                >
+                                  {t('tasks_supervisor_open_resource_registry')}
+                                </button>
+                              )}
+                          </div>
+                        ) : null}
+                      </div>
+                    )
+                  })()
                 )}
                 <div className="mt-3 space-y-2">
                   {supervisorReview.recommendations.length > 0 ? supervisorReview.recommendations.map((rec) => (
@@ -2442,18 +3248,9 @@ export default function TaskMonitor({
                       const decisionTypes = (dossier?.recent_decisions ?? []).map((item) => item.decision_type)
                       const blockingNodes = dossier?.resource_graph?.blocking_nodes ?? []
                       const blockingSummary = dossier?.resource_graph?.blocking_summary ?? []
-                      const dominantBlocker = dossier?.resource_graph?.dominant_blocker ?? null
+                      const dominantBlocker = dossier?.resource_graph?.dominant_blocker ?? blockingSummary[0] ?? null
                       const dominantWorkspaceRequest = dominantBlocker ? buildResourceWorkspaceRequest(dominantBlocker) : null
-                      const directRegistryRequest = dominantBlocker?.registry_key
-                        ? {
-                            nonce: Date.now() + 1,
-                            tab: 'project-info' as const,
-                            focusSection: 'registry' as const,
-                            key: dominantBlocker.registry_key,
-                            path: dominantBlocker.preferred_candidate?.path || undefined,
-                            description: dominantBlocker.label || dominantBlocker.kind || dominantBlocker.id,
-                          }
-                        : null
+                      const directRegistryRequest = dominantBlocker ? buildRegistryWorkspaceRequest(dominantBlocker) : null
                       const resourceStatusCounts = dossier?.resource_graph?.status_counts ?? {}
                       const blockingKindCounts = dossier?.resource_graph?.blocking_kind_counts ?? {}
                       const blockingCauseCounts = dossier?.resource_graph?.blocking_cause_counts ?? {}
@@ -2492,9 +3289,25 @@ export default function TaskMonitor({
                             )}
                           </div>
                           <div className="mt-2 text-xs text-text-primary">{rec.diagnosis}</div>
+                          {rec.failure_layer && (
+                            <div className="mt-1 text-[11px] text-text-muted">
+                              {t('tasks_supervisor_failure_layer')} {formatFailureLayer(rec.failure_layer, t)}
+                            </div>
+                          )}
                           {rec.rollback_level && (
                             <div className="mt-1 text-[11px] text-text-muted">
                               {t('tasks_supervisor_rollback_level')} {formatRollbackLevel(rec.rollback_level, t)}
+                            </div>
+                          )}
+                          {rec.reconfirmation_required !== undefined && rec.reconfirmation_required !== null && (
+                            <div className="mt-1 text-[11px] text-text-muted">
+                              {t('tasks_rollback_guidance_reconfirm')} {formatEligibilityBool(rec.reconfirmation_required, t)}
+                              {(rec.historical_matches || 0) > 0 && (
+                                <>
+                                  {' '}· {t('tasks_rollback_guidance_history')}{' '}
+                                  {t('tasks_rollback_guidance_matches').replace('{count}', String(rec.historical_matches ?? 0))}
+                                </>
+                              )}
                             </div>
                           )}
                           {rec.auto_recovery_kind && (
@@ -2528,16 +3341,48 @@ export default function TaskMonitor({
                               {t('tasks_supervisor_historical_policy')}{' '}
                               {[
                                 rec.historical_policy.preferred_safe_action
-                                  ? `prefer=${rec.historical_policy.preferred_safe_action}`
+                                  ? `prefer=${formatSafeActionLabel(rec.historical_policy.preferred_safe_action, t)}`
+                                  : null,
+                                rec.historical_policy.current_safe_action
+                                  ? `${t('tasks_supervisor_historical_policy_current_action')}=${formatSafeActionLabel(rec.historical_policy.current_safe_action, t)}`
                                   : null,
                                 typeof rec.historical_policy.support_count === 'number'
                                   && typeof rec.historical_policy.total_matches === 'number'
                                   ? `support=${rec.historical_policy.support_count}/${rec.historical_policy.total_matches}`
                                   : null,
+                                typeof rec.historical_policy.current_supported_count === 'number'
+                                  ? `${t('tasks_supervisor_historical_policy_current_support')}=${rec.historical_policy.current_supported_count}`
+                                  : null,
                                 rec.historical_policy.confidence
                                   ? `confidence=${formatHistoricalConfidence(rec.historical_policy.confidence, t)}`
                                   : null,
                                 `alignment=${formatHistoricalAlignment(rec.historical_policy.aligns_with_current, t)}`,
+                                rec.historical_policy.preferred_rollback_level
+                                  ? `${t('tasks_supervisor_historical_policy_rollback')}=${formatRollbackLevel(rec.historical_policy.preferred_rollback_level, t)}`
+                                  : null,
+                                rec.historical_policy.current_rollback_level
+                                  ? `${t('tasks_supervisor_historical_policy_current_rollback')}=${formatRollbackLevel(rec.historical_policy.current_rollback_level, t)}`
+                                  : null,
+                                typeof rec.historical_policy.rollback_level_supported_count === 'number'
+                                  ? `${t('tasks_supervisor_historical_policy_rollback_support')}=${rec.historical_policy.rollback_level_supported_count}`
+                                  : null,
+                                rec.historical_policy.rollback_level_aligns_with_current !== undefined
+                                  && rec.historical_policy.rollback_level_aligns_with_current !== null
+                                  ? `${t('tasks_supervisor_historical_policy_rollback_alignment')}=${formatHistoricalAlignment(rec.historical_policy.rollback_level_aligns_with_current, t)}`
+                                  : null,
+                                rec.historical_policy.preferred_rollback_target
+                                  ? `${t('tasks_supervisor_historical_policy_target')}=${formatRollbackTarget(rec.historical_policy.preferred_rollback_target)}`
+                                  : null,
+                                rec.historical_policy.current_rollback_target
+                                  ? `${t('tasks_supervisor_historical_policy_current_target')}=${formatRollbackTarget(rec.historical_policy.current_rollback_target)}`
+                                  : null,
+                                typeof rec.historical_policy.rollback_target_supported_count === 'number'
+                                  ? `${t('tasks_supervisor_historical_policy_target_support')}=${rec.historical_policy.rollback_target_supported_count}`
+                                  : null,
+                                rec.historical_policy.rollback_target_aligns_with_current !== undefined
+                                  && rec.historical_policy.rollback_target_aligns_with_current !== null
+                                  ? `${t('tasks_supervisor_historical_policy_target_alignment')}=${formatHistoricalAlignment(rec.historical_policy.rollback_target_aligns_with_current, t)}`
+                                  : null,
                               ].filter(Boolean).join(' · ')}
                             </div>
                           )}
@@ -2573,11 +3418,11 @@ export default function TaskMonitor({
                                 </div>
                                 <div>
                                   {t('tasks_supervisor_eligibility_current_job_status')}{' '}
-                                  {rec.safe_action_eligibility.current_job_status || 'unknown'}
+                                  {formatTaskStatusLabel(rec.safe_action_eligibility.current_job_status, t)}
                                 </div>
                                 <div>
                                   {t('tasks_supervisor_eligibility_retryable_statuses')}{' '}
-                                  {(rec.safe_action_eligibility.retryable_job_statuses || []).join(', ') || 'none'}
+                                  {formatStatusList(rec.safe_action_eligibility.retryable_job_statuses, t) || 'none'}
                                 </div>
                                 <div>
                                   {t('tasks_supervisor_eligibility_resolved_signal')}{' '}
@@ -2589,11 +3434,15 @@ export default function TaskMonitor({
                                 </div>
                                 <div>
                                   {t('tasks_supervisor_eligibility_resolved_types')}{' '}
-                                  {(rec.safe_action_eligibility.resolved_pending_types || []).join(', ') || 'none'}
+                                  {(rec.safe_action_eligibility.resolved_pending_types || [])
+                                    .map((item) => formatPendingTypeLabel(item, t))
+                                    .join(', ') || 'none'}
                                 </div>
                                 <div>
                                   {t('tasks_supervisor_eligibility_pending_types')}{' '}
-                                  {(rec.safe_action_eligibility.pending_reference_types || []).join(', ') || 'none'}
+                                  {(rec.safe_action_eligibility.pending_reference_types || [])
+                                    .map((item) => formatPendingTypeLabel(item, t))
+                                    .join(', ') || 'none'}
                                 </div>
                                 {(rec.safe_action_eligibility.blocking_reasons || []).length > 0 && (
                                   <div>
@@ -2713,11 +3562,11 @@ export default function TaskMonitor({
                           {pendingSnapshot && (
                             <div className="mt-1 text-[11px] text-text-muted">
                               {t('tasks_supervisor_pending_requests')} {[
-                                pendingSnapshot.active_type ? `active=${pendingSnapshot.active_type}` : null,
+                                pendingSnapshot.active_type ? `active=${formatPendingTypeLabel(pendingSnapshot.active_type, t)}` : null,
                                 pendingSnapshot.auth_request_id ? `auth=${pendingSnapshot.auth_request_id}` : null,
                                 pendingSnapshot.repair_request_id ? `repair=${pendingSnapshot.repair_request_id}` : null,
                                 pendingSnapshot.diagnostic_kinds && pendingSnapshot.diagnostic_kinds.length > 0
-                                  ? `signals=${pendingSnapshot.diagnostic_kinds.join(',')}`
+                                  ? `signals=${pendingSnapshot.diagnostic_kinds.map((item) => humanizeFocusToken(item)).join(', ')}`
                                   : null,
                               ].filter(Boolean).join(' · ')}
                             </div>
@@ -2726,22 +3575,54 @@ export default function TaskMonitor({
                             <div className="mt-1 text-[11px] text-text-muted">
                               {t('tasks_supervisor_recent_requests')} {[
                                 latestAuthRequest
-                                  ? `auth:${latestAuthRequest.command_type || latestAuthRequest.id || 'request'}=${latestAuthRequest.status || 'unknown'}`
+                                  ? `auth:${latestAuthRequest.command_type || latestAuthRequest.id || 'request'}=${formatRequestStatusLabel(latestAuthRequest.status)}`
                                   : null,
                                 latestRepairRequest
-                                  ? `repair:${latestRepairRequest.id || 'request'}=${latestRepairRequest.status || 'unknown'}`
+                                  ? `repair:${latestRepairRequest.id || 'request'}=${formatRequestStatusLabel(latestRepairRequest.status)}`
                                   : null,
                               ].filter(Boolean).join(' · ')}
                             </div>
                           )}
                           {decisionTypes.length > 0 && (
                             <div className="mt-1 text-[11px] text-text-muted">
-                              {t('tasks_supervisor_recent_decisions')} {decisionTypes.join(', ')}
+                              {t('tasks_supervisor_recent_decisions')} {decisionTypes.map((item) => humanizeFocusToken(item)).join(', ')}
                             </div>
                           )}
                           {runtimeSignals.length > 0 && (
                             <div className="mt-1 text-[11px] text-text-muted">
                               {t('tasks_supervisor_runtime_diagnostics')} {runtimeSignals.map((item) => formatRuntimeDiagnostic(item, t)).join(', ')}
+                            </div>
+                          )}
+                          {dossier?.rollback_hint?.suggested_level && (
+                            <div className="mt-1 text-[11px] text-text-muted">
+                              {t('tasks_supervisor_rollback_hint')}{' '}
+                              {[
+                                formatRollbackLevel(dossier.rollback_hint.suggested_level, t),
+                                dossier.rollback_hint.reason || null,
+                              ].filter(Boolean).join(' · ')}
+                            </div>
+                          )}
+                          {dossier?.execution_confirmation_overview && (
+                            <div className="mt-1 text-[11px] text-text-muted">
+                              {t('tasks_supervisor_execution_overview')}{' '}
+                              {t('tasks_confirmation_overview_summary')
+                                .replace('{abstract}', String(dossier.execution_confirmation_overview.abstract_step_count ?? 0))
+                                .replace('{ir}', String(dossier.execution_confirmation_overview.execution_ir_step_count ?? 0))
+                                .replace('{groups}', String(dossier.execution_confirmation_overview.execution_group_count ?? 0))
+                                .replace('{per_sample}', String(dossier.execution_confirmation_overview.per_sample_step_count ?? 0))
+                                .replace('{aggregate}', String(dossier.execution_confirmation_overview.aggregate_step_count ?? 0))
+                                .replace('{added}', String(dossier.execution_confirmation_overview.added_group_count ?? 0))
+                                .replace('{changed}', String(dossier.execution_confirmation_overview.changed_group_count ?? 0))}
+                            </div>
+                          )}
+                          {dossier?.execution_plan_changes && dossier.execution_plan_changes.length > 0 && (
+                            <div className="mt-1 text-[11px] text-text-muted">
+                              {t('tasks_supervisor_execution_change_counts')}{' '}
+                              {[
+                                `fan_out=${dossier.execution_plan_changes.filter((item) => (item.change_kinds ?? []).includes('fan_out')).length}`,
+                                `aggregate=${dossier.execution_plan_changes.filter((item) => (item.change_kinds ?? []).includes('aggregate')).length}`,
+                                `auto_injected=${dossier.execution_plan_changes.filter((item) => (item.change_kinds ?? []).includes('auto_injected')).length}`,
+                              ].join(' · ')}
                             </div>
                           )}
                           {latestAutoRecovery && (
@@ -2753,7 +3634,7 @@ export default function TaskMonitor({
                             <div className="mt-1 text-[11px] text-text-muted">
                               {t('tasks_supervisor_similar_resolutions')} {dossier.similar_resolutions
                                 .slice(0, 2)
-                                .map((item) => item.safe_action || item.event_type || 'memory')
+                                .map((item) => formatSimilarResolution(item, t))
                                 .join(', ')}
                             </div>
                           )}

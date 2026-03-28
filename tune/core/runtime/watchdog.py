@@ -15,6 +15,7 @@ log = logging.getLogger(__name__)
 STALL_PROGRESS_THRESHOLD_SECONDS = 180
 RUNTIME_WATCHDOG_POLL_INTERVAL_SECONDS = 30
 AUTO_NORMALIZE_PENDING_ISSUES = {"orphan_pending_request", "job_status_mismatch"}
+AUTO_RETRY_RESUME_STATUSES = {"waiting_for_authorization", "waiting_for_repair"}
 
 _runtime_watchdog_task: asyncio.Task | None = None
 _stalled_signatures: dict[str, str] = {}
@@ -203,6 +204,107 @@ async def _auto_normalize_pending_issue(
     }
 
 
+def _resume_retry_is_auto_eligible(job: AnalysisJob, diagnostics: list[dict[str, Any]]) -> tuple[bool, list[str], list[str]]:
+    job_status = str(getattr(job, "status", None) or "").strip()
+    pending_reference_types = sorted(
+        filter(
+            None,
+            [
+                "authorization" if getattr(job, "pending_auth_request_id", None) else "",
+                "repair" if getattr(job, "pending_repair_request_id", None) else "",
+            ],
+        )
+    )
+    resolved_pending_types = sorted(
+        {
+            str(item.get("request_type") or "").strip()
+            for item in diagnostics
+            if str(item.get("kind") or "").strip() == "resolved_pending_request"
+            and str(item.get("request_type") or "").strip()
+        }
+    )
+    if job_status not in AUTO_RETRY_RESUME_STATUSES:
+        return False, pending_reference_types, resolved_pending_types
+    if len(pending_reference_types) != 1:
+        return False, pending_reference_types, resolved_pending_types
+    if len(resolved_pending_types) != 1:
+        return False, pending_reference_types, resolved_pending_types
+    if pending_reference_types != resolved_pending_types:
+        return False, pending_reference_types, resolved_pending_types
+    if job_status == "waiting_for_authorization" and pending_reference_types != ["authorization"]:
+        return False, pending_reference_types, resolved_pending_types
+    if job_status == "waiting_for_repair" and pending_reference_types != ["repair"]:
+        return False, pending_reference_types, resolved_pending_types
+    return True, pending_reference_types, resolved_pending_types
+
+
+async def _auto_retry_resume_failed_issue(
+    session,
+    job: AnalysisJob,
+    *,
+    diagnostics: list[dict[str, Any]],
+    pending_types: str,
+    emit_log=None,
+) -> dict[str, Any] | None:
+    eligible, pending_reference_types, resolved_pending_types = _resume_retry_is_auto_eligible(job, diagnostics)
+    if not eligible:
+        return None
+
+    from tune.api.ws import sync_supervisor_thread_state
+    from tune.workers.defer import defer_async_with_fallback
+    from tune.workers.tasks import resume_job_task
+
+    rollback_target = getattr(job, "pending_step_key", None) or "resume_chain"
+    resulting_status = str(getattr(job, "status", None) or "interrupted")
+    job.error_message = "Retrying resolved pending-decision resume chain automatically."
+    await session.commit()
+    await defer_async_with_fallback(resume_job_task, job_id=job.id)
+    await _record_watchdog_auto_resolution(
+        session,
+        job,
+        issue_kind="resume_failed",
+        safe_action="retry_resume_chain",
+        rollback_target=rollback_target,
+        outcome_status=resulting_status,
+        pending_types=pending_types,
+    )
+
+    emitter = emit_log or _emit_watchdog_log
+    await emitter(
+        session,
+        job,
+        (
+            f"[watchdog] Auto-applied resume_failed via retry_resume_chain "
+            f"(status={resulting_status}, pending={pending_types or 'request'})."
+        ),
+    )
+
+    try:
+        await sync_supervisor_thread_state(
+            job.id,
+            clear_pending_command_auth=bool(getattr(job, "pending_auth_request_id", None)),
+            clear_pending_error_recovery=bool(getattr(job, "pending_repair_request_id", None)),
+            clear_resource_clarification=False,
+            clear_pending_analysis_plan=False,
+            message="Watchdog retried the resolved human-decision resume chain. The job will attempt to continue.",
+            emit_job_started=True,
+            job_name=getattr(job, "name", None),
+        )
+    except Exception:
+        log.exception(
+            "watchdog: failed to sync thread state after auto-retrying resume_failed job_id=%s",
+            getattr(job, "id", None),
+        )
+
+    return {
+        "safe_action": "retry_resume_chain",
+        "resulting_status": resulting_status,
+        "rollback_target": rollback_target,
+        "pending_reference_types": pending_reference_types,
+        "resolved_pending_types": resolved_pending_types,
+    }
+
+
 async def scan_runtime_health_once(
     session,
     *,
@@ -266,6 +368,7 @@ async def scan_pending_request_health_once(
     *,
     emit_log=None,
     auto_normalize: bool = True,
+    auto_retry_resolved_resume: bool = False,
 ) -> list[dict[str, Any]]:
     jobs = (
         await session.execute(
@@ -378,6 +481,25 @@ async def scan_pending_request_health_once(
                         "rollback_target": auto_result["rollback_target"],
                     }
                 )
+        elif auto_retry_resolved_resume and issue_kind == "resume_failed":
+            auto_result = await _auto_retry_resume_failed_issue(
+                session,
+                job,
+                diagnostics=diagnostics,
+                pending_types=pending_types,
+                emit_log=emit_log,
+            )
+            if auto_result:
+                entry.update(
+                    {
+                        "auto_applied": True,
+                        "safe_action": auto_result["safe_action"],
+                        "resulting_status": auto_result["resulting_status"],
+                        "rollback_target": auto_result["rollback_target"],
+                        "pending_reference_types": auto_result["pending_reference_types"],
+                        "resolved_pending_types": auto_result["resolved_pending_types"],
+                    }
+                )
         emitted.append(entry)
 
     return emitted
@@ -391,7 +513,7 @@ async def _runtime_watchdog_loop() -> None:
         try:
             async with get_session_factory()() as session:
                 await scan_runtime_health_once(session)
-                await scan_pending_request_health_once(session)
+                await scan_pending_request_health_once(session, auto_retry_resolved_resume=True)
         except asyncio.CancelledError:
             raise
         except Exception:

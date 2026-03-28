@@ -16,11 +16,19 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from tune.core.database import get_session
 from tune.core.job_output_paths import build_output_dir_path, derive_run_dirs_from_artifact_paths
-from tune.core.models import AnalysisJob
-from tune.core.orchestration import extract_plan_steps, summarize_expanded_dag_for_confirmation
+from tune.core.models import AnalysisJob, KnownPath, ResourceEntity, ResourceFile
+from tune.core.orchestration import (
+    extract_plan_steps,
+    summarize_execution_confirmation_overview,
+    summarize_execution_plan_delta,
+    summarize_execution_ir_for_confirmation,
+    summarize_execution_review_changes,
+    summarize_expanded_dag_for_confirmation,
+)
 from tune.core.runtime.watchdog import (
     STALL_PROGRESS_THRESHOLD_SECONDS,
     get_job_progress_reference,
@@ -30,8 +38,8 @@ from tune.core.runtime.watchdog import (
 
 router = APIRouter()
 log = logging.getLogger(__name__)
-_WATCHDOG_AUTO_NORMALIZED_RE = re.compile(
-    r"^\[watchdog\] Auto-normalized (?P<issue_kind>[a-z_]+) via (?P<safe_action>[a-z_]+) "
+_WATCHDOG_AUTO_RECOVERY_RE = re.compile(
+    r"^\[watchdog\] Auto-(?:normalized|applied) (?P<issue_kind>[a-z_]+) via (?P<safe_action>[a-z_]+) "
     r"\(status=(?P<resulting_status>[^,]+), pending=(?P<pending_types>[^)]+)\)\.$"
 )
 _RUN_DIR_NAME_RE = re.compile(r"^\d{8}_\d{6}_.+")
@@ -43,6 +51,14 @@ _PIXI_MISSING_PACKAGE_RE = re.compile(
     r"PackagesNotFoundError|No package named|Could not find package|No candidates were found for",
     re.IGNORECASE,
 )
+_RESOURCE_DECISION_TARGETS: dict[str, dict[str, str]] = {
+    "reference": {"key": "reference_fasta", "file_role": "reference_fasta"},
+    "reference_bundle": {"key": "reference_fasta", "file_role": "reference_fasta"},
+    "reference_fasta": {"key": "reference_fasta", "file_role": "reference_fasta"},
+    "annotation": {"key": "annotation_gtf", "file_role": "annotation_gtf"},
+    "annotation_bundle": {"key": "annotation_gtf", "file_role": "annotation_gtf"},
+    "annotation_gtf": {"key": "annotation_gtf", "file_role": "annotation_gtf"},
+}
 
 
 class JobCreate(BaseModel):
@@ -436,6 +452,14 @@ def _serialize_execution_plan(job: AnalysisJob) -> dict:
         "abstract_plan": abstract_plan,
         "execution_ir": execution_ir,
         "expanded_dag": expanded_dag,
+        "review_overview": summarize_execution_confirmation_overview(
+            plan_payload=abstract_plan,
+            execution_ir=execution_ir,
+            expanded_dag=expanded_dag,
+        ),
+        "review_ir": summarize_execution_ir_for_confirmation(execution_ir),
+        "review_delta": summarize_execution_plan_delta(abstract_plan, expanded_dag),
+        "review_changes": summarize_execution_review_changes(expanded_dag),
         "summary": {
             "has_execution_ir": bool(execution_ir),
             "has_expanded_dag": bool(expanded_dag),
@@ -449,11 +473,20 @@ def _serialize_confirmation_details(job: AnalysisJob, pending_type: str | None) 
     phase = None
     review_plan: list[dict] = []
     execution_summary = None
+    execution_overview = None
+    execution_ir_review = None
+    execution_changes = None
+    execution_delta = None
 
     if pending_type == "execution_confirmation":
         phase = "execution"
         review_plan = summarize_expanded_dag_for_confirmation(getattr(job, "expanded_dag_json", None))
-        execution_summary = _serialize_execution_plan(job)["summary"]
+        execution_payload = _serialize_execution_plan(job)
+        execution_summary = execution_payload["summary"]
+        execution_overview = execution_payload["review_overview"]
+        execution_ir_review = execution_payload["review_ir"]
+        execution_changes = execution_payload["review_changes"]
+        execution_delta = execution_payload["review_delta"]
     elif pending_type == "plan_confirmation":
         phase = "abstract"
         review_plan = extract_plan_steps(
@@ -464,6 +497,10 @@ def _serialize_confirmation_details(job: AnalysisJob, pending_type: str | None) 
         "confirmation_phase": phase,
         "confirmation_plan": review_plan,
         "execution_plan_summary": execution_summary,
+        "execution_confirmation_overview": execution_overview,
+        "execution_ir_review": execution_ir_review,
+        "execution_plan_delta": execution_delta,
+        "execution_plan_changes": execution_changes,
     }
 
 
@@ -471,6 +508,7 @@ def _infer_rollback_level(incident_type: str) -> str:
     return {
         "authorization": "step",
         "repair": "step",
+        "binding": "step",
         "binding_required": "step",
         "stalled": "step",
         "resume_failed": "step",
@@ -488,6 +526,7 @@ def _infer_failure_layer(incident_type: str) -> str:
     return {
         "plan_confirmation": "abstract_plan",
         "execution_confirmation": "expanded_dag",
+        "binding": "resource_binding",
         "resource_clarification": "resource_binding",
         "binding_required": "resource_binding",
         "authorization": "step_execution",
@@ -511,6 +550,7 @@ def _recommendation_fields_from_incident(incident: dict) -> tuple[str, str, str]
         "plan_confirmation": "abstract_plan_gate",
         "authorization": "authorization_request",
         "repair": incident.get("current_step_key") or "failed_step",
+        "binding": "binding_resolution",
         "resource_clarification": "resource_clarification_gate",
         "binding_required": "binding_resolution",
         "stalled": incident.get("current_step_key") or "job_runtime",
@@ -525,6 +565,7 @@ def _recommendation_fields_from_incident(incident: dict) -> tuple[str, str, str]
         "plan_confirmation": "Execution is intentionally blocked at the abstract plan confirmation gate.",
         "authorization": "Worker execution is paused for a user authorization decision.",
         "repair": "The worker hit a command failure and needs an explicit repair choice before it can continue.",
+        "binding": "The binding layer could not resolve all required inputs deterministically.",
         "resource_clarification": "The runtime could not safely continue because a required resource is ambiguous or missing.",
         "binding_required": "The binding layer could not resolve all required inputs deterministically.",
         "stalled": "The worker is still marked running, but no runtime progress heartbeat has been observed recently.",
@@ -596,6 +637,89 @@ def _recommendation_fields_from_incident(incident: dict) -> tuple[str, str, str]
                 )
     rollback_level = _infer_rollback_level(incident["incident_type"])
     return rollback_target, rollback_level, diagnosis
+
+
+def _resolve_recommendation_rollback(
+    incident: dict,
+    dossier: dict | None,
+    rollback_target: str,
+    rollback_level: str,
+    diagnosis: str,
+) -> tuple[str, str, str]:
+    if not dossier:
+        return rollback_target, rollback_level, diagnosis
+
+    rollback_hint = dossier.get("rollback_hint") or {}
+    suggested_level = str(rollback_hint.get("suggested_level") or "").strip()
+    if not suggested_level:
+        return rollback_target, rollback_level, diagnosis
+
+    incident_type = str(incident.get("incident_type") or "").strip()
+    current_step_key = (
+        str(incident.get("current_step_key") or "").strip()
+        or str(((dossier.get("current_step") or {}).get("step_key")) or "").strip()
+    )
+
+    if suggested_level == "abstract_plan":
+        rollback_target = "abstract_plan_gate"
+    elif suggested_level == "execution_ir":
+        rollback_target = (
+            "resource_clarification_gate"
+            if incident_type == "resource_clarification"
+            else (current_step_key or "execution_semantics")
+        )
+    elif suggested_level == "dag":
+        rollback_target = (
+            "execution_confirmation_gate"
+            if incident_type == "execution_confirmation"
+            else (current_step_key or "expanded_dag")
+        )
+
+    rollback_level = suggested_level
+
+    reason = str(rollback_hint.get("reason") or "").strip()
+    if reason and reason.lower() not in diagnosis.lower():
+        diagnosis = f"{diagnosis} Rollback hint: {reason}"
+
+    return rollback_target, rollback_level, diagnosis
+
+
+def _build_supervisor_rollback_context(
+    job: AnalysisJob,
+    effective: dict,
+    incident: dict,
+    *,
+    current_step=None,
+) -> dict:
+    confirmation = _serialize_confirmation_details(job, effective.get("pending_interaction_type"))
+    dossier = {
+        "job_id": getattr(job, "id", None),
+        "incident_type": incident.get("incident_type"),
+        "current_step": {
+            "step_key": getattr(current_step, "step_key", None),
+        },
+        "execution_confirmation_overview": confirmation.get("execution_confirmation_overview"),
+        "execution_plan_delta": confirmation.get("execution_plan_delta"),
+    }
+    dossier["rollback_hint"] = _build_dossier_rollback_hint(dossier)
+    return dossier
+
+
+def _resolve_supervisor_incident_controls(
+    incident: dict,
+    *,
+    dossier: dict | None = None,
+) -> tuple[str, str, str, str | None]:
+    rollback_target, rollback_level, diagnosis = _recommendation_fields_from_incident(incident)
+    rollback_target, rollback_level, diagnosis = _resolve_recommendation_rollback(
+        incident,
+        dossier,
+        rollback_target,
+        rollback_level,
+        diagnosis,
+    )
+    safe_action = _infer_safe_supervisor_action(incident, rollback_level)
+    return rollback_target, rollback_level, diagnosis, safe_action
 
 
 def _extract_environment_failure_signal(incident: dict) -> dict | None:
@@ -734,7 +858,7 @@ def _infer_safe_supervisor_action(incident: dict, rollback_level: str) -> str | 
         return "refresh_execution_graph"
     if incident.get("incident_type") == "resume_failed":
         eligibility = _build_safe_action_eligibility(incident)
-        if eligibility and eligibility.get("eligible"):
+        if rollback_level == "step" and eligibility and eligibility.get("eligible"):
             return "retry_resume_chain"
     if incident.get("incident_type") == "orphan_pending_request":
         return "normalize_orphan_pending_state"
@@ -841,6 +965,11 @@ def _build_safe_action_note(
             f"reference are still attached, and the job remains in a retryable paused state ({job_status})."
         )
     if incident_type == "resume_failed" and safe_action is None:
+        if eligibility and eligibility.get("eligible") and rollback_level != "step":
+            return (
+                "Resume-chain retry is intentionally withheld because the safer rollback scope is "
+                f"{rollback_level}, so operator review should revisit that layer before resuming."
+            )
         blockers = _describe_resume_retry_blockers(eligibility, job_status=job_status)
         blocker_text = "; ".join(blockers) if blockers else (
             f"the job is no longer in a retryable paused state ({job_status})"
@@ -1186,7 +1315,209 @@ def _summarize_resource_graph_snapshot(raw_graph: str | dict | None) -> dict:
     }
 
 
+def _resolve_resource_decision_target(entity: Any) -> dict[str, str] | None:
+    resource_role = str(getattr(entity, "resource_role", "") or "").strip()
+    direct = _RESOURCE_DECISION_TARGETS.get(resource_role)
+    if direct:
+        return direct
+    resource_files = getattr(entity, "resource_files", None) or []
+    file_roles = {
+        str(getattr(item, "file_role", "") or "").strip()
+        for item in resource_files
+    }
+    if "reference_fasta" in file_roles:
+        return _RESOURCE_DECISION_TARGETS["reference_fasta"]
+    if "annotation_gtf" in file_roles:
+        return _RESOURCE_DECISION_TARGETS["annotation_gtf"]
+    return None
+
+
+def _resolve_resource_file_path(resource_file: Any) -> str | None:
+    path = str(getattr(getattr(resource_file, "file", None), "path", "") or "").strip()
+    return path or None
+
+
+def _resolve_recognized_primary_path(entity: Any, file_role: str) -> str | None:
+    matching = [
+        item
+        for item in (getattr(entity, "resource_files", None) or [])
+        if str(getattr(item, "file_role", "") or "").strip() == file_role and _resolve_resource_file_path(item)
+    ]
+    primary = next((item for item in matching if bool(getattr(item, "is_primary", False))), None)
+    return _resolve_resource_file_path(primary or (matching[0] if matching else None))
+
+
+def _summarize_resource_decision_snapshot(
+    entities: list[Any] | None,
+    known_paths: list[Any] | None,
+) -> dict[str, Any]:
+    if not entities:
+        return {
+            "available": True,
+            "tracked_total": 0,
+            "mismatch_total": 0,
+            "stale_decision_total": 0,
+            "keep_registered_total": 0,
+            "unregistered_total": 0,
+            "entries": [],
+        }
+
+    known_path_by_key = {
+        str(getattr(item, "key", "") or "").strip(): item
+        for item in (known_paths or [])
+        if str(getattr(item, "key", "") or "").strip()
+    }
+
+    entries: list[dict[str, Any]] = []
+    counts: Counter[str] = Counter()
+    for entity in entities:
+        target = _resolve_resource_decision_target(entity)
+        if not target:
+            continue
+        recognized_path = _resolve_recognized_primary_path(entity, target["file_role"])
+        known_path = known_path_by_key.get(target["key"])
+        registered_path = (
+            str(getattr(known_path, "path", "") or "").strip()
+            if known_path is not None
+            else ""
+        ) or None
+        metadata = getattr(entity, "metadata_json", None) or {}
+        known_path_decisions = metadata.get("known_path_decisions") or {}
+        decision = known_path_decisions.get(target["key"]) or {}
+        decision_name = str(decision.get("decision") or "").strip() or None
+        decision_stale = bool(
+            decision_name == "keep_registered"
+            and (
+                decision.get("recognized_path") != recognized_path
+                or decision.get("registered_path") != registered_path
+            )
+        )
+        keep_registered_active = bool(
+            decision_name == "keep_registered"
+            and recognized_path
+            and registered_path
+            and decision.get("recognized_path") == recognized_path
+            and decision.get("registered_path") == registered_path
+        )
+
+        status = "info_only"
+        if recognized_path:
+            if not registered_path:
+                status = "unregistered"
+            elif registered_path == recognized_path:
+                status = "registered"
+            elif keep_registered_active:
+                status = "keep_registered"
+            else:
+                status = "mismatch"
+
+        counts["tracked_total"] += 1
+        if status == "mismatch":
+            counts["mismatch_total"] += 1
+        if status == "unregistered":
+            counts["unregistered_total"] += 1
+        if keep_registered_active:
+            counts["keep_registered_total"] += 1
+        if decision_stale:
+            counts["stale_decision_total"] += 1
+
+        if status in {"mismatch", "unregistered", "keep_registered"} or decision_stale:
+            entries.append(
+                {
+                    "entity_id": str(getattr(entity, "id", "") or ""),
+                    "display_name": str(getattr(entity, "display_name", "") or ""),
+                    "resource_role": str(getattr(entity, "resource_role", "") or ""),
+                    "known_path_key": target["key"],
+                    "recognized_path": recognized_path,
+                    "registered_path": registered_path,
+                    "status": status,
+                    "decision": decision_name,
+                    "decision_stale": decision_stale,
+                    "updated_at": decision.get("updated_at"),
+                }
+            )
+
+    entries.sort(
+        key=lambda item: (
+            0 if item.get("decision_stale") else 1,
+            {"mismatch": 0, "unregistered": 1, "keep_registered": 2}.get(str(item.get("status") or ""), 3),
+            str(item.get("display_name") or ""),
+        )
+    )
+
+    return {
+        "available": True,
+        "tracked_total": counts["tracked_total"],
+        "mismatch_total": counts["mismatch_total"],
+        "stale_decision_total": counts["stale_decision_total"],
+        "keep_registered_total": counts["keep_registered_total"],
+        "unregistered_total": counts["unregistered_total"],
+        "entries": entries[:5],
+    }
+
+
+async def _fetch_project_resource_decision_snapshot(
+    session: AsyncSession,
+    project_id: str | None,
+) -> dict[str, Any]:
+    unavailable = {
+        "available": False,
+        "tracked_total": 0,
+        "mismatch_total": 0,
+        "stale_decision_total": 0,
+        "keep_registered_total": 0,
+        "unregistered_total": 0,
+        "entries": [],
+    }
+    if not hasattr(session, "execute"):
+        return unavailable
+    project_key = str(project_id or "").strip()
+    if not project_key:
+        return unavailable
+
+    try:
+        entities = (
+            await session.execute(
+                select(ResourceEntity)
+                .where(ResourceEntity.project_id == project_key)
+                .options(selectinload(ResourceEntity.resource_files).selectinload(ResourceFile.file))
+            )
+        ).scalars().all()
+        known_paths = (
+            await session.execute(select(KnownPath).where(KnownPath.project_id == project_key))
+        ).scalars().all()
+    except Exception:
+        log.debug(
+            "jobs: failed to load project resource decision snapshot for project_id=%s",
+            project_key,
+            exc_info=True,
+        )
+        return unavailable
+    return _summarize_resource_decision_snapshot(entities, known_paths)
+
+
 def _build_incident_memory_query(job: AnalysisJob, incident: dict, current_step=None) -> str:
+    confirmation = _serialize_confirmation_details(
+        job,
+        incident.get("pending_interaction_type"),
+    )
+    rollback_context = {
+        "job_id": getattr(job, "id", None),
+        "incident_type": incident.get("incident_type"),
+        "current_step": {
+            "step_key": (
+                str(incident.get("current_step_key") or "").strip()
+                or str(getattr(current_step, "step_key", None) or "").strip()
+            ),
+        },
+        "execution_confirmation_overview": confirmation.get("execution_confirmation_overview"),
+        "execution_plan_delta": confirmation.get("execution_plan_delta"),
+    }
+    rollback_context["rollback_hint"] = _build_dossier_rollback_hint(rollback_context)
+    rollback_target, rollback_level, _diagnosis, safe_action = _resolve_supervisor_incident_controls(
+        incident,
+        dossier=rollback_context,
+    )
     env_failure = _extract_environment_failure_signal(incident)
     parts = [
         str(incident.get("incident_type") or "").strip(),
@@ -1201,7 +1532,14 @@ def _build_incident_memory_query(job: AnalysisJob, incident: dict, current_step=
             or getattr(job, "pending_step_key", None)
             or ""
         ).strip(),
+        f"rollback_level={rollback_level}",
+        f"rollback_target={rollback_target}",
     ]
+    if safe_action:
+        parts.append(f"safe_action={safe_action}")
+    rollback_hint = rollback_context.get("rollback_hint") or {}
+    if str(rollback_hint.get("suggested_level") or "").strip():
+        parts.append(f"rollback_hint={str(rollback_hint.get('suggested_level')).strip()}")
     if env_failure is not None:
         parts.append(str(env_failure.get("failure_kind") or "").strip())
         parts.extend(
@@ -1230,6 +1568,26 @@ def _extract_safe_action_from_resolution(resolution: str | None) -> str | None:
     return None
 
 
+def _extract_rollback_level_from_resolution(resolution: str | None) -> str | None:
+    text = str(resolution or "").strip()
+    if not text:
+        return None
+    match = re.search(r"\brollback_level=([a-z_]+)\b", text)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _extract_rollback_target_from_resolution(resolution: str | None) -> str | None:
+    text = str(resolution or "").strip()
+    if not text:
+        return None
+    match = re.search(r"\brollback_target=([A-Za-z0-9_:-]+)\b", text)
+    if match:
+        return match.group(1)
+    return None
+
+
 def _serialize_project_execution_event(event) -> dict:
     resolution = str(getattr(event, "resolution", None) or "").strip()
     return {
@@ -1237,6 +1595,8 @@ def _serialize_project_execution_event(event) -> dict:
         "description": str(getattr(event, "description", None) or "").strip(),
         "resolution": resolution,
         "safe_action": _extract_safe_action_from_resolution(resolution),
+        "rollback_level": _extract_rollback_level_from_resolution(resolution),
+        "rollback_target": _extract_rollback_target_from_resolution(resolution),
         "user_contributed": bool(getattr(event, "user_contributed", False)),
         "created_at": getattr(event, "created_at", None).isoformat()
         if getattr(event, "created_at", None)
@@ -1273,10 +1633,14 @@ def _build_historical_guidance(
     safe_action_eligibility: dict | None = None,
     incident_type: str | None = None,
     job_status: str | None = None,
+    rollback_level: str | None = None,
+    rollback_target: str | None = None,
 ) -> str | None:
     historical_policy = _build_historical_policy(
         similar_resolutions,
         safe_action=safe_action,
+        rollback_level=rollback_level,
+        rollback_target=rollback_target,
     )
     if not historical_policy:
         return None
@@ -1287,8 +1651,16 @@ def _build_historical_guidance(
     current_safe_action = historical_policy.get("current_safe_action")
     current_supported_count = int(historical_policy.get("current_supported_count") or 0)
     aligns_with_current = historical_policy.get("aligns_with_current")
+    preferred_rollback_level = historical_policy.get("preferred_rollback_level")
+    rollback_level_aligns_with_current = historical_policy.get("rollback_level_aligns_with_current")
 
     if current_safe_action and current_supported_count > 0:
+        if rollback_level_aligns_with_current is False and preferred_rollback_level:
+            return (
+                f"Project memory shows {current_supported_count} similar resolution(s) "
+                f"using {current_safe_action}, but it most often paired that action with "
+                f"rollback level {preferred_rollback_level}."
+            )
         return (
             f"Project memory shows {current_supported_count} similar resolution(s) "
             f"using {current_safe_action}."
@@ -1303,20 +1675,25 @@ def _build_historical_guidance(
         if (
             not current_safe_action
             and str(incident_type or "").strip() == "resume_failed"
-            and safe_action_eligibility
-            and safe_action_eligibility.get("blocking_reasons")
         ):
-            blocker_text = "; ".join(
-                _describe_resume_retry_blockers(
-                    safe_action_eligibility,
-                    job_status=str(job_status or "unknown").strip() or "unknown",
+            if safe_action_eligibility and safe_action_eligibility.get("blocking_reasons"):
+                blocker_text = "; ".join(
+                    _describe_resume_retry_blockers(
+                        safe_action_eligibility,
+                        job_status=str(job_status or "unknown").strip() or "unknown",
+                    )
+                ) or "the current retry eligibility checks are blocked"
+                return (
+                    f"Project memory most often resolved similar incidents via {preferred_safe_action} "
+                    f"({support_count}/{total_matches}), but the current recommendation intentionally withholds "
+                    f"that path because {blocker_text}."
                 )
-            ) or "the current retry eligibility checks are blocked"
-            return (
-                f"Project memory most often resolved similar incidents via {preferred_safe_action} "
-                f"({support_count}/{total_matches}), but the current recommendation intentionally withholds "
-                f"that path because {blocker_text}."
-            )
+            if str(rollback_level or "").strip() and str(rollback_level or "").strip() != "step":
+                return (
+                    f"Project memory most often resolved similar incidents via {preferred_safe_action} "
+                    f"({support_count}/{total_matches}), but the current recommendation intentionally withholds "
+                    f"that path because the safer rollback scope is {rollback_level}."
+                )
         return (
             f"Project memory most often resolved similar incidents via {preferred_safe_action} "
             f"({support_count}/{total_matches})."
@@ -1329,6 +1706,8 @@ def _build_historical_policy(
     similar_resolutions: list[dict] | None,
     *,
     safe_action: str | None,
+    rollback_level: str | None = None,
+    rollback_target: str | None = None,
 ) -> dict | None:
     items = [item for item in (similar_resolutions or []) if isinstance(item, dict)]
     if not items:
@@ -1339,6 +1718,23 @@ def _build_historical_policy(
         for item in items
         if item.get("safe_action")
     )
+    rollback_level_counts: Counter[str] = Counter(
+        str(item.get("rollback_level") or "").strip()
+        for item in items
+        if item.get("rollback_level")
+    )
+    rollback_target_counts: Counter[str] = Counter(
+        str(item.get("rollback_target") or "").strip()
+        for item in items
+        if item.get("rollback_target")
+    )
+    current_rollback_level = str(rollback_level or "").strip() or None
+    current_rollback_target = str(rollback_target or "").strip() or None
+    preferred_rollback_level = rollback_level_counts.most_common(1)[0][0] if rollback_level_counts else None
+    preferred_rollback_target = rollback_target_counts.most_common(1)[0][0] if rollback_target_counts else None
+    rollback_level_supported_count = rollback_level_counts.get(current_rollback_level or "", 0)
+    rollback_target_supported_count = rollback_target_counts.get(current_rollback_target or "", 0)
+
     if not safe_action_counts:
         return {
             "preferred_safe_action": None,
@@ -1348,6 +1744,22 @@ def _build_historical_policy(
             "current_safe_action": safe_action,
             "current_supported_count": 0,
             "aligns_with_current": None,
+            "preferred_rollback_level": preferred_rollback_level,
+            "current_rollback_level": current_rollback_level,
+            "rollback_level_supported_count": rollback_level_supported_count,
+            "rollback_level_aligns_with_current": (
+                preferred_rollback_level == current_rollback_level
+                if preferred_rollback_level and current_rollback_level
+                else None
+            ),
+            "preferred_rollback_target": preferred_rollback_target,
+            "current_rollback_target": current_rollback_target,
+            "rollback_target_supported_count": rollback_target_supported_count,
+            "rollback_target_aligns_with_current": (
+                preferred_rollback_target == current_rollback_target
+                if preferred_rollback_target and current_rollback_target
+                else None
+            ),
         }
 
     preferred_safe_action, support_count = safe_action_counts.most_common(1)[0]
@@ -1375,6 +1787,22 @@ def _build_historical_policy(
             if current_safe_action
             else None
         ),
+        "preferred_rollback_level": preferred_rollback_level,
+        "current_rollback_level": current_rollback_level,
+        "rollback_level_supported_count": rollback_level_supported_count,
+        "rollback_level_aligns_with_current": (
+            preferred_rollback_level == current_rollback_level
+            if preferred_rollback_level and current_rollback_level
+            else None
+        ),
+        "preferred_rollback_target": preferred_rollback_target,
+        "current_rollback_target": current_rollback_target,
+        "rollback_target_supported_count": rollback_target_supported_count,
+        "rollback_target_aligns_with_current": (
+            preferred_rollback_target == current_rollback_target
+            if preferred_rollback_target and current_rollback_target
+            else None
+        ),
     }
 
 
@@ -1386,9 +1814,8 @@ def _build_recommended_action_confidence(
     historical_policy: dict | None,
 ) -> tuple[str, list[str]]:
     basis: list[str] = []
-
     if not safe_action:
-        return "low", ["no_safe_action"]
+        basis.append("no_safe_action")
 
     if auto_recoverable:
         basis.append("auto_recoverable")
@@ -1404,17 +1831,54 @@ def _build_recommended_action_confidence(
             basis.append("historical_alignment")
         elif historical_policy.get("aligns_with_current") is False:
             basis.append("historical_divergence")
+        if historical_policy.get("rollback_level_aligns_with_current") is True:
+            basis.append("historical_rollback_alignment")
+        elif historical_policy.get("rollback_level_aligns_with_current") is False:
+            basis.append("historical_rollback_divergence")
+        if historical_policy.get("rollback_target_aligns_with_current") is True:
+            basis.append("historical_target_alignment")
+        elif historical_policy.get("rollback_target_aligns_with_current") is False:
+            basis.append("historical_target_divergence")
         confidence = str(historical_policy.get("confidence") or "").strip()
         if confidence:
             basis.append(f"historical_confidence_{confidence}")
+
+    if not safe_action:
+        if (
+            "historical_rollback_alignment" in basis
+            and (
+                "historical_confidence_high" in basis
+                or "historical_confidence_medium" in basis
+            )
+        ):
+            return "medium", basis
+        return "low", ["no_safe_action", *basis]
 
     if auto_recoverable:
         return "high", basis
     if "eligibility_blocked" in basis:
         return "low", basis
-    if "historical_alignment" in basis and "historical_confidence_high" in basis:
+    if "historical_divergence" in basis or "historical_rollback_divergence" in basis:
+        return "low", basis
+    if (
+        "historical_alignment" in basis
+        and "historical_confidence_high" in basis
+        and (
+            "historical_rollback_alignment" in basis
+            or historical_policy is None
+            or historical_policy.get("rollback_level_aligns_with_current") is None
+        )
+    ):
         return "high", basis
-    if "eligibility_passed" in basis or "historical_alignment" in basis:
+    if (
+        "eligibility_passed" in basis
+        and (
+            "historical_alignment" in basis
+            or "historical_rollback_alignment" in basis
+        )
+    ):
+        return "medium", basis
+    if "historical_alignment" in basis or "historical_rollback_alignment" in basis:
         return "medium", basis
     return "low", basis
 
@@ -1442,6 +1906,13 @@ def _recommendation_sort_key(rec: dict, incident_age_seconds: int) -> tuple:
             historical_alignment_rank = 0
         elif aligns is False:
             historical_alignment_rank = 2
+    rollback_alignment_rank = 1
+    if historical_policy:
+        rollback_aligns = historical_policy.get("rollback_level_aligns_with_current")
+        if rollback_aligns is True:
+            rollback_alignment_rank = 0
+        elif rollback_aligns is False:
+            rollback_alignment_rank = 2
     original_priority = int(rec.get("priority") or 9999)
     return (
         severity_rank,
@@ -1450,6 +1921,7 @@ def _recommendation_sort_key(rec: dict, incident_age_seconds: int) -> tuple:
         has_safe_action_rank,
         eligibility_rank,
         historical_alignment_rank,
+        rollback_alignment_rank,
         -max(0, int(incident_age_seconds or 0)),
         original_priority,
         str(rec.get("job_id") or ""),
@@ -1493,13 +1965,7 @@ def _build_supervisor_overview_and_message(
     user_held = sum(1 for item in recs if str(item.get("owner") or "").strip() == "user")
     system_held = sum(1 for item in recs if str(item.get("owner") or "").strip() == "system")
 
-    cause_counts: Counter[str] = Counter()
-    for dossier in dossiers:
-        for key, value in ((dossier.get("resource_graph") or {}).get("blocking_cause_counts") or {}).items():
-            try:
-                cause_counts[str(key)] += int(value)
-            except Exception:
-                continue
+    cause_counts = _collect_resource_readiness_cause_counts(dossiers)
 
     overview_parts = [
         f"{summary.get('total_open', 0)} open incidents",
@@ -1536,6 +2002,20 @@ def _build_supervisor_overview_and_message(
             f"{user_held} incident{'s' if user_held != 1 else ''} "
             f"{'is' if user_held == 1 else 'are'} waiting on user action."
         )
+    latest_auto_recovery = _find_latest_auto_recovery_event(dossiers)
+    if latest_auto_recovery:
+        auto_job_label = (
+            str(latest_auto_recovery.get("job_name") or "").strip()
+            or str(latest_auto_recovery.get("job_id") or "").strip()
+            or "unknown job"
+        )
+        auto_issue = str(latest_auto_recovery.get("issue_kind") or "unknown_issue").strip()
+        auto_action = str(latest_auto_recovery.get("safe_action") or "unknown_action").strip()
+        auto_status = str(latest_auto_recovery.get("resulting_status") or "unknown_status").strip()
+        message_parts.append(
+            f"Most recent watchdog recovery handled {auto_issue} via {auto_action} "
+            f"for job '{auto_job_label}' and left it in {auto_status}."
+        )
     if cause_counts:
         top_cause, top_count = cause_counts.most_common(1)[0]
         message_parts.append(f"Most common resource blocker cause is {top_cause} ({top_count}).")
@@ -1565,13 +2045,7 @@ def _build_supervisor_focus_summary(
         for item in recs
         if item.get("incident_type")
     )
-    cause_counts: Counter[str] = Counter()
-    for dossier in dossiers:
-        for key, value in ((dossier.get("resource_graph") or {}).get("blocking_cause_counts") or {}).items():
-            try:
-                cause_counts[str(key)] += int(value)
-            except Exception:
-                continue
+    cause_counts = _collect_resource_readiness_cause_counts(dossiers)
 
     top_owner = owner_counts.most_common(1)[0][0] if owner_counts else None
     top_incident_type = incident_type_counts.most_common(1)[0][0] if incident_type_counts else None
@@ -1586,8 +2060,26 @@ def _build_supervisor_focus_summary(
         if str(item.get("owner") or "").strip() == "user"
     )
     top_recommendation = recs[0] if recs else {}
+    top_failure_layer = (
+        str(
+            top_recommendation.get("failure_layer")
+            or _infer_failure_layer(str(top_incident_type or "").strip())
+        ).strip()
+        or None
+    )
     top_safe_action = str(top_recommendation.get("safe_action") or "").strip() or None
+    top_rollback_level = str(top_recommendation.get("rollback_level") or "").strip() or None
+    top_rollback_target = str(top_recommendation.get("rollback_target") or "").strip() or None
     top_job_id = str(top_recommendation.get("job_id") or "").strip()
+    top_historical_policy = top_recommendation.get("historical_policy") or {}
+    top_historical_rollback_level = (
+        str(top_historical_policy.get("preferred_rollback_level") or "").strip() or None
+    )
+    top_historical_rollback_alignment = top_historical_policy.get("rollback_level_aligns_with_current")
+    top_historical_rollback_target = (
+        str(top_historical_policy.get("preferred_rollback_target") or "").strip() or None
+    )
+    top_historical_rollback_target_alignment = top_historical_policy.get("rollback_target_aligns_with_current")
     dossier_by_job = {
         str(item.get("job_id") or "").strip(): item
         for item in dossiers
@@ -1622,35 +2114,175 @@ def _build_supervisor_focus_summary(
         lane_reason = resource_guidance["lane_reason"]
         next_best_operator_move = resource_guidance["next_move"]
         next_best_operator_reason = resource_guidance["next_reason"]
+    elif top_failure_layer == "resource_binding":
+        resource_guidance = _build_resource_readiness_guidance(None)
+        primary_lane = "resource_readiness"
+        lane_reason = resource_guidance["lane_reason"]
+        next_best_operator_move = resource_guidance["next_move"]
+        next_best_operator_reason = resource_guidance["next_reason"]
     elif top_environment_failure:
         environment_guidance = _build_environment_readiness_guidance(top_environment_failure)
         primary_lane = "environment_readiness"
         lane_reason = environment_guidance["lane_reason"]
         next_best_operator_move = environment_guidance["next_move"]
         next_best_operator_reason = environment_guidance["next_reason"]
+    elif (
+        not top_safe_action
+        and top_historical_rollback_alignment is True
+        and top_historical_rollback_level in {"abstract_plan", "execution_ir", "dag"}
+    ):
+        primary_lane = "rollback_review"
+        if top_historical_rollback_level == "abstract_plan":
+            lane_reason = "Project memory and the current dossier both point to abstract-plan rollback review before runtime retry."
+            next_best_operator_move = "review_rollback_scope"
+            next_best_operator_reason = "Re-open the abstract plan in chat, confirm the rollback scope, and only then decide whether runtime recovery is still appropriate."
+        elif top_historical_rollback_level == "execution_ir":
+            lane_reason = "Project memory and the current dossier both point to execution-semantics rollback review before runtime retry."
+            next_best_operator_move = "review_rollback_scope"
+            next_best_operator_reason = "Review resource clarification / execution semantics first, then rebuild the execution graph before retrying runtime recovery."
+        else:
+            lane_reason = "Project memory and the current dossier both point to expanded-DAG rollback review before runtime retry."
+            next_best_operator_move = "review_rollback_scope"
+            next_best_operator_reason = "Review the expanded DAG changes in chat and reconfirm the execution graph before attempting runtime recovery."
     elif top_safe_action or auto_recoverable_total > 0:
         primary_lane = "runtime_recovery"
         lane_reason = "The current project is mainly in runtime recovery / normalization work."
         next_best_operator_move = "apply_runtime_recovery"
         next_best_operator_reason = "Apply the top safe action or normalization path, then recheck job state consistency."
 
-    return {
+    latest_auto_recovery = _find_latest_auto_recovery_event(dossiers)
+    payload = {
         "top_owner": top_owner,
         "top_incident_type": top_incident_type,
         "top_blocker_cause": top_blocker_cause,
         "high_confidence_total": high_confidence_total,
         "auto_recoverable_total": auto_recoverable_total,
         "user_wait_total": user_wait_total,
+        "top_failure_layer": top_failure_layer,
         "top_safe_action": top_safe_action,
+        "top_rollback_level": top_rollback_level,
+        "top_historical_rollback_level": top_historical_rollback_level,
+        "top_historical_rollback_alignment": top_historical_rollback_alignment,
         "primary_lane": primary_lane,
         "lane_reason": lane_reason,
         "next_best_operator_move": next_best_operator_move,
         "next_best_operator_reason": next_best_operator_reason,
     }
+    if top_rollback_target:
+        payload["top_rollback_target"] = top_rollback_target
+    if top_historical_rollback_target or top_historical_rollback_target_alignment is not None:
+        payload.update(
+            {
+                "top_historical_rollback_target": top_historical_rollback_target,
+                "top_historical_rollback_target_alignment": top_historical_rollback_target_alignment,
+            }
+        )
+    if latest_auto_recovery:
+        payload.update(
+            {
+                "latest_auto_recovery_issue": latest_auto_recovery.get("issue_kind"),
+                "latest_auto_recovery_action": latest_auto_recovery.get("safe_action"),
+                "latest_auto_recovery_status": latest_auto_recovery.get("resulting_status"),
+                "latest_auto_recovery_pending_types": latest_auto_recovery.get("pending_types"),
+                "latest_auto_recovery_job_id": latest_auto_recovery.get("job_id"),
+            }
+        )
+    return payload
+
+
+def _parse_event_timestamp(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _find_latest_auto_recovery_event(dossiers: list[dict] | None) -> dict | None:
+    latest_event: dict | None = None
+    latest_key: tuple[int, datetime, int, int] | None = None
+    for dossier_index, dossier in enumerate(dossiers or []):
+        job_id = str(dossier.get("job_id") or "").strip() or None
+        job_name = str(dossier.get("job_name") or "").strip() or None
+        for event_index, event in enumerate(dossier.get("auto_recovery_events") or []):
+            if not isinstance(event, dict):
+                continue
+            event_time = _parse_event_timestamp(event.get("ts"))
+            sort_key = (
+                1 if event_time else 0,
+                event_time or datetime.min.replace(tzinfo=timezone.utc),
+                dossier_index,
+                event_index,
+            )
+            if latest_key is None or sort_key > latest_key:
+                latest_key = sort_key
+                latest_event = {
+                    **event,
+                    "job_id": job_id,
+                    "job_name": job_name,
+                }
+    return latest_event
+
+
+def _collect_resource_readiness_cause_counts(
+    dossiers: list[dict] | None,
+) -> Counter[str]:
+    cause_counts: Counter[str] = Counter()
+    for dossier in dossiers or []:
+        if not isinstance(dossier, dict):
+            continue
+        for key, value in ((dossier.get("resource_graph") or {}).get("blocking_cause_counts") or {}).items():
+            try:
+                cause_counts[str(key)] += int(value)
+            except Exception:
+                continue
+        resource_decisions = dossier.get("resource_decisions") or {}
+        try:
+            mismatch_total = int(resource_decisions.get("mismatch_total", 0) or 0)
+        except Exception:
+            mismatch_total = 0
+        try:
+            stale_decision_total = int(resource_decisions.get("stale_decision_total", 0) or 0)
+        except Exception:
+            stale_decision_total = 0
+        if mismatch_total:
+            cause_counts["registered_path_mismatch"] += mismatch_total
+        if stale_decision_total:
+            cause_counts["stale_resource_decision"] += stale_decision_total
+    return cause_counts
 
 
 def _build_resource_readiness_guidance(blocker_cause: str | None) -> dict[str, object]:
     cause = str(blocker_cause or "").strip()
+    if cause == "stale_resource_decision":
+        return {
+            "lane_reason": "Resource readiness is dominated by stale previously-kept resource registration decisions.",
+            "next_move": "review_stale_resource_decision",
+            "next_reason": "Re-open the recognized resource mismatch, compare the latest detected path against the registered path, and choose whether to keep or replace the registration again.",
+            "step_codes": [
+                "open_task",
+                "inspect_resource_candidates",
+                "review_stale_resource_decision",
+                "recheck_task_state",
+            ],
+        }
+    if cause == "registered_path_mismatch":
+        return {
+            "lane_reason": "Resource readiness is dominated by recognized resources disagreeing with current registered paths.",
+            "next_move": "resolve_resource_registration_mismatch",
+            "next_reason": "Review the recognized resource mismatch and either replace the registered path or explicitly keep the current registration before resuming binding.",
+            "step_codes": [
+                "open_task",
+                "inspect_resource_candidates",
+                "resolve_resource_registration_mismatch",
+                "recheck_task_state",
+            ],
+        }
     if cause == "missing_primary_resource":
         return {
             "lane_reason": "Resource readiness is dominated by missing primary reference / annotation resources.",
@@ -1795,6 +2427,8 @@ def _build_project_playbook(
         ])
     elif move in {
         "resolve_resource_readiness",
+        "review_stale_resource_decision",
+        "resolve_resource_registration_mismatch",
         "register_primary_resource",
         "resolve_ambiguous_resource_candidates",
         "refresh_stale_derived_resource",
@@ -1808,6 +2442,26 @@ def _build_project_playbook(
                 or []
             )
         )
+    elif move == "review_rollback_scope":
+        rollback_level = str(top.get("rollback_level") or "").strip()
+        if rollback_level == "abstract_plan":
+            step_codes.extend([
+                "open_chat",
+                "confirm_or_edit_plan",
+                "recheck_task_state",
+            ])
+        elif rollback_level == "execution_ir":
+            step_codes.extend([
+                "open_chat",
+                "provide_missing_resource_clarification",
+                "recheck_task_state",
+            ])
+        else:
+            step_codes.extend([
+                "open_chat",
+                "confirm_or_edit_execution",
+                "recheck_task_state",
+            ])
     elif move == "apply_runtime_recovery":
         step_codes.extend([
             "open_task",
@@ -1897,6 +2551,8 @@ async def _record_supervisor_resolution_event(
         f"Applied safe action '{safe_action}'",
         f"rollback_level={rollback_level}",
         f"rollback_target={rollback_target}",
+        f"failure_layer={_infer_failure_layer(str(incident.get('incident_type') or '').strip())}",
+        f"reconfirmation_required={'true' if _requires_reconfirmation(rollback_level) else 'false'}",
         f"resulting_status={outcome_status}",
     ]
     if detail:
@@ -1958,7 +2614,7 @@ def _extract_auto_recovery_events(recent_logs: list[dict] | None) -> list[dict]:
         line = str(item.get("line") or "").strip()
         if not line:
             continue
-        match = _WATCHDOG_AUTO_NORMALIZED_RE.match(line)
+        match = _WATCHDOG_AUTO_RECOVERY_RE.match(line)
         if not match:
             continue
         events.append(
@@ -2204,6 +2860,7 @@ def _build_job_timeline(
     step_runs: list[dict] | None = None,
     artifacts: list[dict] | None = None,
     runtime_diagnostics: list[dict] | None = None,
+    rollback_guidance: dict | None = None,
 ) -> list[dict]:
     events: list[dict] = []
     step_display_by_key = {
@@ -2376,11 +3033,44 @@ def _build_job_timeline(
             }
         )
 
+    if rollback_guidance and str(rollback_guidance.get("level") or "").strip() not in {"", "step"}:
+        detail_parts = [
+            f"level={str(rollback_guidance.get('level') or '').strip()}",
+            (
+                f"target={str(rollback_guidance.get('target') or '').strip()}"
+                if str(rollback_guidance.get("target") or "").strip()
+                else None
+            ),
+            (
+                "reconfirm=true"
+                if rollback_guidance.get("reconfirmation_required")
+                else None
+            ),
+            str(rollback_guidance.get("reason") or "").strip() or None,
+        ]
+        reference_ts = (
+            get_job_progress_reference(job)
+            or getattr(job, "updated_at", None)
+            or getattr(job, "ended_at", None)
+            or getattr(job, "started_at", None)
+            or getattr(job, "created_at", None)
+        )
+        events.append(
+            {
+                "ts": reference_ts.isoformat() if getattr(reference_ts, "isoformat", None) else reference_ts,
+                "kind": "rollback_guidance",
+                "source": "supervisor",
+                "category": "recovery",
+                "title": "Rollback review recommended",
+                "detail": " · ".join(part for part in detail_parts if part),
+            }
+        )
+
     for item in recent_logs or []:
         line = str(item.get("line") or "").strip()
         if not line.startswith("[watchdog]"):
             continue
-        match = _WATCHDOG_AUTO_NORMALIZED_RE.match(line)
+        match = _WATCHDOG_AUTO_RECOVERY_RE.match(line)
         if match:
             events.append(
                 {
@@ -2429,6 +3119,40 @@ def _build_dossier_summary(dossier: dict) -> str:
         fragments.append(
             f"dag={execution.get('group_count', 0)} groups/{execution.get('node_count', 0)} nodes"
         )
+    confirmation_overview = dossier.get("execution_confirmation_overview") or {}
+    if confirmation_overview:
+        fragments.append(
+            "exec_overview="
+            + ",".join(
+                [
+                    f"abstract:{confirmation_overview.get('abstract_step_count', 0)}",
+                    f"ir:{confirmation_overview.get('execution_ir_step_count', 0)}",
+                    f"groups:{confirmation_overview.get('execution_group_count', 0)}",
+                    f"added:{confirmation_overview.get('added_group_count', 0)}",
+                    f"changed:{confirmation_overview.get('changed_group_count', 0)}",
+                ]
+            )
+        )
+        fragments.append(
+            "exec_modes="
+            + ",".join(
+                [
+                    f"per_sample:{confirmation_overview.get('per_sample_step_count', 0)}",
+                    f"aggregate:{confirmation_overview.get('aggregate_step_count', 0)}",
+                    f"global:{confirmation_overview.get('global_step_count', 0)}",
+                ]
+            )
+        )
+        fragments.append(
+            "exec_changes="
+            + ",".join(
+                [
+                    f"fan_out:{confirmation_overview.get('fan_out_change_count', 0)}",
+                    f"aggregate:{confirmation_overview.get('aggregate_change_count', 0)}",
+                    f"auto_injected:{confirmation_overview.get('auto_injected_change_count', 0)}",
+                ]
+            )
+        )
 
     impacted_step_keys = dossier.get("impacted_step_keys") or []
     if impacted_step_keys:
@@ -2465,6 +3189,17 @@ def _build_dossier_summary(dossier: dict) -> str:
         dominant_cause = str(dominant_blocker.get("cause") or "").strip()
         if dominant_label and dominant_cause:
             fragments.append(f"resource_focus={dominant_label}:{dominant_cause}")
+    resource_decisions = dossier.get("resource_decisions") or {}
+    if resource_decisions.get("available"):
+        tracked_total = int(resource_decisions.get("tracked_total", 0) or 0)
+        mismatch_total = int(resource_decisions.get("mismatch_total", 0) or 0)
+        stale_decision_total = int(resource_decisions.get("stale_decision_total", 0) or 0)
+        if tracked_total:
+            fragments.append(f"resource_decisions={tracked_total}")
+        if mismatch_total:
+            fragments.append(f"resource_mismatches={mismatch_total}")
+        if stale_decision_total:
+            fragments.append(f"resource_decision_stale={stale_decision_total}")
 
     recent_logs = dossier.get("recent_logs") or []
     if recent_logs:
@@ -2513,8 +3248,193 @@ def _build_dossier_summary(dossier: dict) -> str:
     similar_resolutions = dossier.get("similar_resolutions") or []
     if similar_resolutions:
         fragments.append(f"memory_matches={len(similar_resolutions)}")
+    rollback_hint = dossier.get("rollback_hint") or {}
+    if rollback_hint.get("suggested_level"):
+        fragments.append(f"rollback_hint={rollback_hint.get('suggested_level')}")
 
     return " · ".join(fragments) if fragments else "No additional dossier signals."
+
+
+def _build_dossier_rollback_hint(dossier: dict) -> dict[str, str] | None:
+    incident_type = str(dossier.get("incident_type") or "").strip()
+    current_step_key = str(((dossier.get("current_step") or {}).get("step_key")) or "").strip()
+    overview = dossier.get("execution_confirmation_overview") or {}
+    delta = dossier.get("execution_plan_delta") or {}
+
+    added_groups = {
+        str(item.get("group_key") or "").strip()
+        for item in (delta.get("added_groups") or [])
+        if isinstance(item, dict) and str(item.get("group_key") or "").strip()
+    }
+    changed_groups = {
+        str(item.get("group_key") or "").strip()
+        for item in (delta.get("changed_groups") or [])
+        if isinstance(item, dict) and str(item.get("group_key") or "").strip()
+    }
+
+    if incident_type in {"plan_confirmation", "execution_confirmation"}:
+        return {
+            "suggested_level": _infer_rollback_level(incident_type),
+            "reason": "The job is already paused at a confirmation gate.",
+        }
+
+    if current_step_key and current_step_key in added_groups:
+        return {
+            "suggested_level": "execution_ir",
+            "reason": "The current failing / blocked step was added by orchestration, so rollback should revisit execution semantics before retrying.",
+        }
+
+    if current_step_key and current_step_key in changed_groups:
+        return {
+            "suggested_level": "dag",
+            "reason": "The current failing / blocked step was materially re-orchestrated in the expanded DAG, so rollback should revisit the execution graph.",
+        }
+
+    if incident_type in {"binding_required", "resource_clarification"} and int(overview.get("added_group_count", 0) or 0) > 0:
+        return {
+            "suggested_level": "execution_ir",
+            "reason": "Binding / clarification is blocked after orchestration added preparation steps, so revisit execution semantics first.",
+        }
+
+    if incident_type in {"failed", "repair", "stalled", "resume_failed"} and int(overview.get("changed_group_count", 0) or 0) > 0:
+        return {
+            "suggested_level": "dag",
+            "reason": "Runtime failure happened after orchestration changed execution groups, so revisit the expanded DAG before retrying from a step.",
+        }
+
+    return None
+
+
+def _build_rollback_guidance(dossier: dict) -> dict | None:
+    rollback_level = str(dossier.get("rollback_level") or "").strip() or None
+    rollback_target = str(dossier.get("rollback_target") or "").strip() or None
+    rollback_hint = dossier.get("rollback_hint") or {}
+    reason = str(rollback_hint.get("reason") or "").strip() or None
+    reconfirmation_required = bool(dossier.get("reconfirmation_required"))
+    similar_resolutions = [
+        item
+        for item in (dossier.get("similar_resolutions") or [])
+        if isinstance(item, dict)
+    ]
+    same_level_count = 0
+    same_target_count = 0
+    if rollback_level:
+        same_level_count = sum(
+            1
+            for item in similar_resolutions
+            if str(item.get("rollback_level") or "").strip() == rollback_level
+        )
+    if rollback_target:
+        same_target_count = sum(
+            1
+            for item in similar_resolutions
+            if str(item.get("rollback_target") or "").strip() == rollback_target
+        )
+
+    if rollback_level in {None, "step"} and not reason:
+        return None
+
+    summary_parts = [f"level={rollback_level or 'step'}"]
+    if rollback_target:
+        summary_parts.append(f"target={rollback_target}")
+    if reconfirmation_required:
+        summary_parts.append("reconfirm=true")
+    if same_level_count:
+        summary_parts.append(f"history_same_level={same_level_count}/{len(similar_resolutions)}")
+    if same_target_count:
+        summary_parts.append(f"history_same_target={same_target_count}/{len(similar_resolutions)}")
+    if reason:
+        summary_parts.append(reason)
+
+    return {
+        "level": rollback_level or "step",
+        "target": rollback_target,
+        "reconfirmation_required": reconfirmation_required,
+        "reason": reason,
+        "historical_matches": len(similar_resolutions),
+        "historical_same_level_count": same_level_count,
+        "historical_same_target_count": same_target_count,
+        "summary": " · ".join(summary_parts),
+    }
+
+
+async def _fetch_job_current_step(session: AsyncSession, job: AnalysisJob):
+    from tune.core.models import AnalysisStepRun
+
+    if getattr(job, "current_step_id", None):
+        step = (
+            await session.execute(
+                select(AnalysisStepRun).where(AnalysisStepRun.id == job.current_step_id)
+            )
+        ).scalar_one_or_none()
+        if step is not None:
+            return step
+
+    pending_step_key = str(getattr(job, "pending_step_key", None) or "").strip()
+    if pending_step_key:
+        step = (
+            await session.execute(
+                select(AnalysisStepRun)
+                .where(
+                    AnalysisStepRun.job_id == job.id,
+                    AnalysisStepRun.step_key == pending_step_key,
+                )
+                .order_by(AnalysisStepRun.started_at.desc(), AnalysisStepRun.finished_at.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if step is not None:
+            return step
+
+    return (
+        await session.execute(
+            select(AnalysisStepRun)
+            .where(AnalysisStepRun.job_id == job.id)
+            .order_by(AnalysisStepRun.started_at.desc(), AnalysisStepRun.finished_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+
+async def _build_job_rollback_guidance(
+    session: AsyncSession,
+    job: AnalysisJob,
+    effective: dict,
+    *,
+    current_step=None,
+) -> dict | None:
+    incident = _derive_job_incident(job, effective, current_step=current_step)
+    if incident is None:
+        return None
+    confirmation = _serialize_confirmation_details(job, effective.get("pending_interaction_type"))
+    rollback_context = {
+        "job_id": job.id,
+        "incident_type": incident["incident_type"],
+        "current_step": {
+            "step_key": getattr(current_step, "step_key", None),
+        },
+        "execution_confirmation_overview": confirmation.get("execution_confirmation_overview"),
+        "execution_plan_delta": confirmation.get("execution_plan_delta"),
+    }
+    rollback_context["rollback_hint"] = _build_dossier_rollback_hint(rollback_context)
+    rollback_target, rollback_level, _diagnosis, _safe_action = _resolve_supervisor_incident_controls(
+        incident,
+        dossier=rollback_context,
+    )
+    return _build_rollback_guidance(
+        {
+            "rollback_level": rollback_level,
+            "rollback_target": rollback_target,
+            "reconfirmation_required": _requires_reconfirmation(rollback_level),
+            "rollback_hint": rollback_context["rollback_hint"],
+            "similar_resolutions": await _fetch_similar_project_execution_events(
+                session,
+                job,
+                incident,
+                current_step=current_step,
+            ),
+        }
+    )
 
 
 def _build_pending_request_snapshot(
@@ -2669,12 +3589,13 @@ async def _build_job_dossier(
     current_step=None,
 ) -> dict:
     confirmation = _serialize_confirmation_details(job, effective.get("pending_interaction_type"))
-    rollback_target, rollback_level, _diagnosis = _recommendation_fields_from_incident(incident)
+    execution_plan = _serialize_execution_plan(job)
     recent_logs = await _fetch_recent_job_logs(session, job.id)
     recent_decisions = await _fetch_recent_user_decisions(session, job.id)
     recent_auth_requests = await _fetch_recent_auth_requests(session, job.id)
     recent_repair_requests = await _fetch_recent_repair_requests(session, job.id)
     auto_recovery_events = _extract_auto_recovery_events(recent_logs)
+    resource_decisions = await _fetch_project_resource_decision_snapshot(session, job.project_id)
     similar_resolutions = await _fetch_similar_project_execution_events(
         session,
         job,
@@ -2692,6 +3613,20 @@ async def _build_job_dossier(
     )
     environment_failure = _extract_environment_failure_signal(
         {"runtime_diagnostics": effective.get("runtime_diagnostics") or []}
+    )
+    rollback_context = {
+        "job_id": job.id,
+        "incident_type": incident["incident_type"],
+        "current_step": {
+            "step_key": getattr(current_step, "step_key", None),
+        },
+        "execution_confirmation_overview": confirmation.get("execution_confirmation_overview"),
+        "execution_plan_delta": confirmation.get("execution_plan_delta"),
+    }
+    rollback_context["rollback_hint"] = _build_dossier_rollback_hint(rollback_context)
+    rollback_target, rollback_level, _diagnosis, _safe_action = _resolve_supervisor_incident_controls(
+        incident,
+        dossier=rollback_context,
     )
 
     dossier = {
@@ -2713,8 +3648,13 @@ async def _build_job_dossier(
         },
         "impacted_step_keys": impacted_step_keys,
         "confirmation": confirmation,
-        "execution_plan_summary": _serialize_execution_plan(job)["summary"],
+        "execution_plan_summary": execution_plan["summary"],
+        "execution_confirmation_overview": confirmation.get("execution_confirmation_overview"),
+        "execution_ir_review": confirmation.get("execution_ir_review") or [],
+        "execution_plan_delta": confirmation.get("execution_plan_delta"),
+        "execution_plan_changes": confirmation.get("execution_plan_changes") or [],
         "resource_graph": _summarize_resource_graph_snapshot(getattr(job, "resource_graph_json", None)),
+        "resource_decisions": resource_decisions,
         "recent_logs": recent_logs,
         "recent_decisions": recent_decisions,
         "pending_requests": _build_pending_request_snapshot(
@@ -2729,6 +3669,8 @@ async def _build_job_dossier(
         "auto_recovery_events": auto_recovery_events,
         "similar_resolutions": similar_resolutions,
     }
+    dossier["rollback_hint"] = rollback_context["rollback_hint"]
+    dossier["rollback_guidance"] = _build_rollback_guidance(dossier)
     dossier["summary"] = _build_dossier_summary(dossier)
     return dossier
 
@@ -2903,10 +3845,10 @@ def _derive_job_incident(
 
     return {
         "job_id": job.id,
-        "job_name": job.name,
+        "job_name": getattr(job, "name", None),
         "job_status": status,
-        "project_id": job.project_id,
-        "thread_id": job.thread_id,
+        "project_id": getattr(job, "project_id", None),
+        "thread_id": getattr(job, "thread_id", None),
         "incident_type": incident_type,
         "severity": severity,
         "owner": owner,
@@ -2975,7 +3917,7 @@ def _normalize_attention_reason(incident_type: str | None) -> str | None:
         return "confirmation"
     if raw == "resource_clarification":
         return "clarification"
-    if raw in {"stalled", "resume_failed", "job_status_mismatch", "orphan_pending_request", "failed", "interrupted", "binding_required"}:
+    if raw in {"stalled", "resume_failed", "job_status_mismatch", "orphan_pending_request", "failed", "interrupted", "binding", "binding_required"}:
         return "warning"
     return None
 
@@ -2984,25 +3926,48 @@ def _build_task_attention_summary_payload(
     incidents: list[dict],
     overview: dict,
     *,
+    dossiers: list[dict] | None = None,
     auto_authorize_commands: bool = False,
     reminder_threshold_seconds: int = 120,
 ) -> dict:
+    dossiers_by_job = {
+        str(item.get("job_id") or "").strip(): item
+        for item in (dossiers or [])
+        if isinstance(item, dict) and str(item.get("job_id") or "").strip()
+    }
     normalized: list[dict] = []
     for incident in incidents:
+        job_id = str(incident.get("job_id") or "").strip()
         reason = _normalize_attention_reason(incident.get("incident_type"))
         if not reason:
             continue
+        dossier = dossiers_by_job.get(job_id) or {}
+        rollback_guidance = dossier.get("rollback_guidance") or {}
+        rollback_level = str(rollback_guidance.get("level") or "").strip() or None
+        reconfirmation_required = bool(rollback_guidance.get("reconfirmation_required"))
+        if (
+            reason == "warning"
+            and reconfirmation_required
+            and rollback_level in {"abstract_plan", "execution_ir", "dag"}
+        ):
+            reason = "rollback_review"
         normalized.append({
             "key": f"{incident.get('job_id')}:{reason}",
             "job_id": incident.get("job_id"),
             "job_name": incident.get("job_name"),
+            "thread_id": incident.get("thread_id"),
             "incident_type": incident.get("incident_type"),
             "reason": reason,
             "age_seconds": int(incident.get("age_seconds") or 0),
             "summary": incident.get("summary"),
             "severity": incident.get("severity"),
             "owner": incident.get("owner"),
+            "next_action": incident.get("next_action"),
             "pending_interaction_type": incident.get("pending_interaction_type"),
+            "rollback_level": rollback_level,
+            "rollback_target": str(rollback_guidance.get("target") or "").strip() or None,
+            "rollback_reason": str(rollback_guidance.get("reason") or "").strip() or None,
+            "reconfirmation_required": reconfirmation_required,
         })
 
     needs_input = [item for item in normalized if item["reason"] != "warning"]
@@ -3014,6 +3979,7 @@ def _build_task_attention_summary_payload(
         "repair": sum(1 for item in needs_input if item["reason"] == "repair"),
         "confirmation": sum(1 for item in needs_input if item["reason"] == "confirmation"),
         "clarification": sum(1 for item in needs_input if item["reason"] == "clarification"),
+        "rollback_review": sum(1 for item in needs_input if item["reason"] == "rollback_review"),
         "warning": len(needs_review),
         "needs_input": len(needs_input),
         "needs_review": len(needs_review),
@@ -3062,6 +4028,7 @@ async def _collect_job_attention_summary(
     attention = _build_task_attention_summary_payload(
         incidents,
         overview,
+        dossiers=_dossiers,
         auto_authorize_commands=auto_authorize_commands,
     )
     attention["summary"] = summary
@@ -3151,9 +4118,11 @@ def _build_supervisor_review_fallback(
         ),
         start=1,
     ):
-        rollback_target, rollback_level, diagnosis = _recommendation_fields_from_incident(incident)
         dossier = dossier_map.get(incident["job_id"])
-        safe_action = _infer_safe_supervisor_action(incident, rollback_level)
+        rollback_target, rollback_level, diagnosis, safe_action = _resolve_supervisor_incident_controls(
+            incident,
+            dossier=dossier,
+        )
         auto_recoverable, auto_recovery_kind = _infer_auto_recovery_policy(
             incident,
             rollback_level,
@@ -3163,6 +4132,8 @@ def _build_supervisor_review_fallback(
         historical_policy = _build_historical_policy(
             (dossier or {}).get("similar_resolutions") or [],
             safe_action=safe_action,
+            rollback_level=rollback_level,
+            rollback_target=rollback_target,
         )
         historical_guidance = _build_historical_guidance(
             (dossier or {}).get("similar_resolutions") or [],
@@ -3170,6 +4141,8 @@ def _build_supervisor_review_fallback(
             safe_action_eligibility=safe_action_eligibility,
             incident_type=incident.get("incident_type"),
             job_status=incident.get("job_status"),
+            rollback_level=rollback_level,
+            rollback_target=rollback_target,
         )
         recommended_action_confidence, recommended_action_basis = _build_recommended_action_confidence(
             safe_action=safe_action,
@@ -3191,6 +4164,7 @@ def _build_supervisor_review_fallback(
                 "rollback_level": rollback_level,
                 "rollback_target": rollback_target,
                 "reconfirmation_required": _requires_reconfirmation(rollback_level),
+                "historical_matches": len((dossier or {}).get("similar_resolutions") or []),
                 "safe_action": safe_action,
                 "safe_action_eligibility": safe_action_eligibility,
                 "historical_policy": historical_policy,
@@ -3270,6 +4244,7 @@ async def _build_supervisor_review_with_llm(
                         "rollback_level": {"type": "string"},
                         "rollback_target": {"type": "string"},
                         "reconfirmation_required": {"type": "boolean"},
+                        "historical_matches": {"type": "integer"},
                         "safe_action": {"type": "string"},
                         "safe_action_eligibility": {
                             "type": "object",
@@ -3298,6 +4273,14 @@ async def _build_supervisor_review_with_llm(
                                 "current_safe_action": {"type": "string"},
                                 "current_supported_count": {"type": "integer"},
                                 "aligns_with_current": {"type": "boolean"},
+                                "preferred_rollback_level": {"type": "string"},
+                                "current_rollback_level": {"type": "string"},
+                                "rollback_level_supported_count": {"type": "integer"},
+                                "rollback_level_aligns_with_current": {"type": "boolean"},
+                                "preferred_rollback_target": {"type": "string"},
+                                "current_rollback_target": {"type": "string"},
+                                "rollback_target_supported_count": {"type": "integer"},
+                                "rollback_target_aligns_with_current": {"type": "boolean"},
                             },
                         },
                         "auto_recoverable": {"type": "boolean"},
@@ -3347,11 +4330,23 @@ async def _build_supervisor_review_with_llm(
                     "high_confidence_total": {"type": "integer"},
                     "auto_recoverable_total": {"type": "integer"},
                     "user_wait_total": {"type": "integer"},
+                    "top_failure_layer": {"type": "string"},
                     "top_safe_action": {"type": "string"},
+                    "top_rollback_level": {"type": "string"},
+                    "top_rollback_target": {"type": "string"},
+                    "top_historical_rollback_level": {"type": "string"},
+                    "top_historical_rollback_alignment": {"type": "boolean"},
+                    "top_historical_rollback_target": {"type": "string"},
+                    "top_historical_rollback_target_alignment": {"type": "boolean"},
                     "primary_lane": {"type": "string"},
                     "lane_reason": {"type": "string"},
                     "next_best_operator_move": {"type": "string"},
                     "next_best_operator_reason": {"type": "string"},
+                    "latest_auto_recovery_issue": {"type": "string"},
+                    "latest_auto_recovery_action": {"type": "string"},
+                    "latest_auto_recovery_status": {"type": "string"},
+                    "latest_auto_recovery_pending_types": {"type": "string"},
+                    "latest_auto_recovery_job_id": {"type": "string"},
                 },
             },
             "project_playbook": {
@@ -3396,22 +4391,42 @@ async def _build_supervisor_review_with_llm(
             job_id = item.get("job_id")
             baseline = fallback_by_job.get(job_id or "", {})
             merged = dict(item)
-            merged.setdefault("thread_id", baseline.get("thread_id", ""))
-            merged.setdefault("failure_layer", baseline.get("failure_layer", "step_execution"))
-            merged.setdefault("rollback_level", baseline.get("rollback_level", "step"))
-            merged.setdefault("rollback_target", baseline.get("rollback_target", "job_detail"))
-            merged.setdefault("reconfirmation_required", baseline.get("reconfirmation_required", False))
-            merged.setdefault("safe_action", baseline.get("safe_action"))
-            merged.setdefault("safe_action_eligibility", baseline.get("safe_action_eligibility"))
-            merged.setdefault("historical_policy", baseline.get("historical_policy"))
-            merged.setdefault("auto_recoverable", baseline.get("auto_recoverable", False))
-            merged.setdefault("auto_recovery_kind", baseline.get("auto_recovery_kind"))
-            merged.setdefault("recommended_action_confidence", baseline.get("recommended_action_confidence", "low"))
-            merged.setdefault("recommended_action_basis", baseline.get("recommended_action_basis", []))
-            merged.setdefault("safe_action_note", baseline.get("safe_action_note"))
-            merged.setdefault("historical_guidance", baseline.get("historical_guidance"))
-            merged.setdefault("dossier_summary", baseline.get("dossier_summary", "No additional dossier signals."))
-            merged.setdefault("recovery_playbook", baseline.get("recovery_playbook"))
+            if baseline:
+                merged["thread_id"] = baseline.get("thread_id", "")
+                merged["failure_layer"] = baseline.get("failure_layer", "step_execution")
+                merged["rollback_level"] = baseline.get("rollback_level", "step")
+                merged["rollback_target"] = baseline.get("rollback_target", "job_detail")
+                merged["reconfirmation_required"] = baseline.get("reconfirmation_required", False)
+                merged["historical_matches"] = baseline.get("historical_matches", 0)
+                merged["safe_action"] = baseline.get("safe_action")
+                merged["safe_action_eligibility"] = baseline.get("safe_action_eligibility")
+                merged["historical_policy"] = baseline.get("historical_policy")
+                merged["auto_recoverable"] = baseline.get("auto_recoverable", False)
+                merged["auto_recovery_kind"] = baseline.get("auto_recovery_kind")
+                merged["recommended_action_confidence"] = baseline.get("recommended_action_confidence", "low")
+                merged["recommended_action_basis"] = baseline.get("recommended_action_basis", [])
+                merged["safe_action_note"] = baseline.get("safe_action_note")
+                merged["historical_guidance"] = baseline.get("historical_guidance")
+                merged["dossier_summary"] = baseline.get("dossier_summary", "No additional dossier signals.")
+                merged["recovery_playbook"] = baseline.get("recovery_playbook")
+            else:
+                merged.setdefault("thread_id", "")
+                merged.setdefault("failure_layer", "step_execution")
+                merged.setdefault("rollback_level", "step")
+                merged.setdefault("rollback_target", "job_detail")
+                merged.setdefault("reconfirmation_required", False)
+                merged.setdefault("historical_matches", 0)
+                merged.setdefault("safe_action", None)
+                merged.setdefault("safe_action_eligibility", None)
+                merged.setdefault("historical_policy", None)
+                merged.setdefault("auto_recoverable", False)
+                merged.setdefault("auto_recovery_kind", None)
+                merged.setdefault("recommended_action_confidence", "low")
+                merged.setdefault("recommended_action_basis", [])
+                merged.setdefault("safe_action_note", None)
+                merged.setdefault("historical_guidance", None)
+                merged.setdefault("dossier_summary", "No additional dossier signals.")
+                merged.setdefault("recovery_playbook", None)
             recommendations.append(merged)
             if job_id:
                 seen_job_ids.add(str(job_id))
@@ -3674,6 +4689,13 @@ async def get_job(job_id: str, session: AsyncSession = Depends(get_session)):
     if not j:
         raise HTTPException(404, "Job not found")
     effective = await _get_effective_job_state(session, j)
+    current_step = await _fetch_job_current_step(session, j)
+    rollback_guidance = await _build_job_rollback_guidance(
+        session,
+        j,
+        effective,
+        current_step=current_step,
+    )
     execution_plan = _serialize_execution_plan(j)
     recent_logs = await _fetch_recent_job_logs(session, job_id)
     recent_decisions = await _fetch_recent_user_decisions(session, job_id)
@@ -3694,6 +4716,7 @@ async def get_job(job_id: str, session: AsyncSession = Depends(get_session)):
         "execution_ir": execution_plan["execution_ir"],
         "expanded_dag": execution_plan["expanded_dag"],
         "execution_plan_summary": execution_plan["summary"],
+        "rollback_guidance": rollback_guidance,
         "auto_recovery_events": _extract_auto_recovery_events(recent_logs),
         "timeline": _build_job_timeline(
             j,
@@ -3704,6 +4727,7 @@ async def get_job(job_id: str, session: AsyncSession = Depends(get_session)):
             step_runs=step_runs,
             artifacts=artifacts,
             runtime_diagnostics=effective.get("runtime_diagnostics") or [],
+            rollback_guidance=rollback_guidance,
         ),
     }
 
@@ -3812,8 +4836,16 @@ async def supervisor_step_reenter(job_id: str, session: AsyncSession = Depends(g
     if not incident:
         raise HTTPException(409, "No open supervisor incident is available for this job")
 
-    rollback_level = _infer_rollback_level(incident["incident_type"])
-    if rollback_level != "step" or incident["owner"] != "system":
+    rollback_target, rollback_level, _diagnosis, safe_action = _resolve_supervisor_incident_controls(
+        incident,
+        dossier=_build_supervisor_rollback_context(
+            j,
+            effective,
+            incident,
+            current_step=current_step,
+        ),
+    )
+    if rollback_level != "step" or incident["owner"] != "system" or safe_action != "step_reenter":
         raise HTTPException(409, "This incident is not eligible for safe step-level supervisor re-entry")
 
     anchor_step_key, anchor_step_id = await _resolve_supervisor_step_anchor(
@@ -4002,8 +5034,10 @@ async def _supervisor_refresh_execution_plan(
     if not incident:
         raise HTTPException(409, "No open supervisor incident is available for this job")
 
-    inferred_rollback_level = _infer_rollback_level(incident["incident_type"])
-    safe_action = _infer_safe_supervisor_action(incident, inferred_rollback_level)
+    _resolved_target, inferred_rollback_level, _diagnosis, safe_action = _resolve_supervisor_incident_controls(
+        incident,
+        dossier=_build_supervisor_rollback_context(j, effective, incident),
+    )
     if safe_action != expected_safe_action:
         raise HTTPException(409, "This incident is not eligible for the requested supervisor execution refresh")
 
@@ -4118,8 +5152,10 @@ async def supervisor_revalidate_abstract_plan(
     if not incident:
         raise HTTPException(409, "No open supervisor incident is available for this job")
 
-    rollback_level = _infer_rollback_level(incident["incident_type"])
-    safe_action = _infer_safe_supervisor_action(incident, rollback_level)
+    _resolved_target, rollback_level, _diagnosis, safe_action = _resolve_supervisor_incident_controls(
+        incident,
+        dossier=_build_supervisor_rollback_context(j, effective, incident),
+    )
     if safe_action != "revalidate_abstract_plan":
         raise HTTPException(409, "This incident is not eligible for safe abstract-plan revalidation")
 
@@ -4262,8 +5298,10 @@ async def supervisor_retry_resume_chain(
     if not incident:
         raise HTTPException(409, "No open supervisor incident is available for this job")
 
-    rollback_level = _infer_rollback_level(incident["incident_type"])
-    safe_action = _infer_safe_supervisor_action(incident, rollback_level)
+    rollback_target, rollback_level, _diagnosis, safe_action = _resolve_supervisor_incident_controls(
+        incident,
+        dossier=_build_supervisor_rollback_context(j, effective, incident),
+    )
     if safe_action != "retry_resume_chain":
         raise HTTPException(409, "This incident is not eligible for safe resume-chain retry")
 
@@ -4273,11 +5311,12 @@ async def supervisor_retry_resume_chain(
     if not (j.pending_auth_request_id or j.pending_repair_request_id):
         raise HTTPException(409, "No resolved pending-decision metadata is available to retry")
 
-    rollback_target = (
-        incident.get("current_step_key")
-        or getattr(j, "pending_step_key", None)
-        or "resume_chain"
-    )
+    if rollback_target in {"job_detail", "resume_chain"}:
+        rollback_target = (
+            incident.get("current_step_key")
+            or getattr(j, "pending_step_key", None)
+            or "resume_chain"
+        )
     pending_types = sorted(
         filter(
             None,
@@ -4361,8 +5400,10 @@ async def supervisor_normalize_terminal_state(
     if not incident:
         raise HTTPException(409, "No open supervisor incident is available for this job")
 
-    rollback_level = _infer_rollback_level(incident["incident_type"])
-    safe_action = _infer_safe_supervisor_action(incident, rollback_level)
+    rollback_target, rollback_level, _diagnosis, safe_action = _resolve_supervisor_incident_controls(
+        incident,
+        dossier=_build_supervisor_rollback_context(j, effective, incident),
+    )
     if safe_action != "normalize_terminal_state":
         raise HTTPException(409, "This incident is not eligible for safe terminal-state normalization")
 
@@ -4395,7 +5436,7 @@ async def supervisor_normalize_terminal_state(
         incident,
         safe_action="normalize_terminal_state",
         rollback_level=rollback_level,
-        rollback_target="job_state_normalization",
+        rollback_target=rollback_target,
         outcome_status=final_status,
     )
 
@@ -4417,7 +5458,7 @@ async def supervisor_normalize_terminal_state(
         "ok": True,
         "status": final_status,
         "rollback_level": rollback_level,
-        "rollback_target": "job_state_normalization",
+        "rollback_target": rollback_target,
     }
 
 
@@ -4439,8 +5480,10 @@ async def supervisor_normalize_orphan_pending_state(
     if not incident:
         raise HTTPException(409, "No open supervisor incident is available for this job")
 
-    rollback_level = _infer_rollback_level(incident["incident_type"])
-    safe_action = _infer_safe_supervisor_action(incident, rollback_level)
+    rollback_target, rollback_level, _diagnosis, safe_action = _resolve_supervisor_incident_controls(
+        incident,
+        dossier=_build_supervisor_rollback_context(j, effective, incident),
+    )
     if safe_action != "normalize_orphan_pending_state":
         raise HTTPException(409, "This incident is not eligible for safe orphan-pending normalization")
 
@@ -4472,7 +5515,7 @@ async def supervisor_normalize_orphan_pending_state(
         incident,
         safe_action="normalize_orphan_pending_state",
         rollback_level=rollback_level,
-        rollback_target=incident.get("current_step_key") or "pending_request_record",
+        rollback_target=rollback_target,
         outcome_status=normalized_status,
     )
 
@@ -4494,7 +5537,7 @@ async def supervisor_normalize_orphan_pending_state(
         "ok": True,
         "status": normalized_status,
         "rollback_level": rollback_level,
-        "rollback_target": incident.get("current_step_key") or "pending_request_record",
+        "rollback_target": rollback_target,
     }
 
 
@@ -4942,6 +5985,13 @@ async def get_bindings(
     if not job:
         raise HTTPException(404, "Job not found")
     effective = await _get_effective_job_state(session, job)
+    current_step = await _fetch_job_current_step(session, job)
+    rollback_guidance = await _build_job_rollback_guidance(
+        session,
+        job,
+        effective,
+        current_step=current_step,
+    )
 
     if not detailed:
         confirmation = _serialize_confirmation_details(
@@ -4967,6 +6017,7 @@ async def get_bindings(
             "pending_interaction_type": effective["pending_interaction_type"],
             "pending_interaction_payload": effective["pending_interaction_payload"],
             "runtime_diagnostics": effective.get("runtime_diagnostics") or [],
+            "rollback_guidance": rollback_guidance,
             "auto_recovery_events": _extract_auto_recovery_events(recent_logs),
             "timeline": _build_job_timeline(
                 job,
@@ -4977,6 +6028,7 @@ async def get_bindings(
                 step_runs=step_runs,
                 artifacts=artifacts,
                 runtime_diagnostics=effective.get("runtime_diagnostics") or [],
+                rollback_guidance=rollback_guidance,
             ),
             "confirmation_phase": confirmation["confirmation_phase"],
             "confirmation_plan": confirmation["confirmation_plan"],
@@ -5029,6 +6081,7 @@ async def get_bindings(
         "pending_interaction_type": effective["pending_interaction_type"],
         "pending_interaction_payload": effective["pending_interaction_payload"],
         "runtime_diagnostics": effective.get("runtime_diagnostics") or [],
+        "rollback_guidance": rollback_guidance,
         "auto_recovery_events": _extract_auto_recovery_events(recent_logs),
         "timeline": _build_job_timeline(
             job,
@@ -5039,6 +6092,7 @@ async def get_bindings(
             step_runs=step_runs,
             artifacts=artifacts,
             runtime_diagnostics=effective.get("runtime_diagnostics") or [],
+            rollback_guidance=rollback_guidance,
         ),
         "confirmation_phase": confirmation["confirmation_phase"],
         "confirmation_plan": confirmation["confirmation_plan"],

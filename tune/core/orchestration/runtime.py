@@ -262,6 +262,8 @@ def build_expanded_dag(
                     "scope": scope,
                     "origin_step_type": step_type,
                     "origin_display_name": _step_display_name(step),
+                    "_preflight_injected": bool(step.get("_preflight_injected")),
+                    "_rr_injected": bool(step.get("_rr_injected")),
                     "node_keys": group_node_keys,
                 }
             )
@@ -277,6 +279,8 @@ def build_expanded_dag(
                     "scope": scope,
                     "origin_step_type": step_type,
                     "origin_display_name": _step_display_name(step),
+                    "_preflight_injected": bool(step.get("_preflight_injected")),
+                    "_rr_injected": bool(step.get("_rr_injected")),
                     "node_keys": [origin_step_key],
                 }
             )
@@ -326,8 +330,7 @@ def build_execution_payload(
     )
 
 
-def summarize_expanded_dag_for_confirmation(expanded_dag: dict[str, Any] | None) -> list[dict[str, Any]]:
-    """Return a grouped, human-readable plan view for second confirmation."""
+def _collect_confirmation_group_views(expanded_dag: dict[str, Any] | None) -> list[dict[str, Any]]:
     if not isinstance(expanded_dag, dict):
         return []
 
@@ -349,8 +352,7 @@ def summarize_expanded_dag_for_confirmation(expanded_dag: dict[str, Any] | None)
             if normalized_node_key:
                 group_key_by_node_key[normalized_node_key] = group_key
 
-    summaries: list[dict[str, Any]] = []
-
+    views: list[dict[str, Any]] = []
     for group in groups:
         if not isinstance(group, dict):
             continue
@@ -359,10 +361,10 @@ def summarize_expanded_dag_for_confirmation(expanded_dag: dict[str, Any] | None)
         if not group_key or not node_keys:
             continue
 
-        first_node = nodes.get(node_keys[0], {})
+        group_nodes = [nodes.get(node_key, {}) for node_key in node_keys]
+        first_node = group_nodes[0] if group_nodes else {}
         raw_depends_on: list[str] = []
-        for node_key in node_keys:
-            node = nodes.get(node_key, {})
+        for node in group_nodes:
             raw_depends_on.extend(str(dep) for dep in (node.get("depends_on") or []))
         depends_on: list[str] = []
         seen_dep_keys: set[str] = set()
@@ -374,7 +376,32 @@ def summarize_expanded_dag_for_confirmation(expanded_dag: dict[str, Any] | None)
             if collapsed_dep not in seen_dep_keys:
                 depends_on.append(collapsed_dep)
                 seen_dep_keys.add(collapsed_dep)
-        scope = str(group.get("scope") or "global")
+
+        views.append(
+            {
+                "group": group,
+                "group_key": group_key,
+                "node_keys": node_keys,
+                "group_nodes": group_nodes,
+                "first_node": first_node,
+                "depends_on": depends_on,
+                "scope": str(group.get("scope") or "global"),
+                "step_type": group.get("origin_step_type") or first_node.get("step_type") or "",
+                "display_name": group.get("origin_display_name") or first_node.get("display_name") or group_key,
+            }
+        )
+
+    return views
+
+
+def summarize_expanded_dag_for_confirmation(expanded_dag: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Return a grouped, human-readable plan view for second confirmation."""
+    summaries: list[dict[str, Any]] = []
+
+    for view in _collect_confirmation_group_views(expanded_dag):
+        scope = view["scope"]
+        node_keys = view["node_keys"]
+        depends_on = view["depends_on"]
         scope_label = {
             "global": "global x1",
             "aggregate": "aggregate x1",
@@ -386,9 +413,9 @@ def summarize_expanded_dag_for_confirmation(expanded_dag: dict[str, Any] | None)
 
         summaries.append(
             {
-                "step_key": group_key,
-                "step_type": group.get("origin_step_type") or first_node.get("step_type") or "",
-                "display_name": group.get("origin_display_name") or first_node.get("display_name") or group_key,
+                "step_key": view["group_key"],
+                "step_type": view["step_type"],
+                "display_name": view["display_name"],
                 "description": " | ".join(description_parts),
                 "depends_on": depends_on,
                 "node_count": len(node_keys),
@@ -397,6 +424,231 @@ def summarize_expanded_dag_for_confirmation(expanded_dag: dict[str, Any] | None)
         )
 
     return summaries
+
+
+def summarize_execution_review_changes(expanded_dag: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Describe concrete orchestration changes between the abstract plan and expanded DAG."""
+    changes: list[dict[str, Any]] = []
+
+    for view in _collect_confirmation_group_views(expanded_dag):
+        group = view["group"]
+        node_keys = view["node_keys"]
+        group_nodes = view["group_nodes"]
+        group_key = view["group_key"]
+        depends_on = view["depends_on"]
+        scope = view["scope"]
+
+        change_kinds: list[str] = []
+        detail_parts: list[str] = []
+        fan_out_mode: str | None = None
+        aggregate_mode: str | None = None
+
+        fan_out = any(bool(node.get("_fanout_expanded")) for node in group_nodes) or any(
+            node_key != group_key for node_key in node_keys
+        )
+        if fan_out:
+            change_kinds.append("fan_out")
+            fan_out_mode = "per_sample" if scope == "per_sample" else "generic"
+            if fan_out_mode == "per_sample":
+                detail_parts.append(f"expanded into {len(node_keys)} per-sample execution node(s)")
+            else:
+                detail_parts.append(f"expanded into {len(node_keys)} execution node(s)")
+
+        if scope == "aggregate":
+            change_kinds.append("aggregate")
+            aggregate_mode = "all_upstream"
+            if depends_on:
+                detail_parts.append(f"aggregates upstream outputs from {', '.join(depends_on)} into one execution step")
+            else:
+                detail_parts.append("aggregates upstream outputs into one execution step")
+
+        auto_injected_reasons: list[str] = []
+        auto_injected_cause: str | None = None
+        if group.get("_preflight_injected") or any(bool(node.get("_preflight_injected")) for node in group_nodes):
+            auto_injected_reasons.append("preflight")
+        if group.get("_rr_injected") or any(bool(node.get("_rr_injected")) for node in group_nodes):
+            auto_injected_reasons.append("resource_readiness")
+        if auto_injected_reasons:
+            change_kinds.append("auto_injected")
+            if any(bool(node.get("_stale_rebuild")) for node in group_nodes):
+                auto_injected_cause = "stale_derived_resource"
+            elif "preflight" in auto_injected_reasons and view["step_type"] == "util.hisat2_build":
+                auto_injected_cause = "missing_hisat2_index"
+            elif "preflight" in auto_injected_reasons and view["step_type"] == "util.star_genome_generate":
+                auto_injected_cause = "missing_star_genome"
+            elif "resource_readiness" in auto_injected_reasons and view["step_type"] == "util.hisat2_build":
+                auto_injected_cause = "derivable_hisat2_index"
+            elif "resource_readiness" in auto_injected_reasons and view["step_type"] == "util.star_genome_generate":
+                auto_injected_cause = "derivable_star_genome"
+
+            cause_summary = {
+                "missing_hisat2_index": "auto-injected to build a missing HISAT2 index from the registered reference FASTA",
+                "missing_star_genome": "auto-injected to build a missing STAR genome index from registered reference resources",
+                "derivable_hisat2_index": "auto-injected because the required HISAT2 index is derivable from registered reference resources",
+                "derivable_star_genome": "auto-injected because the required STAR genome index is derivable from registered reference resources",
+                "stale_derived_resource": "auto-injected to rebuild a stale derived reference resource before downstream execution",
+            }.get(auto_injected_cause)
+            detail_parts.append(cause_summary or f"auto-injected via {', '.join(auto_injected_reasons)}")
+
+        if not change_kinds:
+            continue
+
+        changes.append(
+            {
+                "group_key": group_key,
+                "step_type": view["step_type"],
+                "display_name": view["display_name"],
+                "change_kinds": change_kinds,
+                "summary": " | ".join(detail_parts),
+                "depends_on": depends_on,
+                "node_count": len(node_keys),
+                "scope": scope,
+                "fan_out_mode": fan_out_mode,
+                "aggregate_mode": aggregate_mode,
+                "auto_injected_reasons": auto_injected_reasons,
+                "auto_injected_cause": auto_injected_cause,
+            }
+        )
+
+    return changes
+
+
+def summarize_execution_plan_delta(
+    plan_payload: Any,
+    expanded_dag: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Compare the confirmed abstract plan with the grouped execution DAG."""
+    abstract_steps = extract_plan_steps(plan_payload)
+    abstract_step_keys = {
+        _step_key(step)
+        for step in abstract_steps
+        if _step_key(step)
+    }
+    changes = summarize_execution_review_changes(expanded_dag)
+    changes_by_group_key = {
+        str(item.get("group_key") or ""): item
+        for item in changes
+        if str(item.get("group_key") or "").strip()
+    }
+
+    added_groups: list[dict[str, Any]] = []
+    changed_groups: list[dict[str, Any]] = []
+    unchanged_groups: list[dict[str, Any]] = []
+
+    for view in _collect_confirmation_group_views(expanded_dag):
+        group_key = view["group_key"]
+        base_item = {
+            "group_key": group_key,
+            "display_name": view["display_name"],
+            "step_type": view["step_type"],
+        }
+        if group_key not in abstract_step_keys:
+            added_groups.append(base_item)
+            continue
+        if group_key in changes_by_group_key:
+            changed_groups.append(
+                {
+                    **base_item,
+                    "change_kinds": list(changes_by_group_key[group_key].get("change_kinds") or []),
+                }
+            )
+            continue
+        unchanged_groups.append(base_item)
+
+    return {
+        "abstract_step_count": len(abstract_step_keys),
+        "execution_group_count": len(added_groups) + len(changed_groups) + len(unchanged_groups),
+        "added_group_count": len(added_groups),
+        "changed_group_count": len(changed_groups),
+        "unchanged_group_count": len(unchanged_groups),
+        "added_groups": added_groups,
+        "changed_groups": changed_groups,
+    }
+
+
+def summarize_execution_ir_for_confirmation(execution_ir: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Return a readable execution-semantics view for second confirmation."""
+    if not isinstance(execution_ir, dict):
+        return []
+
+    review_items: list[dict[str, Any]] = []
+    for step in execution_ir.get("steps", []) or []:
+        if not isinstance(step, dict):
+            continue
+        step_key = str(step.get("step_key") or "").strip()
+        if not step_key:
+            continue
+        scope = str(step.get("scope") or "global")
+        execution_kind = str(step.get("execution_kind") or "").strip()
+        aggregation_mode = str(step.get("aggregation_mode") or "none").strip()
+        input_semantics = [str(item) for item in (step.get("input_semantics") or []) if str(item).strip()]
+        depends_on = [str(item) for item in (step.get("depends_on") or []) if str(item).strip()]
+
+        description_parts = [scope]
+        if execution_kind:
+            description_parts.append(execution_kind)
+        if input_semantics:
+            description_parts.append(f"inputs={', '.join(input_semantics)}")
+        if aggregation_mode and aggregation_mode != "none":
+            description_parts.append(f"aggregate={aggregation_mode}")
+        if depends_on:
+            description_parts.append(f"depends_on={', '.join(depends_on)}")
+
+        review_items.append(
+            {
+                "step_key": step_key,
+                "step_type": step.get("step_type") or "",
+                "display_name": step.get("display_name") or step_key,
+                "description": " | ".join(description_parts),
+                "scope": scope,
+                "execution_kind": execution_kind,
+                "aggregation_mode": aggregation_mode,
+                "input_semantics": input_semantics,
+                "depends_on": depends_on,
+            }
+        )
+
+    return review_items
+
+
+def summarize_execution_confirmation_overview(
+    *,
+    plan_payload: Any,
+    execution_ir: dict[str, Any] | None,
+    expanded_dag: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Return a compact summary that compresses IR + delta + change signals."""
+    ir_review = summarize_execution_ir_for_confirmation(execution_ir)
+    delta = summarize_execution_plan_delta(plan_payload, expanded_dag)
+    changes = summarize_execution_review_changes(expanded_dag)
+
+    scope_counts = {"global": 0, "per_sample": 0, "aggregate": 0}
+    for item in ir_review:
+        scope = str(item.get("scope") or "").strip()
+        if scope in scope_counts:
+            scope_counts[scope] += 1
+
+    change_kind_counts = {"fan_out": 0, "aggregate": 0, "auto_injected": 0}
+    for item in changes:
+        for kind in item.get("change_kinds") or []:
+            normalized = str(kind).strip()
+            if normalized in change_kind_counts:
+                change_kind_counts[normalized] += 1
+
+    return {
+        "abstract_step_count": delta.get("abstract_step_count", 0),
+        "execution_ir_step_count": len(ir_review),
+        "execution_group_count": delta.get("execution_group_count", 0),
+        "unchanged_group_count": delta.get("unchanged_group_count", 0),
+        "changed_group_count": delta.get("changed_group_count", 0),
+        "added_group_count": delta.get("added_group_count", 0),
+        "per_sample_step_count": scope_counts["per_sample"],
+        "aggregate_step_count": scope_counts["aggregate"],
+        "global_step_count": scope_counts["global"],
+        "fan_out_change_count": change_kind_counts["fan_out"],
+        "aggregate_change_count": change_kind_counts["aggregate"],
+        "auto_injected_change_count": change_kind_counts["auto_injected"],
+    }
 
 
 def build_execution_bundle(

@@ -8,7 +8,7 @@ import ErrorRecoveryPanel from './ErrorRecoveryPanel'
 import ResultViewer, { type ResultItem } from './ResultViewer'
 import { useLanguage } from '../i18n/LanguageContext'
 import type { Lang } from '../i18n/translations'
-import { formatTaskAttentionReason, type TaskAttentionReminder } from '../lib/taskAttention'
+import { buildTaskAttentionReminderMessage, type TaskAttentionReminder } from '../lib/taskAttention'
 
 type ConfirmationPhase = 'abstract' | 'execution'
 
@@ -19,12 +19,71 @@ interface PlanSummary {
   group_count?: number
 }
 
+interface ExecutionConfirmationOverview {
+  abstract_step_count?: number | null
+  execution_ir_step_count?: number | null
+  execution_group_count?: number | null
+  unchanged_group_count?: number | null
+  changed_group_count?: number | null
+  added_group_count?: number | null
+  per_sample_step_count?: number | null
+  aggregate_step_count?: number | null
+  global_step_count?: number | null
+  fan_out_change_count?: number | null
+  aggregate_change_count?: number | null
+  auto_injected_change_count?: number | null
+}
+
+interface ExecutionIrReviewItem {
+  step_key?: string
+  step_type?: string
+  display_name?: string
+  description?: string | null
+  scope?: string | null
+  execution_kind?: string | null
+  aggregation_mode?: string | null
+  input_semantics?: string[] | null
+  depends_on?: string[] | null
+}
+
+interface ExecutionPlanDeltaGroupItem {
+  group_key?: string
+  display_name?: string
+  step_type?: string
+  change_kinds?: string[]
+}
+
+interface ExecutionPlanDelta {
+  abstract_step_count?: number | null
+  execution_group_count?: number | null
+  added_group_count?: number | null
+  changed_group_count?: number | null
+  unchanged_group_count?: number | null
+  added_groups?: ExecutionPlanDeltaGroupItem[] | null
+  changed_groups?: ExecutionPlanDeltaGroupItem[] | null
+}
+
 interface PlanItem {
   step_key?: string
   step_type?: string
   display_name?: string
   name?: string
   description?: string
+}
+
+interface ExecutionPlanChangeItem {
+  group_key?: string
+  step_type?: string
+  display_name?: string
+  change_kinds?: string[]
+  summary?: string | null
+  depends_on?: string[]
+  node_count?: number | null
+  scope?: string | null
+  fan_out_mode?: string | null
+  aggregate_mode?: string | null
+  auto_injected_reasons?: string[]
+  auto_injected_cause?: string | null
 }
 
 interface Message {
@@ -35,6 +94,10 @@ interface Message {
   requiresConfirmation?: boolean
   confirmationPhase?: ConfirmationPhase
   executionPlanSummary?: PlanSummary | null
+  executionConfirmationOverview?: ExecutionConfirmationOverview | null
+  executionIrReview?: ExecutionIrReviewItem[] | null
+  executionPlanDelta?: ExecutionPlanDelta | null
+  executionPlanChanges?: ExecutionPlanChangeItem[] | null
   results?: ResultItem[]
   newFilesEvent?: { count: number; types: Record<string, number> }
 }
@@ -114,6 +177,80 @@ export default function ChatPanel({ ws, projectId, lang, threadTitle, llmReachab
   const formatPlanMeta = (item: PlanItem) => {
     const parts = [item.step_type, item.description].filter(Boolean)
     return parts.join(' · ')
+  }
+
+  const formatExecutionPlanChangeKind = (kind: string) => {
+    const keyMap = {
+      fan_out: 'tasks_confirmation_change_fan_out',
+      aggregate: 'tasks_confirmation_change_aggregate',
+      auto_injected: 'tasks_confirmation_change_auto_injected',
+    } as const
+    return t(keyMap[kind as keyof typeof keyMap] ?? 'tasks_confirmation_change_auto_injected')
+  }
+
+  const formatExecutionPlanChangeSummary = (item: ExecutionPlanChangeItem) => {
+    const changeKinds = new Set((item.change_kinds ?? []).filter(Boolean))
+    const detailParts: string[] = []
+
+    if (changeKinds.has('fan_out')) {
+      detailParts.push(
+        (
+          item.fan_out_mode === 'per_sample'
+            ? t('tasks_confirmation_change_detail_fan_out_per_sample')
+            : t('tasks_confirmation_change_detail_fan_out')
+        ).replace('{count}', String(item.node_count ?? 0)),
+      )
+    }
+
+    if (changeKinds.has('aggregate')) {
+      const sources = (item.depends_on ?? []).filter(Boolean)
+      detailParts.push(
+        sources.length > 0
+          ? t('tasks_confirmation_change_detail_aggregate_with_sources').replace('{sources}', sources.join(', '))
+          : t('tasks_confirmation_change_detail_aggregate'),
+      )
+    }
+
+    if (changeKinds.has('auto_injected')) {
+      const causeMap = {
+        missing_hisat2_index: 'tasks_confirmation_change_detail_auto_injected_missing_hisat2_index',
+        missing_star_genome: 'tasks_confirmation_change_detail_auto_injected_missing_star_genome',
+        derivable_hisat2_index: 'tasks_confirmation_change_detail_auto_injected_derivable_hisat2_index',
+        derivable_star_genome: 'tasks_confirmation_change_detail_auto_injected_derivable_star_genome',
+        stale_derived_resource: 'tasks_confirmation_change_detail_auto_injected_stale_derived_resource',
+      } as const
+      if (item.auto_injected_cause && causeMap[item.auto_injected_cause as keyof typeof causeMap]) {
+        detailParts.push(t(causeMap[item.auto_injected_cause as keyof typeof causeMap]))
+        return detailParts.join(' · ') || item.summary || ''
+      }
+      const sourceLabels = (item.auto_injected_reasons ?? [])
+        .filter(Boolean)
+        .map((reason) => (
+          reason === 'preflight'
+            ? t('tasks_confirmation_change_source_preflight')
+            : reason === 'resource_readiness'
+              ? t('tasks_confirmation_change_source_resource_readiness')
+              : reason
+        ))
+      detailParts.push(
+        sourceLabels.length > 0
+          ? t('tasks_confirmation_change_detail_auto_injected_with_sources').replace('{sources}', sourceLabels.join(', '))
+          : t('tasks_confirmation_change_detail_auto_injected'),
+      )
+    }
+
+    return detailParts.join(' · ') || item.summary || ''
+  }
+
+  const buildExecutionPlanDeltaStatusMap = (delta: ExecutionPlanDelta | null | undefined) => {
+    const statusMap: Record<string, 'added' | 'changed'> = {}
+    for (const item of delta?.added_groups ?? []) {
+      if (item.group_key) statusMap[item.group_key] = 'added'
+    }
+    for (const item of delta?.changed_groups ?? []) {
+      if (item.group_key && !statusMap[item.group_key]) statusMap[item.group_key] = 'changed'
+    }
+    return statusMap
   }
 
   useEffect(() => {
@@ -228,6 +365,13 @@ export default function ChatPanel({ ws, projectId, lang, threadTitle, llmReachab
           last.plan = ((msg.plan as PlanItem[]) || []).filter((item): item is PlanItem => Boolean(item))
           last.requiresConfirmation = true
           last.confirmationPhase = last.confirmationPhase || 'abstract'
+          if (last.confirmationPhase !== 'execution') {
+            last.executionPlanSummary = null
+            last.executionConfirmationOverview = null
+            last.executionIrReview = null
+            last.executionPlanDelta = null
+            last.executionPlanChanges = null
+          }
         }))
       } else if (msg.type === 'execution_plan') {
         setMessages((prev) => upsertLastAssistant(clearConfirmationCards(prev), (last) => {
@@ -236,6 +380,26 @@ export default function ChatPanel({ ws, projectId, lang, threadTitle, llmReachab
           last.executionPlanSummary = (
             (msg.execution_plan_summary as PlanSummary | undefined)
             ?? ((msg.execution_plan as { summary?: PlanSummary } | undefined)?.summary)
+            ?? null
+          )
+          last.executionConfirmationOverview = (
+            (msg.execution_confirmation_overview as ExecutionConfirmationOverview | undefined)
+            ?? ((msg.execution_plan as { review_overview?: ExecutionConfirmationOverview } | undefined)?.review_overview)
+            ?? null
+          )
+          last.executionIrReview = (
+            (msg.execution_ir_review as ExecutionIrReviewItem[] | undefined)
+            ?? ((msg.execution_plan as { review_ir?: ExecutionIrReviewItem[] } | undefined)?.review_ir)
+            ?? null
+          )
+          last.executionPlanDelta = (
+            (msg.execution_plan_delta as ExecutionPlanDelta | undefined)
+            ?? ((msg.execution_plan as { review_delta?: ExecutionPlanDelta } | undefined)?.review_delta)
+            ?? null
+          )
+          last.executionPlanChanges = (
+            (msg.execution_plan_changes as ExecutionPlanChangeItem[] | undefined)
+            ?? ((msg.execution_plan as { review_changes?: ExecutionPlanChangeItem[] } | undefined)?.review_changes)
             ?? null
           )
         }))
@@ -313,20 +477,17 @@ export default function ChatPanel({ ws, projectId, lang, threadTitle, llmReachab
     for (const reminder of taskAttentionReminders) {
       if (seenTaskReminderKeysRef.current.has(reminder.key)) continue
       seenTaskReminderKeysRef.current.add(reminder.key)
-      const waitMinutes = Math.max(1, Math.floor(reminder.ageSeconds / 60))
       nextMessages.push({
         id: `task-reminder-${reminder.key}`,
         role: 'system',
-        content: lang === 'zh'
-          ? `任务“${reminder.jobName}”仍在等待${formatTaskAttentionReason(reminder.reason, lang)}，已超过 ${waitMinutes} 分钟。请打开右侧任务面板处理。`
-          : `Task "${reminder.jobName}" is still waiting on ${formatTaskAttentionReason(reminder.reason, lang)} after ${waitMinutes} minute(s). Open the task tray on the right to continue.`,
+        content: buildTaskAttentionReminderMessage(reminder, lang, t),
       })
     }
 
     if (nextMessages.length > 0) {
       setMessages((prev) => [...prev, ...nextMessages])
     }
-  }, [lang, taskAttentionReminders])
+  }, [lang, t, taskAttentionReminders])
 
   useEffect(() => () => {
     if (redirectTimerRef.current !== null) {
@@ -389,6 +550,9 @@ export default function ChatPanel({ ws, projectId, lang, threadTitle, llmReachab
 
           return (
             <div key={m.id} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+              {(() => {
+                const executionPlanStatusMap = buildExecutionPlanDeltaStatusMap(m.executionPlanDelta)
+                return (
               <div className={`max-w-[85%] rounded-2xl px-4 py-3 text-sm ${
                 m.role === 'user'
                   ? 'bg-accent/15 text-text-primary'
@@ -434,21 +598,119 @@ export default function ChatPanel({ ws, projectId, lang, threadTitle, llmReachab
                         </span>
                       )}
                     </div>
+                    {m.confirmationPhase === 'execution' && m.executionConfirmationOverview && (
+                      <div className="mt-3 rounded-lg border border-cyan-500/15 bg-cyan-500/6 px-3 py-2 text-[11px] text-cyan-100/90">
+                        {t('tasks_confirmation_overview_summary')
+                          .replace('{abstract}', String(m.executionConfirmationOverview.abstract_step_count ?? 0))
+                          .replace('{ir}', String(m.executionConfirmationOverview.execution_ir_step_count ?? 0))
+                          .replace('{groups}', String(m.executionConfirmationOverview.execution_group_count ?? 0))
+                          .replace('{per_sample}', String(m.executionConfirmationOverview.per_sample_step_count ?? 0))
+                          .replace('{aggregate}', String(m.executionConfirmationOverview.aggregate_step_count ?? 0))
+                          .replace('{added}', String(m.executionConfirmationOverview.added_group_count ?? 0))
+                          .replace('{changed}', String(m.executionConfirmationOverview.changed_group_count ?? 0))}
+                      </div>
+                    )}
+                    {m.confirmationPhase === 'execution' && m.executionPlanDelta && (
+                      <div className="mt-3 rounded-lg border border-amber-500/10 bg-surface-base/70 px-3 py-2 text-[11px] text-text-muted">
+                        {t('tasks_confirmation_delta_summary')
+                          .replace('{abstract}', String(m.executionPlanDelta.abstract_step_count ?? 0))
+                          .replace('{execution}', String(m.executionPlanDelta.execution_group_count ?? 0))
+                          .replace('{unchanged}', String(m.executionPlanDelta.unchanged_group_count ?? 0))
+                          .replace('{changed}', String(m.executionPlanDelta.changed_group_count ?? 0))
+                          .replace('{added}', String(m.executionPlanDelta.added_group_count ?? 0))}
+                      </div>
+                    )}
+                    {m.confirmationPhase === 'execution' && (m.executionIrReview?.length ?? 0) > 0 && (
+                      <div className="mt-3 space-y-2">
+                        <div className="text-[11px] font-semibold uppercase tracking-wide text-amber-200/85">
+                          {t('tasks_confirmation_execution_ir_review')}
+                        </div>
+                        {m.executionIrReview?.map((item, index) => {
+                          const title = item.display_name || item.step_key || item.step_type || t('chat_plan_step_fallback')
+                          const meta = [item.step_type, item.description].filter(Boolean).join(' · ')
+                          return (
+                            <div
+                              key={`${m.id}-execution-ir-${item.step_key ?? item.step_type ?? index}`}
+                              className="rounded-lg border border-cyan-500/15 bg-surface-base/70 px-3 py-2"
+                            >
+                              <div className="text-xs font-medium text-text-primary">
+                                {index + 1}. {title}
+                              </div>
+                              {meta && (
+                                <div className="mt-1 text-[11px] text-text-muted break-words">
+                                  {meta}
+                                </div>
+                              )}
+                            </div>
+                          )
+                        })}
+                      </div>
+                    )}
                     {m.plan && m.plan.length > 0 && (
                       <div className="mt-3 space-y-2">
                         {m.plan.map((item, index) => {
                           const meta = formatPlanMeta(item)
+                          const status = item.step_key ? executionPlanStatusMap[item.step_key] : undefined
                           return (
                             <div
                               key={`${m.id}-plan-${item.step_key ?? item.step_type ?? index}`}
                               className="rounded-lg border border-amber-500/10 bg-surface-base/70 px-3 py-2"
                             >
-                              <div className="text-xs font-medium text-text-primary">
-                                {index + 1}. {formatPlanTitle(item)}
+                              <div className="flex items-center gap-2 flex-wrap">
+                                <div className="text-xs font-medium text-text-primary">
+                                  {index + 1}. {formatPlanTitle(item)}
+                                </div>
+                                {status === 'added' && (
+                                  <span className="rounded-full border border-sky-500/20 bg-sky-500/10 px-2 py-0.5 text-[10px] font-medium text-sky-200">
+                                    {t('tasks_confirmation_status_added')}
+                                  </span>
+                                )}
+                                {status === 'changed' && (
+                                  <span className="rounded-full border border-amber-500/20 bg-amber-500/10 px-2 py-0.5 text-[10px] font-medium text-amber-200">
+                                    {t('tasks_confirmation_status_changed')}
+                                  </span>
+                                )}
                               </div>
                               {meta && (
                                 <div className="mt-1 text-[11px] text-text-muted break-words">
                                   {meta}
+                                </div>
+                              )}
+                            </div>
+                          )
+                        })}
+                      </div>
+                    )}
+                    {m.confirmationPhase === 'execution' && (m.executionPlanChanges?.length ?? 0) > 0 && (
+                      <div className="mt-3 space-y-2">
+                        <div className="text-[11px] font-semibold uppercase tracking-wide text-amber-200/85">
+                          {t('tasks_confirmation_changes')}
+                        </div>
+                        {m.executionPlanChanges?.map((item, index) => {
+                          const title = item.display_name || item.group_key || item.step_type || t('chat_plan_step_fallback')
+                          const summary = formatExecutionPlanChangeSummary(item)
+                          const changeKinds = (item.change_kinds ?? []).filter(Boolean)
+                          return (
+                            <div
+                              key={`${m.id}-execution-change-${item.group_key ?? item.step_type ?? index}`}
+                              className="rounded-lg border border-sky-500/15 bg-surface-base/70 px-3 py-2"
+                            >
+                              <div className="flex items-center gap-2 flex-wrap">
+                                <div className="text-xs font-medium text-text-primary">
+                                  {title}
+                                </div>
+                                {changeKinds.map((kind) => (
+                                  <span
+                                    key={`${m.id}-execution-change-kind-${item.group_key ?? index}-${kind}`}
+                                    className="rounded-full border border-sky-500/20 bg-sky-500/10 px-2 py-0.5 text-[10px] font-medium text-sky-200"
+                                  >
+                                    {formatExecutionPlanChangeKind(kind)}
+                                  </span>
+                                ))}
+                              </div>
+                              {summary && (
+                                <div className="mt-1 text-[11px] text-text-muted break-words">
+                                  {summary}
                                 </div>
                               )}
                             </div>
@@ -475,6 +737,8 @@ export default function ChatPanel({ ws, projectId, lang, threadTitle, llmReachab
                   </div>
                 )}
               </div>
+                )
+              })()}
             </div>
           )
         })}

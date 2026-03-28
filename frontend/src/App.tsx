@@ -213,6 +213,7 @@ interface AppBodyProps {
   handleJobStarted: (jobId: string) => void
   handleOpenThread: (threadId: string | null, jobId?: string | null) => void
   handleOpenResourceWorkspace: (request: ResourceWorkspaceRequest) => void
+  handleOpenSettingsDiagnostics: () => void
   handleProjectSelect: (id: string | null, name: string | null) => void
   handleThreadSelect: (thread: Thread | null) => void
   resourceWorkspaceRequest: ResourceWorkspaceRequest | null
@@ -243,6 +244,7 @@ function AppBody({
   handleJobStarted,
   handleOpenThread,
   handleOpenResourceWorkspace,
+  handleOpenSettingsDiagnostics,
   handleProjectSelect,
   handleThreadSelect,
   resourceWorkspaceRequest,
@@ -262,7 +264,11 @@ function AppBody({
     if ((attentionSummary?.counts.repair ?? 0) > 0) {
       items.push({ key: 'repair', label: t('tasks_tray_metric_repair'), count: attentionSummary?.counts.repair ?? 0, tone: 'attention' })
     }
-    const otherAttentionCount = (attentionSummary?.counts.confirmation ?? 0) + (attentionSummary?.counts.clarification ?? 0)
+    const otherAttentionCount = (
+      (attentionSummary?.counts.confirmation ?? 0)
+      + (attentionSummary?.counts.clarification ?? 0)
+      + (attentionSummary?.counts.rollback_review ?? 0)
+    )
     if (otherAttentionCount > 0) {
       items.push({ key: 'attention', label: t('tasks_tray_metric_attention'), count: otherAttentionCount, tone: 'attention' })
     }
@@ -346,12 +352,15 @@ function AppBody({
                     key: item.key,
                     jobId: item.job_id,
                     jobName: item.job_name,
+                    threadId: item.thread_id,
                     incidentType: item.incident_type,
                     reason: item.reason,
                     ageSeconds: item.age_seconds,
                     summary: item.summary,
                     severity: item.severity,
                     owner: item.owner,
+                    nextAction: item.next_action,
+                    rollbackLevel: item.rollback_level,
                   }))
                   : []
               }
@@ -397,6 +406,7 @@ function AppBody({
                         onAutoSelectConsumed={() => setAutoSelectJobId(null)}
                         onOpenThread={handleOpenThread}
                         onOpenResourceWorkspace={handleOpenResourceWorkspace}
+                        onOpenSettingsDiagnostics={handleOpenSettingsDiagnostics}
                       />
                     )}
                     {activePanel === 'skills' && <SkillLibrary ws={ws} />}
@@ -431,6 +441,7 @@ function AppBody({
                 onAutoSelectConsumed={() => setAutoSelectJobId(null)}
                 onOpenThread={handleOpenThread}
                 onOpenResourceWorkspace={handleOpenResourceWorkspace}
+                onOpenSettingsDiagnostics={handleOpenSettingsDiagnostics}
               />
             </div>
           )}
@@ -585,6 +596,15 @@ export default function App() {
     setResourceWorkspaceRequest(request)
   }, [activeView])
 
+  const handleOpenSettingsDiagnostics = useCallback(() => {
+    if (activeView === 'chat') {
+      setActivePanel('settings')
+    } else {
+      setActiveView('settings')
+      setActivePanel(null)
+    }
+  }, [activeView])
+
   useEffect(() => {
     const unsub = ws.subscribe((msg) => {
       if (msg.type !== 'thread_bound') return
@@ -623,6 +643,7 @@ export default function App() {
         handleJobStarted={handleJobStarted}
         handleOpenThread={handleOpenThread}
         handleOpenResourceWorkspace={handleOpenResourceWorkspace}
+        handleOpenSettingsDiagnostics={handleOpenSettingsDiagnostics}
         handleProjectSelect={handleProjectSelect}
         handleThreadSelect={handleThreadSelect}
         resourceWorkspaceRequest={resourceWorkspaceRequest}

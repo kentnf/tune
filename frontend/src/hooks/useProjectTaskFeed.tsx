@@ -57,13 +57,19 @@ export interface ProjectTaskAttentionItem {
   key: string
   job_id: string
   job_name: string
+  thread_id?: string | null
   incident_type: string
-  reason: 'authorization' | 'repair' | 'confirmation' | 'clarification' | 'warning'
+  reason: 'authorization' | 'repair' | 'confirmation' | 'clarification' | 'rollback_review' | 'warning'
   age_seconds: number
   summary: string
   severity: 'info' | 'warning' | 'critical'
   owner: 'user' | 'system'
+  next_action?: string | null
   pending_interaction_type?: string | null
+  rollback_level?: string | null
+  rollback_target?: string | null
+  rollback_reason?: string | null
+  reconfirmation_required?: boolean | null
 }
 
 export interface ProjectTaskAttentionSummary {
@@ -75,6 +81,7 @@ export interface ProjectTaskAttentionSummary {
     repair: number
     confirmation: number
     clarification: number
+    rollback_review?: number
     warning: number
     needs_input: number
     needs_review: number
