@@ -76,15 +76,14 @@ tune init
 
 初始化时需要配置：
 
-- 数据目录：原始生物数据所在目录
-- 分析目录：Tune 输出分析结果、缓存与状态的目录
+- 工作区根目录：Tune 会自动使用该目录下的 `data/`、`workspace/` 和 `.tune/`
 - 主模型：OpenAI 或 Anthropic
 - 备用模型：可选，用于提高可用性
 
 ## 启动服务
 
 ```bash
-tune start --analysis-dir /path/to/analysis-dir
+tune start --workspace-root /path/to/analysis
 ```
 
 浏览器打开：
@@ -96,7 +95,7 @@ http://localhost:8000
 如果是本地开发，推荐使用项目自带脚本：
 
 ```bash
-bash scripts/service.sh start --analysis-dir analysis/workspace
+bash scripts/service.sh start --workspace-root analysis
 bash scripts/service.sh status
 bash scripts/service.sh restart
 bash scripts/service.sh stop
@@ -105,8 +104,14 @@ bash scripts/service.sh stop
 开发模式：
 
 ```bash
-bash scripts/dev.sh --analysis-dir analysis/workspace
+bash scripts/dev.sh --workspace-root analysis
 ```
+
+兼容说明：
+
+- 旧参数 `--analysis-dir` 仍然可用
+- `analysis/workspace` 和 `analysis` 根目录都能被兼容解析
+- 当前推荐统一使用 `--workspace-root analysis`
 
 ## 基本使用流程
 
@@ -183,13 +188,27 @@ Tune 当前不是“只把一串命令交给工作流执行”的系统。
 配置默认保存在：
 
 ```text
-{analysis_dir}/.tune/config.yaml
+{workspace_root}/.tune/config.yaml
+```
+
+推荐工作区结构：
+
+```text
+analysis/
+  .tune/
+    config.yaml
+  data/
+    proj1/
+    proj2/
+  workspace/
+    proj1/
+    proj2/
 ```
 
 ## 数据与隐私
 
 - 原始数据目录应保持只读
-- 所有分析输出只写入分析目录
+- 所有分析输出只写入 `workspace/`
 - 外部模型调用会发送必要的提示信息到你配置的模型提供商
 - 在正式投入敏感数据环境前，请先自行审查部署方式、日志内容和外部 API 使用策略
 

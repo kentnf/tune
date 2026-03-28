@@ -137,8 +137,8 @@ async def _main() -> int:
     parser = argparse.ArgumentParser(description="Backfill analysis_jobs.thread_id conservatively.")
     parser.add_argument(
         "--analysis-dir",
-        default="/Users/kentnf/projects/tune/analysis/workspace",
-        help="Tune analysis workspace containing .tune/config.yaml",
+        default="/Users/kentnf/projects/tune/analysis",
+        help="Tune workspace root (or legacy analysis/workspace path) containing .tune/config.yaml",
     )
     parser.add_argument(
         "--max-gap-minutes",

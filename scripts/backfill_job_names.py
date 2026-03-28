@@ -2,7 +2,7 @@
 and rename the corresponding output directories on disk.
 
 Usage:
-    python scripts/backfill_job_names.py --analysis-dir /path/to/analysis/workspace [--dry-run]
+    python scripts/backfill_job_names.py --analysis-dir /path/to/analysis [--dry-run]
 
 Only jobs whose name does not already match the slug pattern ([a-z0-9][a-z0-9-]{0,39})
 will be updated. The new name is derived from _slugify(goal or name).
