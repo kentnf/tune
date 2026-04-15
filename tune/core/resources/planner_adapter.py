@@ -208,6 +208,8 @@ def _slot_feasible_from_project_state(step: dict, slot, planner_context) -> bool
 
     resource_graph = getattr(planner_context, "resource_graph", None)
     files = list(getattr(planner_context, "files", []) or [])
+    project_state = dict(getattr(planner_context, "project_state", {}) or {})
+    summary = dict(project_state.get("summary") or {})
     step_type = step.get("step_type", "")
 
     if slot.name == "read1":
@@ -232,15 +234,40 @@ def _slot_feasible_from_project_state(step: dict, slot, planner_context) -> bool
     if slot.name == "reference_fasta":
         return _resource_kind_ready(resource_graph, "reference_fasta") or any(
             _file_matches_types(f.path, slot.file_types) for f in files
-        )
+        ) or bool(summary.get("has_reference_genome"))
     if slot.name == "annotation_gtf":
+        known_path_keys = {
+            str(item).strip()
+            for item in list(summary.get("known_path_keys") or [])
+            if str(item).strip()
+        }
+        resource_roles = {
+            str(item).strip()
+            for item in dict(summary.get("resource_role_counts") or {}).keys()
+            if str(item).strip()
+        }
         return _resource_kind_ready(resource_graph, "annotation_gtf") or any(
             _file_matches_types(f.path, slot.file_types) for f in files
+        ) or bool({"annotation_gtf"} & known_path_keys) or bool(
+            {"annotation_bundle"} & resource_roles
         )
     if slot.name == "index_prefix":
-        return _aligner_index_ready(resource_graph, "hisat2")
+        aligner = _aligner_for_step_type(step_type)
+        available_aligners = {
+            str(item).strip()
+            for item in list(summary.get("available_index_aligners") or [])
+            if str(item).strip()
+        }
+        return _aligner_index_ready(resource_graph, aligner or "hisat2") or bool(
+            aligner and aligner in available_aligners
+        )
     if slot.name == "genome_dir":
-        return _aligner_index_ready(resource_graph, "star")
+        available_aligners = {
+            str(item).strip()
+            for item in list(summary.get("available_index_aligners") or [])
+            if str(item).strip()
+        }
+        return _aligner_index_ready(resource_graph, "star") or "star" in available_aligners
 
     if slot.file_types == ["*"]:
         return False
@@ -325,6 +352,13 @@ def _step_uses_aligner(step_type: str, aligner: str) -> bool:
         "bowtie2": {"align.bowtie2"},
     }
     return step_type in _map.get(aligner, set())
+
+
+def _aligner_for_step_type(step_type: str) -> str | None:
+    for aligner in _ALIGNER_STEP_MAP:
+        if _step_uses_aligner(step_type, aligner):
+            return aligner
+    return None
 
 
 def _aligners_required_by_plan(plan: list[dict]) -> set[str]:

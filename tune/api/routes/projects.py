@@ -17,6 +17,7 @@ from sqlalchemy.orm import selectinload
 from tune.core.config import get_config
 from tune.core.database import get_session
 from tune.core.models import Conversation, EnhancedMetadata, File, Project, ResourceEntity, ResourceFile, Thread, ThreadMessage, Sample, Experiment, FileRun
+from tune.core.project_state import build_project_state
 from tune.core.resources.entities import sync_project_resource_entities_by_id
 
 router = APIRouter()
@@ -508,6 +509,14 @@ async def get_project(project_id: str, session: AsyncSession = Depends(get_sessi
     if not proj:
         raise HTTPException(404, "Project not found")
     return await _project_summary(session, proj)
+
+
+@router.get("/{project_id}/state")
+async def get_project_state(project_id: str, session: AsyncSession = Depends(get_session)):
+    state = await build_project_state(session, project_id)
+    if state is None:
+        raise HTTPException(404, "Project not found")
+    return state.model_dump(mode="json", exclude_none=True)
 
 
 @router.patch("/{project_id}")

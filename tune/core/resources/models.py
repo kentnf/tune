@@ -137,6 +137,7 @@ IssueKind = Literal[
     "unbound_reads",
     "ambiguous_reference",
     "ambiguous_annotation",
+    "ambiguous_index",
     "stale_index",
     "organism_mismatch",
     "incomplete_metadata",

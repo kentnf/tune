@@ -15,6 +15,15 @@ import os
 import uuid as _uuid_mod
 from typing import TYPE_CHECKING, Any
 
+from tune.core.binding.semantic_candidates import (
+    SemanticCandidate,
+    semantic_candidate_from_artifact_record,
+    semantic_candidate_from_filerun,
+    semantic_candidate_from_known_path,
+    semantic_candidate_from_project_file,
+)
+from tune.core.binding.semantic_scoring import score_semantic_candidate
+
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
     from tune.core.registry.steps import SlotDefinition
@@ -206,35 +215,6 @@ async def _resolve_from_artifact_records(
     return match["file_path"] if match else None
 
 
-def _artifact_role_score(
-    slot: "SlotDefinition",
-    artifact: dict[str, Any],
-) -> tuple[int, list[str]]:
-    expected_roles = list(slot.accepted_roles or [])
-    artifact_role = artifact.get("artifact_role")
-    score = 0
-    reasons: list[str] = []
-
-    if artifact_role and expected_roles:
-        if artifact_role in expected_roles:
-            role_index = expected_roles.index(artifact_role)
-            score += max(80 - role_index * 10, 50)
-            reasons.append("role_exact" if role_index == 0 else "role_compatible")
-        else:
-            score -= 40
-            reasons.append("role_mismatch")
-
-    if artifact.get("slot_name") == slot.name:
-        score += 35
-        reasons.append("slot_name_exact")
-
-    if _file_matches_types(artifact.get("file_path", ""), slot.file_types):
-        score += 15
-        reasons.append("file_type_match")
-
-    return score, reasons
-
-
 def _candidate_lineage(candidate: dict[str, Any]) -> dict[str, Any]:
     return {
         "sample_id": candidate.get("sample_id"),
@@ -242,61 +222,6 @@ def _candidate_lineage(candidate: dict[str, Any]) -> dict[str, Any]:
         "sample_name": candidate.get("sample_name"),
         "read_number": candidate.get("read_number"),
     }
-
-
-def _lineage_score(
-    preferred_lineage: dict[str, Any] | None,
-    candidate: dict[str, Any],
-) -> tuple[int, list[str]]:
-    if not preferred_lineage:
-        return 0, []
-
-    score = 0
-    reasons: list[str] = []
-    candidate_sample = candidate.get("sample_id")
-    candidate_experiment = candidate.get("experiment_id")
-    candidate_read_number = candidate.get("read_number")
-
-    preferred_sample = preferred_lineage.get("sample_id")
-    preferred_experiment = preferred_lineage.get("experiment_id")
-    preferred_read_number = preferred_lineage.get("read_number")
-
-    if preferred_sample and candidate_sample:
-        if preferred_sample == candidate_sample:
-            score += 25
-            reasons.append("sample_match")
-        else:
-            score -= 20
-            reasons.append("sample_mismatch")
-
-    if preferred_experiment and candidate_experiment:
-        if preferred_experiment == candidate_experiment:
-            score += 18
-            reasons.append("experiment_match")
-        else:
-            score -= 12
-            reasons.append("experiment_mismatch")
-
-    if preferred_read_number and candidate_read_number:
-        if preferred_read_number == candidate_read_number:
-            score += 12
-            reasons.append("read_number_match")
-        else:
-            score -= 16
-            reasons.append("read_number_mismatch")
-
-    return score, reasons
-
-
-def _source_preference_score(source_type: str) -> tuple[int, list[str]]:
-    score_map = {
-        "artifact_record": 30,
-        "filerun": 35,
-        "known_path": 24,
-        "project_file": 12,
-    }
-    score = score_map.get(source_type, 0)
-    return score, ([f"source_{source_type}"] if score else [])
 
 
 def _infer_project_file_role(slot: "SlotDefinition", project_file: dict[str, Any]) -> str | None:
@@ -336,32 +261,71 @@ def _build_external_candidate(
     experiment_id: str | None = None,
     sample_name: str | None = None,
     read_number: int | None = None,
+    project_id: str | None = None,
 ) -> dict[str, Any] | None:
-    if not file_path:
+    if source_type == "known_path":
+        semantic_candidate = semantic_candidate_from_known_path(
+            known_path_key=str(source_ref or slot.name),
+            path=file_path,
+            artifact_role=artifact_role,
+            slot_name=slot.name,
+            project_id=project_id,
+        )
+    elif source_type == "project_file":
+        semantic_candidate = semantic_candidate_from_project_file(
+            {
+                "id": source_ref,
+                "path": file_path,
+                "linked_sample_id": sample_id,
+                "linked_experiment_id": experiment_id,
+                "sample_name": sample_name,
+                "read_number": read_number,
+            },
+            artifact_role=artifact_role,
+            slot_name=slot.name,
+            project_id=project_id,
+        )
+    elif source_type == "filerun":
+        semantic_candidate = semantic_candidate_from_filerun(
+            {
+                "file_path": file_path,
+                "source_type": source_type,
+                "source_ref": source_ref,
+                "artifact_role": artifact_role,
+                "sample_id": sample_id,
+                "experiment_id": experiment_id,
+                "sample_name": sample_name,
+                "read_number": read_number,
+            },
+            project_id=project_id,
+        )
+    else:
+        semantic_candidate = SemanticCandidate(
+            file_path=file_path,
+            source_type=source_type,
+            source_ref=source_ref,
+            artifact_role=artifact_role,
+            project_id=project_id,
+            sample_id=sample_id,
+            experiment_id=experiment_id,
+            sample_name=sample_name,
+            read_number=read_number,
+        )
+    if semantic_candidate is None:
         return None
 
-    candidate = {
-        "file_path": file_path,
-        "source_type": source_type,
-        "source_ref": source_ref,
-        "artifact_role": artifact_role,
-        "sample_id": sample_id,
-        "experiment_id": experiment_id,
-        "sample_name": sample_name,
-        "read_number": read_number,
-    }
+    candidate = semantic_candidate.to_resolver_dict()
 
-    score, reasons = _artifact_role_score(slot, candidate)
-    if score <= 0:
+    score_result = score_semantic_candidate(
+        slot,
+        semantic_candidate,
+        preferred_lineage=preferred_lineage,
+        project_id=project_id,
+    )
+    if score_result.score <= 0:
         return None
-    lineage_score, lineage_reasons = _lineage_score(preferred_lineage, candidate)
-    source_score, source_reasons = _source_preference_score(source_type)
-    score += lineage_score + source_score
-    reasons.extend(lineage_reasons)
-    reasons.extend(source_reasons)
-
-    if score <= 0:
-        return None
+    score = score_result.score
+    reasons = list(score_result.reason_codes)
 
     explanation = {
         "candidate_source": source_type,
@@ -482,37 +446,42 @@ def _build_artifact_match(
     slot: "SlotDefinition",
     artifact: dict[str, Any],
     preferred_lineage: dict[str, Any] | None = None,
+    project_id: str | None = None,
 ) -> dict[str, Any] | None:
-    file_path = artifact.get("file_path")
-    if not file_path:
+    semantic_candidate = semantic_candidate_from_artifact_record(
+        artifact,
+        dep_key=dep_key,
+        project_id=project_id,
+    )
+    if semantic_candidate is None:
         return None
+    candidate = semantic_candidate.to_resolver_dict()
+    file_path = candidate.get("file_path")
 
-    score, reasons = _artifact_role_score(slot, artifact)
-    if score <= 0:
+    score_result = score_semantic_candidate(
+        slot,
+        semantic_candidate,
+        preferred_lineage=preferred_lineage,
+        project_id=project_id,
+        dependency_rank=dep_index,
+        source_type_override="artifact_record",
+    )
+    if score_result.score <= 0:
         return None
-    lineage_score, lineage_reasons = _lineage_score(preferred_lineage, artifact)
-    score += lineage_score
-    reasons.extend(lineage_reasons)
-    source_score, source_reasons = _source_preference_score("artifact_record")
-    score += source_score
-    reasons.extend(source_reasons)
-
-    dependency_bonus = max(5 - dep_index, 0)
-    if dependency_bonus:
-        score += dependency_bonus
-        reasons.append("dependency_proximity")
+    score = score_result.score
+    reasons = list(score_result.reason_codes)
 
     explanation = {
         "candidate_source": "artifact_record",
         "score": score,
         "reason_codes": reasons,
         "source_step_key": dep_key,
-        "source_slot_name": artifact.get("slot_name"),
-        "source_step_type": artifact.get("step_type"),
-        "artifact_role": artifact.get("artifact_role"),
-        "artifact_scope": artifact.get("artifact_scope"),
+        "source_slot_name": candidate.get("slot_name"),
+        "source_step_type": candidate.get("step_type"),
+        "artifact_role": candidate.get("artifact_role"),
+        "artifact_scope": candidate.get("artifact_scope"),
         "expected_roles": list(slot.accepted_roles or []),
-        "lineage": _candidate_lineage(artifact),
+        "lineage": _candidate_lineage(candidate),
     }
     return {
         "file_path": file_path,
@@ -593,6 +562,7 @@ async def _resolve_artifact_candidates(
     slot: "SlotDefinition",
     db: "AsyncSession",
     preferred_lineage: dict[str, Any] | None = None,
+    project_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Tier 1a: query ArtifactRecord for upstream outputs matching a slot."""
     try:
@@ -608,6 +578,7 @@ async def _resolve_artifact_candidates(
                     slot,
                     artifact,
                     preferred_lineage=preferred_lineage,
+                    project_id=project_id,
                 )
                 if candidate:
                     candidates.append(candidate)
@@ -656,95 +627,18 @@ async def _select_semantic_candidates(
     db: "AsyncSession",
     preferred_lineage: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    candidates: list[dict[str, Any]] = []
+    from tune.core.binding.semantic_retrieval import retrieve_semantic_candidates
 
-    candidates.extend(
-        await _resolve_artifact_candidates(
-            job_id,
-            dep_keys,
-            slot,
-            db,
-            preferred_lineage=preferred_lineage,
-        )
+    return await retrieve_semantic_candidates(
+        job_id=job_id,
+        dep_keys=dep_keys,
+        slot=slot,
+        project_id=project_id,
+        project_files=project_files,
+        kp_bindings=kp_bindings,
+        db=db,
+        preferred_lineage=preferred_lineage,
     )
-
-    if project_id and slot.name in {"read1", "read2", "reads"}:
-        filerun_candidates = await _resolve_read_candidates_from_filerun(project_id, slot.name, db)
-        for candidate in filerun_candidates:
-            external_candidate = _build_external_candidate(
-                slot=slot,
-                source_type="filerun",
-                file_path=candidate["file_path"],
-                source_ref=candidate.get("source_ref"),
-                artifact_role=candidate.get("artifact_role"),
-                preferred_lineage=preferred_lineage,
-                sample_id=candidate.get("sample_id"),
-                experiment_id=candidate.get("experiment_id"),
-                sample_name=candidate.get("sample_name"),
-                read_number=candidate.get("read_number"),
-            )
-            if external_candidate:
-                candidates.append(external_candidate)
-
-    kp_path = kp_bindings.get(slot.name)
-    if kp_path:
-        kp_role = (
-            slot.accepted_roles[0]
-            if slot.accepted_roles
-            else _infer_project_file_role(slot, {"path": kp_path, "file_type": "", "read_number": None})
-        )
-        known_candidate = _build_external_candidate(
-            slot=slot,
-            source_type="known_path",
-            file_path=kp_path,
-            source_ref=slot.name,
-            artifact_role=kp_role,
-            preferred_lineage=preferred_lineage,
-        )
-        if known_candidate:
-            candidates.append(known_candidate)
-
-    for project_file in project_files:
-        if not _file_matches_types(project_file.get("path", ""), slot.file_types):
-            continue
-        artifact_role = _infer_project_file_role(slot, project_file)
-        if slot.accepted_roles and artifact_role is None:
-            continue
-        candidate = _build_external_candidate(
-            slot=slot,
-            source_type="project_file",
-            file_path=project_file.get("path", ""),
-            source_ref=project_file.get("id"),
-            artifact_role=artifact_role,
-            preferred_lineage=preferred_lineage,
-            sample_id=project_file.get("linked_sample_id"),
-            experiment_id=project_file.get("linked_experiment_id"),
-            sample_name=project_file.get("sample_name"),
-            read_number=project_file.get("read_number"),
-        )
-        if candidate:
-            candidates.append(candidate)
-
-    candidates.sort(
-        key=lambda candidate: (
-            candidate["score"],
-            candidate["file_path"],
-        ),
-        reverse=True,
-    )
-    candidates = _dedupe_candidates(candidates)
-    candidates = _collapse_multi_candidates_by_lineage(slot, candidates)
-
-    if slot.multiple and preferred_lineage:
-        lineage_matches = [
-            candidate
-            for candidate in candidates
-            if _lineage_matches_preference(preferred_lineage, candidate.get("lineage"))
-        ]
-        if lineage_matches:
-            return lineage_matches
-
-    return candidates
 
 
 async def _select_semantic_candidate(
@@ -758,7 +652,9 @@ async def _select_semantic_candidate(
     db: "AsyncSession",
     preferred_lineage: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    candidates = await _select_semantic_candidates(
+    from tune.core.binding.semantic_retrieval import retrieve_best_semantic_candidate
+
+    return await retrieve_best_semantic_candidate(
         job_id=job_id,
         dep_keys=dep_keys,
         slot=slot,
@@ -768,7 +664,6 @@ async def _select_semantic_candidate(
         db=db,
         preferred_lineage=preferred_lineage,
     )
-    return candidates[0] if candidates else None
 
 
 def _result_rows(result) -> list[Any]:

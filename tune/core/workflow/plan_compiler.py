@@ -52,7 +52,10 @@ class CompileResult:
 # ---------------------------------------------------------------------------
 
 
-def compile_plan(steps: list[dict]) -> CompileResult:
+def compile_plan(
+    steps: list[dict],
+    implementation_decisions=None,
+) -> CompileResult:
     """Validate, normalise, and compile typed plan steps.
 
     Returns a ``CompileResult``.  When ``ok=False`` the ``errors`` list
@@ -63,6 +66,20 @@ def compile_plan(steps: list[dict]) -> CompileResult:
 
     errors: list[str] = []
     warnings: list[str] = []
+
+    if implementation_decisions is not None:
+        from tune.core.analysis.implementation_decision import (
+            validate_steps_against_implementation_decisions,
+        )
+
+        errors.extend(
+            validate_steps_against_implementation_decisions(
+                steps,
+                implementation_decisions,
+            )
+        )
+        if errors:
+            return CompileResult(ok=False, errors=errors)
 
     # --- Pass 1: basic structural validation (step_type in registry, unique
     #     step_key, params schema, depends_on references) ---
@@ -91,6 +108,20 @@ def compile_plan(steps: list[dict]) -> CompileResult:
 
     log.debug("compile_plan: compiled %d steps (%d warnings)", len(compiled), len(warnings))
     return CompileResult(ok=True, compiled_steps=compiled, warnings=warnings)
+
+
+def compile_plan_with_decisions(
+    steps: list[dict],
+    implementation_decisions=None,
+) -> CompileResult:
+    """Call compile_plan with backward-compatible monkeypatch handling."""
+
+    try:
+        return compile_plan(steps, implementation_decisions=implementation_decisions)
+    except TypeError as exc:
+        if "unexpected keyword argument 'implementation_decisions'" not in str(exc):
+            raise
+        return compile_plan(steps)
 
 
 # ---------------------------------------------------------------------------

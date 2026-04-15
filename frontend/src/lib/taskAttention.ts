@@ -2,7 +2,13 @@ import type { Lang, TranslationKey } from '../i18n/translations'
 
 export type TaskAttentionSignal = 'idle' | 'running' | 'warning' | 'attention'
 export type TaskAttentionReason = 'authorization' | 'repair' | 'confirmation' | 'clarification' | 'rollback_review' | 'warning'
-export type OperatorChatActionCode = 'confirm_or_edit_plan' | 'provide_missing_resource_clarification' | 'confirm_or_edit_execution' | null
+export type OperatorChatActionCode =
+  | 'confirm_or_edit_plan'
+  | 'provide_missing_resource_clarification'
+  | 'confirm_or_edit_execution'
+  | 'review_semantic_trace'
+  | 'review_memory_conflict'
+  | null
 
 type TranslateFn = (key: TranslationKey) => string
 
@@ -19,6 +25,7 @@ export interface TaskAttentionReminder {
   owner: 'user' | 'system'
   nextAction?: string | null
   rollbackLevel?: string | null
+  executionDecisionSource?: string | null
 }
 
 export function formatTaskAttentionReason(reason: TaskAttentionReason, lang: Lang): string {
@@ -33,26 +40,46 @@ export function formatTaskAttentionReason(reason: TaskAttentionReason, lang: Lan
   return labels[reason][lang]
 }
 
+function mapExecutionDecisionSourceToChatAction(
+  decisionSource: string | null | undefined,
+): OperatorChatActionCode {
+  if (decisionSource === 'semantic_trace') return 'review_semantic_trace'
+  if (decisionSource === 'structured_memory') return 'review_memory_conflict'
+  return 'confirm_or_edit_execution'
+}
+
 export function resolveOperatorChatActionCode(input: {
   reason?: string | null
   rollbackLevel?: string | null
   nextAction?: string | null
+  executionDecisionSource?: string | null
 }): OperatorChatActionCode {
+  let baseAction: OperatorChatActionCode = null
+
   if (input.reason === 'rollback_review') {
     if (input.rollbackLevel === 'abstract_plan') return 'confirm_or_edit_plan'
     if (input.rollbackLevel === 'execution_ir') return 'provide_missing_resource_clarification'
-    return 'confirm_or_edit_execution'
+    baseAction = 'confirm_or_edit_execution'
+  } else if (input.nextAction === 'confirm_or_edit_plan') {
+    baseAction = 'confirm_or_edit_plan'
+  } else if (input.nextAction === 'confirm_or_edit_execution') {
+    baseAction = 'confirm_or_edit_execution'
+  } else if (input.nextAction === 'provide_missing_resource_clarification') {
+    baseAction = 'provide_missing_resource_clarification'
   }
-  if (input.nextAction === 'confirm_or_edit_plan') return 'confirm_or_edit_plan'
-  if (input.nextAction === 'confirm_or_edit_execution') return 'confirm_or_edit_execution'
-  if (input.nextAction === 'provide_missing_resource_clarification') return 'provide_missing_resource_clarification'
-  return null
+
+  if (baseAction === 'confirm_or_edit_execution') {
+    return mapExecutionDecisionSourceToChatAction(input.executionDecisionSource)
+  }
+  return baseAction
 }
 
 export function formatOperatorChatActionCta(actionCode: OperatorChatActionCode, t: TranslateFn): string {
   if (actionCode === 'confirm_or_edit_plan') return t('tasks_pending_inputs_open_plan_chat')
   if (actionCode === 'provide_missing_resource_clarification') return t('tasks_pending_inputs_open_execution_ir_chat')
   if (actionCode === 'confirm_or_edit_execution') return t('tasks_pending_inputs_open_dag_chat')
+  if (actionCode === 'review_semantic_trace') return t('tasks_pending_inputs_open_semantic_trace_chat')
+  if (actionCode === 'review_memory_conflict') return t('tasks_pending_inputs_open_memory_conflict_chat')
   return t('tasks_supervisor_open_chat')
 }
 
@@ -60,6 +87,8 @@ export function formatOperatorChatActionHint(actionCode: OperatorChatActionCode,
   if (actionCode === 'confirm_or_edit_plan') return t('tasks_pending_inputs_hint_plan_chat')
   if (actionCode === 'provide_missing_resource_clarification') return t('tasks_pending_inputs_hint_execution_ir_chat')
   if (actionCode === 'confirm_or_edit_execution') return t('tasks_pending_inputs_hint_dag_chat')
+  if (actionCode === 'review_semantic_trace') return t('tasks_pending_inputs_hint_semantic_trace_chat')
+  if (actionCode === 'review_memory_conflict') return t('tasks_pending_inputs_hint_memory_conflict_chat')
   return null
 }
 
@@ -73,6 +102,7 @@ export function buildTaskAttentionReminderMessage(
     reason: reminder.reason,
     rollbackLevel: reminder.rollbackLevel,
     nextAction: reminder.nextAction,
+    executionDecisionSource: reminder.executionDecisionSource,
   })
   const actionHint = formatOperatorChatActionHint(actionCode, t)
 

@@ -28,7 +28,7 @@ from tune.core.models import Experiment, File, FileRun, Sample
 
 _STRATEGY_MAP = {
     "rna-seq": "RNA-Seq", "rnaseq": "RNA-Seq", "mrna": "RNA-Seq",
-    "wgs": "WGS", "whole genome": "WGS",
+    "gs": "WGS", "wgs": "WGS", "whole genome": "WGS",
     "wes": "WXS", "whole exome": "WXS", "wxs": "WXS",
     "chip-seq": "ChIP-Seq", "chipseq": "ChIP-Seq",
     "atac-seq": "ATAC-seq", "atacseq": "ATAC-seq",

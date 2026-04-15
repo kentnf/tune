@@ -22,8 +22,11 @@ interface SupervisorRecommendation {
   severity: string
   owner: string
   diagnosis: string
+  failure_layer?: string | null
   rollback_level?: string
   rollback_target: string
+  reconfirmation_required?: boolean | null
+  historical_matches?: number | null
   safe_action?: string | null
   safe_action_eligibility?: {
     eligible?: boolean
@@ -56,6 +59,8 @@ interface SupervisorRecommendation {
   auto_recovery_kind?: string | null
   recommended_action_confidence?: string | null
   recommended_action_basis?: string[] | null
+  decision_source?: string | null
+  execution_artifact_review_subtype?: string | null
   safe_action_note?: string | null
   historical_guidance?: string | null
   immediate_action: string
@@ -223,10 +228,35 @@ interface SupervisorDossier {
     suggested_level?: string | null
     reason?: string | null
   } | null
+  execution_decision_source?: string | null
   execution_confirmation_overview?: ExecutionConfirmationOverview | null
   execution_ir_review?: ExecutionIrReviewItem[] | null
   execution_plan_delta?: ExecutionPlanDelta | null
   execution_plan_changes?: ExecutionPlanChangeItem[] | null
+  execution_semantic_guardrails?: ExecutionSemanticGuardrails | null
+  semantic_memory_dossier?: {
+    resource_link_count?: number | null
+    artifact_link_count?: number | null
+    runtime_link_count?: number | null
+    resource_links?: Array<{
+      memory_type?: string | null
+      entity_type?: string | null
+      entity_id?: string | null
+      link_role?: string | null
+    }> | null
+    artifact_links?: Array<{
+      memory_type?: string | null
+      entity_type?: string | null
+      entity_id?: string | null
+      link_role?: string | null
+    }> | null
+    runtime_links?: Array<{
+      memory_type?: string | null
+      entity_type?: string | null
+      entity_id?: string | null
+      link_role?: string | null
+    }> | null
+  } | null
   similar_resolutions?: Array<{
     event_type?: string | null
     description?: string | null
@@ -253,6 +283,7 @@ interface SupervisorReview {
     top_safe_action?: string | null
     top_rollback_level?: string | null
     top_rollback_target?: string | null
+    top_execution_artifact_review_subtype?: string | null
     top_historical_rollback_level?: string | null
     top_historical_rollback_alignment?: boolean | null
     top_historical_rollback_target?: string | null
@@ -261,16 +292,44 @@ interface SupervisorReview {
     lane_reason?: string | null
     next_best_operator_move?: string | null
     next_best_operator_reason?: string | null
+    decision_source?: string | null
     latest_auto_recovery_issue?: string | null
     latest_auto_recovery_action?: string | null
     latest_auto_recovery_status?: string | null
     latest_auto_recovery_pending_types?: string | null
     latest_auto_recovery_job_id?: string | null
+    project_memory_episode_count?: number | null
+    project_memory_resource_link_count?: number | null
+    project_memory_artifact_link_count?: number | null
+    project_memory_runtime_link_count?: number | null
+    project_memory_preferred_safe_action?: string | null
+    project_memory_preferred_rollback_level?: string | null
+    project_memory_preferred_analysis_family?: string | null
   } | null
   project_playbook?: {
     goal?: string | null
     next_move?: string | null
+    decision_source?: string | null
     step_codes?: string[] | null
+  } | null
+  project_memory_profile?: {
+    episode_count?: number | null
+    user_validated_episode_count?: number | null
+    preferences?: {
+      preferred_safe_action?: string | null
+      preferred_rollback_level?: string | null
+      preferred_analysis_family?: string | null
+    } | null
+    safe_action_patterns?: Array<{
+      safe_action?: string | null
+      support_count?: number | null
+      user_validated_count?: number | null
+    }> | null
+    rollback_patterns?: Array<{
+      rollback_level?: string | null
+      support_count?: number | null
+      user_validated_count?: number | null
+    }> | null
   } | null
   recommendations: SupervisorRecommendation[]
   dossiers?: SupervisorDossier[]
@@ -281,6 +340,8 @@ interface ExecutionPlanSummary {
   has_expanded_dag?: boolean
   node_count?: number
   group_count?: number
+  ambiguity_count?: number
+  memory_review_count?: number
 }
 
 interface ExecutionConfirmationOverview {
@@ -342,6 +403,48 @@ interface ExecutionPlanChangeItem {
   auto_injected_cause?: string | null
 }
 
+interface ExecutionAmbiguityReviewItem {
+  step_key?: string | null
+  step_type?: string | null
+  display_name?: string | null
+  slot_name?: string | null
+  binding_key?: string | null
+  primary_path?: string | null
+  secondary_path?: string | null
+  score_gap?: number | null
+  candidate_count?: number | null
+  description?: string | null
+}
+
+interface ExecutionMemoryBindingReviewItem {
+  step_key?: string | null
+  step_type?: string | null
+  display_name?: string | null
+  slot_name?: string | null
+  binding_key?: string | null
+  fact_key?: string | null
+  confirmed_path?: string | null
+  candidate_path?: string | null
+  candidate_count?: number | null
+  description?: string | null
+}
+
+interface ExecutionSemanticGuardrails {
+  ambiguity_count?: number | null
+  ambiguity_reviews?: ExecutionAmbiguityReviewItem[] | null
+  memory_review_count?: number | null
+  memory_binding_reviews?: ExecutionMemoryBindingReviewItem[] | null
+  project_memory_summary?: {
+    stable_fact_count?: number | null
+    memory_pattern_count?: number | null
+    memory_preference_count?: number | null
+    memory_link_count?: number | null
+    resource_link_count?: number | null
+    artifact_link_count?: number | null
+    runtime_link_count?: number | null
+  } | null
+}
+
 interface ConfirmationPlanItem {
   step_key?: string | null
   step_type?: string | null
@@ -355,6 +458,14 @@ interface ConfirmationLayerItem {
   label: TranslationKey
   stateLabel: TranslationKey
   tone: 'ready' | 'pending' | 'waiting' | 'missing'
+}
+
+interface ExecutionConfirmationCta {
+  title: string
+  detail: string
+  actionLabel: string
+  panelClassName: string
+  eyebrowClassName: string
 }
 
 function formatRuntimeDiagnostic(item: RuntimeDiagnostic, t: (k: TranslationKey) => string): string {
@@ -451,6 +562,49 @@ function buildConfirmationLayers(
   ]
 }
 
+function buildExecutionConfirmationCta(
+  decisionSource: string | null | undefined,
+  guardrails: ExecutionSemanticGuardrails | null | undefined,
+  t: (k: TranslationKey) => string,
+): ExecutionConfirmationCta {
+  const ambiguityCount = Math.max(Number(guardrails?.ambiguity_count ?? 0), 0)
+  const memoryReviewCount = Math.max(Number(guardrails?.memory_review_count ?? 0), 0)
+  const resolvedSource = decisionSource
+    || (ambiguityCount > 0
+      ? 'semantic_trace'
+      : memoryReviewCount > 0
+        ? 'structured_memory'
+        : 'confirmation_gate')
+
+  if (resolvedSource === 'semantic_trace') {
+    return {
+      title: t('tasks_confirmation_cta_semantic_trace_title'),
+      detail: t('tasks_confirmation_cta_semantic_trace_detail').replace('{count}', String(Math.max(ambiguityCount, 1))),
+      actionLabel: t('tasks_confirmation_cta_semantic_trace_action'),
+      panelClassName: 'border-amber-500/25 bg-amber-500/10',
+      eyebrowClassName: 'text-amber-200',
+    }
+  }
+
+  if (resolvedSource === 'structured_memory') {
+    return {
+      title: t('tasks_confirmation_cta_structured_memory_title'),
+      detail: t('tasks_confirmation_cta_structured_memory_detail').replace('{count}', String(Math.max(memoryReviewCount, 1))),
+      actionLabel: t('tasks_confirmation_cta_structured_memory_action'),
+      panelClassName: 'border-rose-500/25 bg-rose-500/10',
+      eyebrowClassName: 'text-rose-200',
+    }
+  }
+
+  return {
+    title: t('tasks_confirmation_cta_confirmation_gate_title'),
+    detail: t('tasks_confirmation_cta_confirmation_gate_detail'),
+    actionLabel: t('tasks_confirmation_cta_confirmation_gate_action'),
+    panelClassName: 'border-emerald-500/25 bg-emerald-500/10',
+    eyebrowClassName: 'text-emerald-200',
+  }
+}
+
 function formatAttentionReasonLabel(
   reason: 'authorization' | 'repair' | 'confirmation' | 'clarification' | 'rollback_review' | 'warning',
   t: (key: TranslationKey) => string,
@@ -524,10 +678,61 @@ interface PendingInteractionPayload {
   failed_command?: string | null
   stderr_excerpt?: string | null
   prompt_text?: string | null
+  clarification_request?: ClarificationRequestPayload | null
   issues?: Array<{
     title?: string | null
     description?: string | null
   }>
+  decision_packet?: {
+    decision_type?: string | null
+    stage?: string | null
+    blocking?: boolean
+    summary?: string | null
+    reason?: string | null
+    required_user_action?: string | null
+    options?: Array<{
+      option_id?: string | null
+      label?: string | null
+      action?: string | null
+    }>
+    context_payload?: {
+      clarification_request?: ClarificationRequestPayload | null
+      [key: string]: unknown
+    } | null
+  } | null
+}
+
+interface ClarificationRequestOption {
+  option_id?: string | null
+  label?: string | null
+  value?: string | null
+  description?: string | null
+}
+
+interface ClarificationRequestQuestion {
+  question_id?: string | null
+  prompt?: string | null
+  response_kind?: string | null
+  required?: boolean
+  allows_free_text?: boolean
+  free_text_hint?: string | null
+  options?: ClarificationRequestOption[] | null
+  context?: {
+    description?: string | null
+    suggestion?: string | null
+    resolution_type?: string | null
+    [key: string]: unknown
+  } | null
+}
+
+interface ClarificationRequestPayload {
+  request_id?: string | null
+  request_type?: string | null
+  prompt?: string | null
+  questions?: ClarificationRequestQuestion[] | null
+  context?: {
+    [key: string]: unknown
+  } | null
 }
 
 interface JobBindingResponse {
@@ -542,11 +747,55 @@ interface JobBindingResponse {
   confirmation_phase?: 'abstract' | 'execution' | null
   confirmation_plan?: ConfirmationPlanItem[]
   execution_plan_summary?: ExecutionPlanSummary | null
+  execution_decision_source?: string | null
   execution_confirmation_overview?: ExecutionConfirmationOverview | null
   execution_ir_review?: ExecutionIrReviewItem[] | null
   execution_plan_delta?: ExecutionPlanDelta | null
   execution_plan_changes?: ExecutionPlanChangeItem[] | null
+  execution_semantic_guardrails?: ExecutionSemanticGuardrails | null
   steps?: JobBindingStep[]
+}
+
+interface ConfirmationSnapshot {
+  confirmationPhase: 'abstract' | 'execution' | null
+  executionDecisionSource?: string | null
+  executionSemanticGuardrails?: ExecutionSemanticGuardrails | null
+}
+
+type JobFocusSection = 'confirmation_semantic_trace' | 'confirmation_memory_conflict'
+
+type JobFocusTarget = {
+  section: JobFocusSection
+  itemKey?: string | null
+} | null
+
+function buildExecutionAmbiguityReviewItemKey(
+  item: ExecutionAmbiguityReviewItem,
+  index: number,
+): string {
+  return [
+    item.binding_key,
+    item.step_key,
+    item.slot_name,
+    item.primary_path,
+    item.secondary_path,
+    String(index),
+  ].filter(Boolean).join('::')
+}
+
+function buildExecutionMemoryReviewItemKey(
+  item: ExecutionMemoryBindingReviewItem,
+  index: number,
+): string {
+  return [
+    item.binding_key,
+    item.step_key,
+    item.fact_key,
+    item.slot_name,
+    item.candidate_path,
+    item.confirmed_path,
+    String(index),
+  ].filter(Boolean).join('::')
 }
 
 function formatExecutionPlanChangeSummary(
@@ -604,6 +853,13 @@ function formatExecutionPlanChangeSummary(
   }
 
   return detailParts.join(' · ') || item.summary || ''
+}
+
+function formatExecutionSemanticReviewTitle(
+  item: { display_name?: string | null; step_key?: string | null; step_type?: string | null },
+  fallback: string,
+): string {
+  return item.display_name || item.step_key || item.step_type || fallback
 }
 
 function formatExecutionPlanChangeKind(
@@ -823,6 +1079,8 @@ function formatRecommendationBasis(code: string, t: (k: TranslationKey) => strin
     historical_confidence_high: 'tasks_supervisor_recommendation_basis_historical_confidence_high',
     historical_confidence_medium: 'tasks_supervisor_recommendation_basis_historical_confidence_medium',
     historical_confidence_low: 'tasks_supervisor_recommendation_basis_historical_confidence_low',
+    semantic_resource_trace: 'tasks_supervisor_recommendation_basis_semantic_resource_trace',
+    semantic_artifact_trace: 'tasks_supervisor_recommendation_basis_semantic_artifact_trace',
   }
   return t(keyMap[code] || 'tasks_supervisor_resume_retry_blocker_unknown')
 }
@@ -858,7 +1116,29 @@ function formatPrimaryLane(value: string | null | undefined, t: (k: TranslationK
   return t(keyMap[value || ''] || 'tasks_supervisor_lane_unknown') || humanizeFocusToken(value)
 }
 
-function formatNextBestMove(value: string | null | undefined, t: (k: TranslationKey) => string): string {
+function formatDecisionSource(value: string | null | undefined, t: (k: TranslationKey) => string): string {
+  const keyMap: Record<string, TranslationKey> = {
+    confirmation_gate: 'tasks_supervisor_decision_source_confirmation_gate',
+    resource_readiness: 'tasks_supervisor_decision_source_resource_readiness',
+    environment_readiness: 'tasks_supervisor_decision_source_environment_readiness',
+    semantic_trace: 'tasks_supervisor_decision_source_semantic_trace',
+    structured_memory: 'tasks_supervisor_decision_source_structured_memory',
+    historical_memory: 'tasks_supervisor_decision_source_historical_memory',
+    runtime_recovery: 'tasks_supervisor_decision_source_runtime_recovery',
+    authorization: 'tasks_supervisor_decision_source_authorization',
+    repair: 'tasks_supervisor_decision_source_repair',
+    resource_clarification: 'tasks_supervisor_decision_source_resource_clarification',
+  }
+  return t(keyMap[value || ''] || 'tasks_supervisor_decision_source_unknown') || humanizeFocusToken(value)
+}
+
+function formatNextBestMove(
+  value: string | null | undefined,
+  decisionSource: string | null | undefined,
+  t: (k: TranslationKey) => string,
+): string {
+  const operatorActionLabel = formatSupervisorOperatorActionLabel({ move: value, decisionSource }, t)
+  if (operatorActionLabel) return operatorActionLabel
   const keyMap: Record<string, TranslationKey> = {
     inspect_top_incident: 'tasks_supervisor_move_inspect_top_incident',
     review_confirmation_gate: 'tasks_supervisor_move_review_confirmation_gate',
@@ -902,10 +1182,32 @@ function formatFailureLayer(value: string | null | undefined, t: (k: Translation
   return t(keyMap[value || ''] || 'tasks_supervisor_failure_layer_unknown') || humanizeFocusToken(value)
 }
 
-function formatRollbackTarget(value: string | null | undefined): string {
+function formatRollbackTarget(value: string | null | undefined, t: (k: TranslationKey) => string): string {
   const raw = String(value || '').trim()
   if (!raw) return ''
-  return humanizeFocusToken(raw)
+  const keyMap: Record<string, TranslationKey> = {
+    resource_clarification_gate: 'tasks_supervisor_rollback_target_resource_clarification_gate',
+    execution_artifact_review: 'tasks_supervisor_rollback_target_execution_artifact_review',
+    execution_semantics: 'tasks_supervisor_rollback_target_execution_semantics',
+    execution_confirmation_gate: 'tasks_supervisor_rollback_target_execution_confirmation_gate',
+    abstract_plan_gate: 'tasks_supervisor_rollback_target_abstract_plan_gate',
+  }
+  const key = keyMap[raw]
+  return key ? t(key) : humanizeFocusToken(raw)
+}
+
+function formatExecutionArtifactReviewSubtype(
+  value: string | null | undefined,
+  t: (k: TranslationKey) => string,
+): string {
+  const raw = String(value || '').trim()
+  if (!raw) return ''
+  const keyMap: Record<string, TranslationKey> = {
+    upstream_output_regeneration: 'tasks_supervisor_artifact_review_subtype_upstream_output_regeneration',
+    downstream_binding_review: 'tasks_supervisor_artifact_review_subtype_downstream_binding_review',
+  }
+  const key = keyMap[raw]
+  return key ? t(key) : humanizeFocusToken(raw)
 }
 
 function formatPendingTypeLabel(value: string | null | undefined, t: (k: TranslationKey) => string): string {
@@ -916,6 +1218,31 @@ function formatPendingTypeLabel(value: string | null | undefined, t: (k: Transla
 
 function formatRequestStatusLabel(value: string | null | undefined): string {
   return humanizeFocusToken(value) || 'unknown'
+}
+
+function focusTargetForOperatorAction(
+  actionCode: ReturnType<typeof resolveOperatorChatActionCode>,
+  confirmationSnapshot?: ConfirmationSnapshot | null,
+): JobFocusTarget | null {
+  if (actionCode === 'review_semantic_trace') {
+    const firstAmbiguityReview = confirmationSnapshot?.executionSemanticGuardrails?.ambiguity_reviews?.[0]
+    return {
+      section: 'confirmation_semantic_trace',
+      itemKey: firstAmbiguityReview
+        ? buildExecutionAmbiguityReviewItemKey(firstAmbiguityReview, 0)
+        : null,
+    }
+  }
+  if (actionCode === 'review_memory_conflict') {
+    const firstMemoryReview = confirmationSnapshot?.executionSemanticGuardrails?.memory_binding_reviews?.[0]
+    return {
+      section: 'confirmation_memory_conflict',
+      itemKey: firstMemoryReview
+        ? buildExecutionMemoryReviewItemKey(firstMemoryReview, 0)
+        : null,
+    }
+  }
+  return null
 }
 
 function formatTimelineTimestamp(ts: string | null | undefined, lang: 'en' | 'zh'): string {
@@ -1108,20 +1435,67 @@ function formatRollbackLevel(level: string | undefined, t: (k: TranslationKey) =
   return t(key)
 }
 
-function formatSupervisorAction(action: string | undefined, t: (k: TranslationKey) => string): string {
+function formatSupervisorOperatorActionLabel(
+  input: {
+    move?: string | null
+    action?: string | null
+    decisionSource?: string | null
+  },
+  t: (k: TranslationKey) => string,
+): string | null {
+  if (input.move === 'review_rollback_scope') {
+    return t('tasks_pending_inputs_open_rollback_chat')
+  }
+
+  let actionCode = null
+
+  if (input.move === 'review_confirmation_gate' || input.action === 'confirm_or_edit_execution') {
+    actionCode = resolveOperatorChatActionCode({
+      nextAction: 'confirm_or_edit_execution',
+      executionDecisionSource: input.decisionSource,
+    })
+  } else if (input.action === 'confirm_or_edit_plan') {
+    actionCode = resolveOperatorChatActionCode({
+      nextAction: 'confirm_or_edit_plan',
+    })
+  } else if (
+    input.move === 'resolve_resource_clarification'
+    || input.action === 'provide_missing_resource_clarification'
+  ) {
+    actionCode = resolveOperatorChatActionCode({
+      nextAction: 'provide_missing_resource_clarification',
+    })
+  }
+
+  return actionCode ? formatOperatorChatActionCta(actionCode, t) : null
+}
+
+function formatSupervisorAction(
+  action: string | undefined,
+  decisionSource: string | null | undefined,
+  t: (k: TranslationKey) => string,
+): string {
+  const operatorActionLabel = formatSupervisorOperatorActionLabel({ action, decisionSource }, t)
+  if (operatorActionLabel) return operatorActionLabel
   const key = `tasks_incident_action_${action || 'inspect_task'}` as TranslationKey
   const label = t(key)
   return label || action || 'inspect_task'
 }
 
-function formatSupervisorPlaybookStep(code: string, t: (k: TranslationKey) => string): string {
+function formatSupervisorPlaybookStep(
+  code: string,
+  decisionSource: string | null | undefined,
+  t: (k: TranslationKey) => string,
+): string {
   if (code === 'open_task') return t('tasks_supervisor_open_task')
   if (code === 'open_chat') return t('tasks_supervisor_open_chat')
   if (code === 'resume_job') return t('tasks_supervisor_resume_job')
   if (code === 'review_historical_policy') return t('tasks_incident_action_review_historical_policy')
+  if (code === 'review_semantic_memory_dossier') return t('tasks_incident_action_review_semantic_memory_dossier')
+  if (code === 'review_project_memory_patterns') return t('tasks_incident_action_review_project_memory_patterns')
   if (code === 'apply_safe_action') return t('tasks_supervisor_playbook_apply_safe_action')
   if (code === 'recheck_task_state') return t('tasks_supervisor_playbook_recheck_task_state')
-  return formatSupervisorAction(code, t)
+  return formatSupervisorAction(code, decisionSource, t)
 }
 
 function safeActionNextStatus(recommendation: SupervisorRecommendation): string | undefined {
@@ -1152,12 +1526,72 @@ function formatSimilarResolution(item: NonNullable<SupervisorDossier['similar_re
   return 'memory'
 }
 
+function formatSemanticMemoryLinkItem(
+  item: {
+    link_role?: string | null
+    entity_id?: string | null
+  } | null | undefined,
+): string {
+  const role = humanizeFocusToken(item?.link_role)
+  const entityId = String(item?.entity_id || '').trim()
+  if (role && entityId) return `${role}=${entityId}`
+  return entityId || role || ''
+}
+
 function splitIssueText(errorMessage: string | null | undefined): string[] {
   if (!errorMessage) return []
   return errorMessage
     .split(/;\s+/)
     .map((item) => item.trim())
     .filter(Boolean)
+}
+
+function getClarificationRequest(
+  payload: PendingInteractionPayload | null | undefined,
+): ClarificationRequestPayload | null {
+  const directRequest = payload?.clarification_request
+  if (directRequest && typeof directRequest === 'object') return directRequest
+  const request = payload?.decision_packet?.context_payload?.clarification_request
+  return request && typeof request === 'object' ? request : null
+}
+
+function getPendingInteractionPrompt(
+  payload: PendingInteractionPayload | null | undefined,
+  fallback?: string | null,
+): string | null {
+  const decisionSummary = String(payload?.decision_packet?.summary || '').trim()
+  if (decisionSummary) return decisionSummary
+  const clarificationPrompt = String(getClarificationRequest(payload)?.prompt || '').trim()
+  if (clarificationPrompt) return clarificationPrompt
+  const promptText = String(payload?.prompt_text || '').trim()
+  if (promptText) return promptText
+  const fallbackText = String(fallback || '').trim()
+  return fallbackText || null
+}
+
+function describeClarificationQuestion(question: ClarificationRequestQuestion): string[] {
+  const prompt = String(question.prompt || '').trim()
+  const description = String(question.context?.description || '').trim()
+  const suggestion = String(question.context?.suggestion || '').trim()
+  const parts = [prompt, description, suggestion].filter(Boolean)
+  return parts.length > 0 ? [parts.join(': ')] : []
+}
+
+function derivePendingInteractionIssueLines(
+  payload: PendingInteractionPayload | null | undefined,
+  errorMessage: string | null | undefined,
+): string[] {
+  const clarificationRequest = getClarificationRequest(payload)
+  const clarificationLines = (clarificationRequest?.questions ?? [])
+    .flatMap((question) => describeClarificationQuestion(question))
+    .filter(Boolean)
+  if (clarificationLines.length > 0) return clarificationLines
+
+  const payloadIssues = (payload?.issues ?? [])
+    .map((issue) => [issue.title, issue.description].filter(Boolean).join(': ').trim())
+    .filter(Boolean)
+  if (payloadIssues.length > 0) return payloadIssues
+  return splitIssueText(errorMessage)
 }
 
 function CommandPreview({
@@ -1328,11 +1762,109 @@ function RepairPromptCard({
   )
 }
 
+function ResourceClarificationPromptCard({
+  title,
+  prompt,
+  clarificationRequest,
+  onOpenChat,
+  openChatLabel,
+  actionRow,
+}: {
+  title: string
+  prompt?: string | null
+  clarificationRequest: ClarificationRequestPayload
+  onOpenChat?: () => void
+  openChatLabel?: string
+  actionRow?: ReactNode
+}) {
+  const { t } = useLanguage()
+  const questions = (clarificationRequest.questions ?? []).filter(Boolean)
+
+  return (
+    <div className="rounded-lg border border-orange-500/20 bg-orange-500/8 p-3">
+      <div className="text-[11px] font-semibold uppercase tracking-wide text-orange-300 mb-2">
+        {title}
+      </div>
+      {(prompt || clarificationRequest.prompt) && (
+        <div className="text-xs text-orange-100 whitespace-pre-wrap mb-3">
+          {prompt || clarificationRequest.prompt}
+        </div>
+      )}
+      {questions.length > 0 && (
+        <div className="space-y-2">
+          <div className="text-[11px] font-semibold uppercase tracking-wide text-text-muted">
+            {t('tasks_pending_clarifications_questions')}
+          </div>
+          {questions.map((question, index) => {
+            const promptText = question.prompt || `${t('tasks_pending_clarifications_question')} ${index + 1}`
+            const description = question.context?.description || question.context?.suggestion || ''
+            const options = (question.options ?? []).filter(Boolean)
+            return (
+              <div
+                key={`${clarificationRequest.request_id ?? 'clarification'}-${question.question_id ?? index}`}
+                className="rounded-md border border-orange-500/10 bg-surface-raised/80 p-2"
+              >
+                <div className="text-xs font-medium text-text-primary">
+                  {index + 1}. {promptText}
+                </div>
+                {description && (
+                  <div className="mt-1 text-[11px] text-text-muted break-words">
+                    {description}
+                  </div>
+                )}
+                {options.length > 0 && (
+                  <div className="mt-2">
+                    <div className="text-[10px] uppercase tracking-wide text-text-muted mb-1">
+                      {t('tasks_pending_clarifications_candidates')}
+                    </div>
+                    <div className="flex flex-wrap gap-1.5">
+                      {options.map((option, optionIndex) => (
+                        <span
+                          key={`${clarificationRequest.request_id ?? 'clarification'}-${question.question_id ?? index}-option-${option.option_id ?? optionIndex}`}
+                          className="rounded-full border border-orange-500/20 bg-orange-500/10 px-2 py-0.5 text-[10px] text-orange-100"
+                          title={option.description || option.value || ''}
+                        >
+                          {option.label || option.value || `${optionIndex + 1}`}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                {question.allows_free_text && question.free_text_hint && (
+                  <div className="mt-2 text-[11px] text-text-muted break-words">
+                    {t('tasks_pending_clarifications_expected_input')} {question.free_text_hint}
+                  </div>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      )}
+      {(onOpenChat || actionRow) && (
+        <div className="mt-3 flex flex-wrap gap-2">
+          {onOpenChat && (
+            <button
+              type="button"
+              onClick={onOpenChat}
+              className="rounded-lg border border-orange-500/25 px-3 py-1.5 text-xs text-orange-100 transition-colors hover:bg-orange-500/10"
+            >
+              {openChatLabel || t('tasks_pending_clarifications_open_chat')}
+            </button>
+          )}
+          {actionRow}
+        </div>
+      )}
+    </div>
+  )
+}
+
 function JobCard({
   job,
   autoExpand,
+  focusTarget,
   detailRefreshNonce,
   onAutoExpandConsumed,
+  onFocusTargetConsumed,
   onDelete,
   onJobStateSync,
   onResume,
@@ -1340,8 +1872,10 @@ function JobCard({
 }: {
   job: Job
   autoExpand: boolean
+  focusTarget: JobFocusTarget
   detailRefreshNonce: number
   onAutoExpandConsumed: () => void
+  onFocusTargetConsumed: () => void
   onDelete: (job: Job) => void
   onJobStateSync: (jobId: string, patch: Partial<Job>) => void
   onResume: (job: Job) => void
@@ -1368,12 +1902,21 @@ function JobCard({
   const [confirmationPhase, setConfirmationPhase] = useState<'abstract' | 'execution' | null>(null)
   const [confirmationPlan, setConfirmationPlan] = useState<ConfirmationPlanItem[]>([])
   const [executionPlanSummary, setExecutionPlanSummary] = useState<ExecutionPlanSummary | null>(null)
+  const [executionDecisionSource, setExecutionDecisionSource] = useState<string | null>(null)
   const [executionConfirmationOverview, setExecutionConfirmationOverview] = useState<ExecutionConfirmationOverview | null>(null)
   const [executionIrReview, setExecutionIrReview] = useState<ExecutionIrReviewItem[]>([])
   const [executionPlanDelta, setExecutionPlanDelta] = useState<ExecutionPlanDelta | null>(null)
   const [executionPlanChanges, setExecutionPlanChanges] = useState<ExecutionPlanChangeItem[]>([])
+  const [executionSemanticGuardrails, setExecutionSemanticGuardrails] = useState<ExecutionSemanticGuardrails | null>(null)
+  const [highlightedFocusSection, setHighlightedFocusSection] = useState<JobFocusSection | null>(null)
+  const [highlightedFocusItemKey, setHighlightedFocusItemKey] = useState<string | null>(null)
   const logRef = useRef<HTMLDivElement>(null)
   const wsRef = useRef<WebSocket | null>(null)
+  const semanticTraceSectionRef = useRef<HTMLDivElement | null>(null)
+  const memoryConflictSectionRef = useRef<HTMLDivElement | null>(null)
+  const semanticTraceItemRefs = useRef<Record<string, HTMLDivElement | null>>({})
+  const memoryConflictItemRefs = useRef<Record<string, HTMLDivElement | null>>({})
+  const focusHighlightTimerRef = useRef<number | null>(null)
   const executionPlanStatusMap = useMemo(
     () => buildExecutionPlanDeltaStatusMap(executionPlanDelta),
     [executionPlanDelta],
@@ -1382,6 +1925,11 @@ function JobCard({
   const filteredTimeline = useMemo(() => (
     timeline.filter((item) => timelineFilter === 'all' || classifyTimelineEvent(item) === timelineFilter)
   ), [timeline, timelineFilter])
+
+  const clarificationRequest = useMemo(
+    () => getClarificationRequest(pendingInteraction),
+    [pendingInteraction],
+  )
 
   const loadBindings = useCallback(() => {
     setBindingsLoading(true)
@@ -1394,11 +1942,13 @@ function JobCard({
           pending_interaction_type: data.pending_interaction_type ?? null,
         })
         setBindingSteps(Array.isArray(data.steps) ? data.steps : [])
-        const payloadIssues = (data.pending_interaction_payload?.issues ?? [])
-          .map((issue) => [issue.title, issue.description].filter(Boolean).join(': ').trim())
-          .filter(Boolean)
-        setBlockingIssues(payloadIssues.length > 0 ? payloadIssues : splitIssueText(data.error_message))
-        setBlockingPrompt(data.pending_interaction_payload?.prompt_text ?? null)
+        setBlockingIssues(
+          derivePendingInteractionIssueLines(
+            data.pending_interaction_payload ?? null,
+            data.error_message,
+          ),
+        )
+        setBlockingPrompt(getPendingInteractionPrompt(data.pending_interaction_payload ?? null, data.error_message))
         setPendingInteraction(data.pending_interaction_payload ?? null)
         setPendingInteractionType(data.pending_interaction_type ?? null)
         setRuntimeDiagnostics(Array.isArray(data.runtime_diagnostics) ? data.runtime_diagnostics : [])
@@ -1410,10 +1960,12 @@ function JobCard({
         setConfirmationPhase(data.confirmation_phase ?? null)
         setConfirmationPlan(Array.isArray(data.confirmation_plan) ? data.confirmation_plan : [])
         setExecutionPlanSummary(data.execution_plan_summary ?? null)
+        setExecutionDecisionSource(data.execution_decision_source ?? null)
         setExecutionConfirmationOverview(data.execution_confirmation_overview ?? null)
         setExecutionIrReview(Array.isArray(data.execution_ir_review) ? data.execution_ir_review : [])
         setExecutionPlanDelta(data.execution_plan_delta ?? null)
         setExecutionPlanChanges(Array.isArray(data.execution_plan_changes) ? data.execution_plan_changes : [])
+        setExecutionSemanticGuardrails(data.execution_semantic_guardrails ?? null)
       })
       .catch(() => {
         setBindingSteps([])
@@ -1430,10 +1982,12 @@ function JobCard({
         setConfirmationPhase(null)
         setConfirmationPlan([])
         setExecutionPlanSummary(null)
+        setExecutionDecisionSource(null)
         setExecutionConfirmationOverview(null)
         setExecutionIrReview([])
         setExecutionPlanDelta(null)
         setExecutionPlanChanges([])
+        setExecutionSemanticGuardrails(null)
       })
       .finally(() => setBindingsLoading(false))
   }, [job.id, job.error_message, job.status, job.pending_interaction_type, detailRefreshNonce, onJobStateSync])
@@ -1445,6 +1999,47 @@ function JobCard({
       onAutoExpandConsumed()
     }
   }, [autoExpand])
+
+  useEffect(() => {
+    if (!focusTarget) return
+    if (!logsOpen) {
+      setLogsOpen(true)
+      return
+    }
+    if (bindingsLoading) return
+
+    const targetSection = focusTarget.section
+    const targetRef = targetSection === 'confirmation_semantic_trace'
+      ? semanticTraceSectionRef
+      : memoryConflictSectionRef
+    const targetItemRefs = targetSection === 'confirmation_semantic_trace'
+      ? semanticTraceItemRefs
+      : memoryConflictItemRefs
+    const targetNode = (
+      (focusTarget.itemKey ? targetItemRefs.current[focusTarget.itemKey] : null)
+      ?? targetRef.current
+    )
+    if (!targetNode) return
+
+    targetNode.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    if (focusHighlightTimerRef.current !== null) {
+      window.clearTimeout(focusHighlightTimerRef.current)
+    }
+    setHighlightedFocusSection(targetSection)
+    setHighlightedFocusItemKey(focusTarget.itemKey ?? null)
+    focusHighlightTimerRef.current = window.setTimeout(() => {
+      setHighlightedFocusSection(null)
+      setHighlightedFocusItemKey(null)
+      focusHighlightTimerRef.current = null
+    }, 2500)
+    onFocusTargetConsumed()
+  }, [bindingsLoading, focusTarget, logsOpen, onFocusTargetConsumed])
+
+  useEffect(() => () => {
+    if (focusHighlightTimerRef.current !== null) {
+      window.clearTimeout(focusHighlightTimerRef.current)
+    }
+  }, [])
 
   // WS subscription when logs are expanded
   useEffect(() => {
@@ -1483,10 +2078,12 @@ function JobCard({
     setConfirmationPhase(null)
     setConfirmationPlan([])
     setExecutionPlanSummary(null)
+    setExecutionDecisionSource(null)
     setExecutionConfirmationOverview(null)
     setExecutionIrReview([])
     setExecutionPlanDelta(null)
     setExecutionPlanChanges([])
+    setExecutionSemanticGuardrails(null)
     if (!logsOpen) return
     loadBindings()
   }, [logsOpen, loadBindings])
@@ -1766,6 +2363,9 @@ function JobCard({
                 <div className="mb-4 rounded-lg border border-amber-500/20 bg-amber-500/8 p-3">
                   {(() => {
                     const confirmationLayers = buildConfirmationLayers(confirmationPhase, executionPlanSummary)
+                    const executionConfirmationCta = confirmationPhase === 'execution'
+                      ? buildExecutionConfirmationCta(executionDecisionSource, executionSemanticGuardrails, t)
+                      : null
                     const layerToneClass: Record<ConfirmationLayerItem['tone'], string> = {
                       ready: 'border-emerald-500/25 bg-emerald-500/10 text-emerald-200',
                       pending: 'border-amber-500/25 bg-amber-500/10 text-amber-100',
@@ -1788,6 +2388,11 @@ function JobCard({
                         {t('tasks_confirmation_summary')
                           .replace('{groups}', String(executionPlanSummary.group_count ?? 0))
                           .replace('{nodes}', String(executionPlanSummary.node_count ?? 0))}
+                      </span>
+                    )}
+                    {confirmationPhase === 'execution' && executionDecisionSource && (
+                      <span className="text-[11px] text-text-muted">
+                        {t('tasks_confirmation_decision_source')} {formatDecisionSource(executionDecisionSource, t)}
                       </span>
                     )}
                     <span className="text-[11px] text-text-muted">
@@ -1814,6 +2419,142 @@ function JobCard({
                         .replace('{unchanged}', String(executionPlanDelta.unchanged_group_count ?? 0))
                         .replace('{changed}', String(executionPlanDelta.changed_group_count ?? 0))
                         .replace('{added}', String(executionPlanDelta.added_group_count ?? 0))}
+                    </div>
+                  )}
+                  {confirmationPhase === 'execution' && executionSemanticGuardrails && (
+                    ((executionSemanticGuardrails.ambiguity_count ?? 0) > 0 || (executionSemanticGuardrails.memory_review_count ?? 0) > 0)
+                  ) && (
+                    <div className="mb-3 rounded-md border border-rose-500/20 bg-rose-500/8 px-3 py-3">
+                      <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-rose-200">
+                        {t('tasks_confirmation_semantic_guardrails')}
+                      </div>
+                      <div className="mb-3 flex flex-wrap gap-2">
+                        {(executionSemanticGuardrails.ambiguity_count ?? 0) > 0 && (
+                          <span className="rounded-full border border-amber-500/25 bg-amber-500/12 px-2 py-0.5 text-[10px] font-medium text-amber-200">
+                            {t('tasks_confirmation_guardrail_ambiguities').replace('{count}', String(executionSemanticGuardrails.ambiguity_count ?? 0))}
+                          </span>
+                        )}
+                        {(executionSemanticGuardrails.memory_review_count ?? 0) > 0 && (
+                          <span className="rounded-full border border-rose-500/25 bg-rose-500/12 px-2 py-0.5 text-[10px] font-medium text-rose-200">
+                            {t('tasks_confirmation_guardrail_memory_conflicts').replace('{count}', String(executionSemanticGuardrails.memory_review_count ?? 0))}
+                          </span>
+                        )}
+                      </div>
+                      {executionSemanticGuardrails.project_memory_summary && (
+                        <div className="mb-3 text-[11px] text-rose-100/85 break-words">
+                          {t('tasks_confirmation_guardrail_memory_summary')}{' '}
+                          {[
+                            t('tasks_confirmation_guardrail_memory_facts').replace('{count}', String(executionSemanticGuardrails.project_memory_summary.stable_fact_count ?? 0)),
+                            t('tasks_confirmation_guardrail_memory_patterns').replace('{count}', String(executionSemanticGuardrails.project_memory_summary.memory_pattern_count ?? 0)),
+                            t('tasks_confirmation_guardrail_memory_preferences').replace('{count}', String(executionSemanticGuardrails.project_memory_summary.memory_preference_count ?? 0)),
+                            t('tasks_confirmation_guardrail_memory_resources').replace('{count}', String(executionSemanticGuardrails.project_memory_summary.resource_link_count ?? 0)),
+                            t('tasks_confirmation_guardrail_memory_artifacts').replace('{count}', String(executionSemanticGuardrails.project_memory_summary.artifact_link_count ?? 0)),
+                            t('tasks_confirmation_guardrail_memory_runtime').replace('{count}', String(executionSemanticGuardrails.project_memory_summary.runtime_link_count ?? 0)),
+                          ].join(' · ')}
+                        </div>
+                      )}
+                      {(executionSemanticGuardrails.memory_binding_reviews ?? []).length > 0 && (
+                        <div
+                          ref={memoryConflictSectionRef}
+                          className={`mb-3 space-y-2 rounded-md px-1 py-1 ${
+                            highlightedFocusSection === 'confirmation_memory_conflict'
+                              ? 'ring-2 ring-rose-400/60'
+                              : ''
+                          }`}
+                        >
+                          <div className="text-[11px] font-semibold uppercase tracking-wide text-text-muted">
+                            {t('tasks_confirmation_guardrail_memory_conflicts').replace('{count}', String(executionSemanticGuardrails.memory_review_count ?? 0))}
+                          </div>
+                          {(executionSemanticGuardrails.memory_binding_reviews ?? []).map((item, index) => {
+                            const reviewItemKey = buildExecutionMemoryReviewItemKey(item, index)
+                            return (
+                              <div
+                                key={`${job.id}-memory-guardrail-${reviewItemKey}`}
+                                ref={(node) => {
+                                  if (node) memoryConflictItemRefs.current[reviewItemKey] = node
+                                  else delete memoryConflictItemRefs.current[reviewItemKey]
+                                }}
+                                data-focus-key={reviewItemKey}
+                                data-focus-active={highlightedFocusItemKey === reviewItemKey ? 'true' : 'false'}
+                                className={`rounded-md border border-rose-500/15 bg-surface-raised/80 p-2 ${
+                                  highlightedFocusItemKey === reviewItemKey ? 'ring-2 ring-rose-400/60' : ''
+                                }`}
+                              >
+                                <div className="text-xs font-medium text-text-primary">
+                                  {formatExecutionSemanticReviewTitle(item, t('chat_plan_step_fallback'))}
+                                </div>
+                                <div className="mt-1 text-[11px] text-text-muted break-words">
+                                  {item.description || ''}
+                                </div>
+                                <div className="mt-1 text-[11px] text-rose-100/90 break-words">
+                                  {[
+                                    item.slot_name
+                                      ? `${t('tasks_confirmation_guardrail_slot')} ${item.slot_name}`
+                                      : null,
+                                    item.candidate_path
+                                      ? `${t('tasks_confirmation_guardrail_candidate')} ${item.candidate_path}`
+                                      : null,
+                                    item.confirmed_path
+                                      ? `${t('tasks_confirmation_guardrail_confirmed')} ${item.confirmed_path}`
+                                      : null,
+                                  ].filter(Boolean).join(' · ')}
+                                </div>
+                              </div>
+                            )
+                          })}
+                        </div>
+                      )}
+                      {(executionSemanticGuardrails.ambiguity_reviews ?? []).length > 0 && (
+                        <div
+                          ref={semanticTraceSectionRef}
+                          className={`space-y-2 rounded-md px-1 py-1 ${
+                            highlightedFocusSection === 'confirmation_semantic_trace'
+                              ? 'ring-2 ring-amber-400/60'
+                              : ''
+                          }`}
+                        >
+                          <div className="text-[11px] font-semibold uppercase tracking-wide text-text-muted">
+                            {t('tasks_confirmation_guardrail_ambiguities').replace('{count}', String(executionSemanticGuardrails.ambiguity_count ?? 0))}
+                          </div>
+                          {(executionSemanticGuardrails.ambiguity_reviews ?? []).map((item, index) => {
+                            const reviewItemKey = buildExecutionAmbiguityReviewItemKey(item, index)
+                            return (
+                              <div
+                                key={`${job.id}-ambiguity-guardrail-${reviewItemKey}`}
+                                ref={(node) => {
+                                  if (node) semanticTraceItemRefs.current[reviewItemKey] = node
+                                  else delete semanticTraceItemRefs.current[reviewItemKey]
+                                }}
+                                data-focus-key={reviewItemKey}
+                                data-focus-active={highlightedFocusItemKey === reviewItemKey ? 'true' : 'false'}
+                                className={`rounded-md border border-amber-500/15 bg-surface-raised/80 p-2 ${
+                                  highlightedFocusItemKey === reviewItemKey ? 'ring-2 ring-amber-400/60' : ''
+                                }`}
+                              >
+                                <div className="text-xs font-medium text-text-primary">
+                                  {formatExecutionSemanticReviewTitle(item, t('chat_plan_step_fallback'))}
+                                </div>
+                                <div className="mt-1 text-[11px] text-text-muted break-words">
+                                  {item.description || ''}
+                                </div>
+                                <div className="mt-1 text-[11px] text-amber-100/90 break-words">
+                                  {[
+                                    item.slot_name
+                                      ? `${t('tasks_confirmation_guardrail_slot')} ${item.slot_name}`
+                                      : null,
+                                    item.primary_path
+                                      ? `${t('tasks_confirmation_guardrail_primary')} ${item.primary_path}`
+                                      : null,
+                                    item.secondary_path
+                                      ? `${t('tasks_confirmation_guardrail_secondary')} ${item.secondary_path}`
+                                      : null,
+                                  ].filter(Boolean).join(' · ')}
+                                </div>
+                              </div>
+                            )
+                          })}
+                        </div>
+                      )}
                     </div>
                   )}
                   {confirmationPhase === 'execution' && executionIrReview.length > 0 && (
@@ -1863,8 +2604,32 @@ function JobCard({
                     </div>
                   </div>
                   <div className="text-xs text-amber-100 whitespace-pre-wrap mb-3">
-                    {pendingInteraction?.prompt_text || t('tasks_confirmation_waiting')}
+                    {getPendingInteractionPrompt(pendingInteraction, t('tasks_confirmation_waiting'))}
                   </div>
+                  {executionConfirmationCta && (
+                    <div className={`mb-3 rounded-md border px-3 py-3 ${executionConfirmationCta.panelClassName}`}>
+                      <div className={`text-[11px] font-semibold uppercase tracking-wide ${executionConfirmationCta.eyebrowClassName}`}>
+                        {t('tasks_confirmation_next_move')}
+                      </div>
+                      <div className="mt-1 text-sm font-medium text-text-primary">
+                        {executionConfirmationCta.title}
+                      </div>
+                      <div className="mt-1 text-[11px] text-text-muted">
+                        {executionConfirmationCta.detail}
+                      </div>
+                      {job.thread_id && onOpenThread && (
+                        <div className="mt-3">
+                          <button
+                            type="button"
+                            onClick={() => onOpenThread(job.thread_id ?? null, job.id)}
+                            className="rounded-lg border border-current/25 px-3 py-1.5 text-xs text-text-primary transition-colors hover:bg-black/5 dark:hover:bg-white/5"
+                          >
+                            {executionConfirmationCta.actionLabel}
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  )}
                   {confirmationPhase === 'execution' && executionPlanChanges.length > 0 && (
                     <div className="space-y-2 mb-3">
                       <div className="text-[11px] font-semibold uppercase tracking-wide text-text-muted">
@@ -1943,7 +2708,9 @@ function JobCard({
                   )}
                   <div className="flex flex-wrap items-center gap-2">
                     <div className="text-xs text-text-muted">
-                      {t('tasks_confirmation_open_chat')}
+                      {confirmationPhase === 'execution' && executionConfirmationCta
+                        ? t('tasks_confirmation_open_chat_execution')
+                        : t('tasks_confirmation_open_chat')}
                     </div>
                     {job.thread_id && onOpenThread && (
                       <button
@@ -1951,7 +2718,9 @@ function JobCard({
                         onClick={() => onOpenThread(job.thread_id ?? null, job.id)}
                         className="rounded-lg border border-amber-500/25 px-3 py-1.5 text-xs text-amber-100 transition-colors hover:bg-amber-500/10"
                       >
-                        {t('tasks_supervisor_open_chat')}
+                        {confirmationPhase === 'execution' && executionConfirmationCta
+                          ? t('tasks_confirmation_open_chat_fallback')
+                          : t('tasks_supervisor_open_chat')}
                       </button>
                     )}
                   </div>
@@ -1985,6 +2754,21 @@ function JobCard({
                     onRetryOriginal={() => resolveRepair('retry_original')}
                     onCancelJob={() => resolveRepair('cancel_job')}
                     repairActionLoading={repairActionLoading}
+                  />
+                </div>
+              )}
+              {pendingInteractionType === 'resource_clarification' && clarificationRequest && (
+                <div className="mb-4">
+                  <ResourceClarificationPromptCard
+                    title={t('tasks_pending_clarifications_heading')}
+                    prompt={getPendingInteractionPrompt(pendingInteraction)}
+                    clarificationRequest={clarificationRequest}
+                    onOpenChat={
+                      job.thread_id && onOpenThread
+                        ? () => onOpenThread(job.thread_id ?? null, job.id)
+                        : undefined
+                    }
+                    openChatLabel={t('tasks_pending_clarifications_open_chat')}
                   />
                 </div>
               )}
@@ -2106,6 +2890,7 @@ export default function TaskMonitor({
   const [supervisorLoading, setSupervisorLoading] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState<{ jobId: string; jobName: string; outputDir?: string | null } | null>(null)
   const [autoExpandId, setAutoExpandId] = useState<string | null>(null)
+  const [jobFocusRequest, setJobFocusRequest] = useState<{ jobId: string; target: JobFocusTarget } | null>(null)
   const [page, setPage] = useState(1)
   const [jobsLoading, setJobsLoading] = useState(false)
   const [detailRefreshNonce, setDetailRefreshNonce] = useState(0)
@@ -2114,6 +2899,8 @@ export default function TaskMonitor({
   const [authorizationActionLoading, setAuthorizationActionLoading] = useState<Record<string, string | null>>({})
   const [repairSnapshots, setRepairSnapshots] = useState<Record<string, PendingInteractionPayload>>({})
   const [repairSnapshotLoading, setRepairSnapshotLoading] = useState<Record<string, boolean>>({})
+  const [confirmationSnapshots, setConfirmationSnapshots] = useState<Record<string, ConfirmationSnapshot>>({})
+  const [confirmationSnapshotLoading, setConfirmationSnapshotLoading] = useState<Record<string, boolean>>({})
   const [repairActionLoadingByJob, setRepairActionLoadingByJob] = useState<Record<string, string | null>>({})
   const [repairDrafts, setRepairDrafts] = useState<Record<string, string>>({})
   const listRef = useRef<HTMLDivElement>(null)
@@ -2170,6 +2957,33 @@ export default function TaskMonitor({
     })),
     [attentionNeedsReview, incidentsByKey, knownJobsById],
   )
+  const confirmationSnapshotJobIds = useMemo(() => {
+    const jobIds = new Set<string>()
+
+    pendingOperatorEntries.forEach(({ item, incident }) => {
+      const needsExecutionConfirmationSnapshot = item.reason === 'confirmation'
+        || incident?.next_action === 'confirm_or_edit_execution'
+        || (
+          item.reason === 'rollback_review'
+          && item.rollback_level !== 'abstract_plan'
+          && item.rollback_level !== 'execution_ir'
+        )
+      if (needsExecutionConfirmationSnapshot) {
+        jobIds.add(item.job_id)
+      }
+    })
+
+    reviewEntries.forEach(({ item, incident }) => {
+      if (
+        item.incident_type === 'execution_confirmation'
+        || incident?.next_action === 'confirm_or_edit_execution'
+      ) {
+        jobIds.add(item.job_id)
+      }
+    })
+
+    return Array.from(jobIds)
+  }, [pendingOperatorEntries, reviewEntries])
   const autoAuthorizeCommands = attentionSummary?.auto_authorize_commands ?? false
   const attentionCounts = attentionSummary?.counts ?? {
     running: 0,
@@ -2377,6 +3191,51 @@ export default function TaskMonitor({
     })
   }, [loadRepairSnapshot, pendingRepairEntries, repairSnapshotLoading, repairSnapshots])
 
+  const loadConfirmationSnapshot = useCallback((jobId: string) => {
+    setConfirmationSnapshotLoading((prev) => ({ ...prev, [jobId]: true }))
+    return fetch(`/api/jobs/${jobId}/bindings?detailed=1`)
+      .then((r) => r.json())
+      .then((data: JobBindingResponse) => {
+        const confirmationPhase = data.confirmation_phase ?? null
+        const isConfirmationPayload = data.pending_interaction_type === 'plan_confirmation'
+          || data.pending_interaction_type === 'execution_confirmation'
+          || confirmationPhase === 'execution'
+          || confirmationPhase === 'abstract'
+
+        if (isConfirmationPayload) {
+          setConfirmationSnapshots((prev) => ({
+            ...prev,
+            [jobId]: {
+              confirmationPhase,
+              executionDecisionSource: data.execution_decision_source ?? null,
+              executionSemanticGuardrails: data.execution_semantic_guardrails ?? null,
+            },
+          }))
+        } else {
+          setConfirmationSnapshots((prev) => ({
+            ...prev,
+            [jobId]: {
+              confirmationPhase: null,
+              executionDecisionSource: null,
+              executionSemanticGuardrails: null,
+            },
+          }))
+        }
+      })
+      .catch(() => {})
+      .finally(() => {
+        setConfirmationSnapshotLoading((prev) => ({ ...prev, [jobId]: false }))
+      })
+  }, [])
+
+  useEffect(() => {
+    confirmationSnapshotJobIds.forEach((jobId) => {
+      if (!confirmationSnapshots[jobId] && !confirmationSnapshotLoading[jobId]) {
+        void loadConfirmationSnapshot(jobId)
+      }
+    })
+  }, [confirmationSnapshotJobIds, confirmationSnapshotLoading, confirmationSnapshots, loadConfirmationSnapshot])
+
   const resolveAuthorizationFromQueue = useCallback((jobId: string, authRequestId: string, action: 'approved' | 'rejected') => {
     setAuthorizationActionLoading((prev) => ({ ...prev, [jobId]: action }))
     return fetch(`/api/jobs/${jobId}/authorization-requests/${authRequestId}/resolve`, {
@@ -2476,18 +3335,20 @@ export default function TaskMonitor({
       .catch(() => {})
   }
 
-  const focusJob = (jobId: string) => {
+  const focusJob = (jobId: string, target: JobFocusTarget = null) => {
     locateJobPage(jobId)
       .then((targetPage) => {
         const nextPage = targetPage ?? 1
         setPage(nextPage)
         return loadJobsPage(nextPage, { force: true }).then(() => {
           setAutoExpandId(jobId)
+          setJobFocusRequest(target ? { jobId, target } : null)
           listRef.current?.scrollTo({ top: 0, behavior: 'smooth' })
         })
       })
       .catch(() => {
         setAutoExpandId(jobId)
+        setJobFocusRequest(target ? { jobId, target } : null)
       })
   }
 
@@ -2582,11 +3443,14 @@ export default function TaskMonitor({
             <div className="mt-3 space-y-3">
               {pendingOperatorEntries.map(({ item, job, incident }) => (
                 (() => {
+                  const confirmationSnapshot = confirmationSnapshots[item.job_id]
                   const chatActionCode = resolveOperatorChatActionCode({
                     reason: item.reason,
                     rollbackLevel: item.rollback_level,
                     nextAction: incident?.next_action ?? item.next_action,
+                    executionDecisionSource: confirmationSnapshot?.executionDecisionSource,
                   })
+                  const focusTarget = focusTargetForOperatorAction(chatActionCode, confirmationSnapshot)
                   const chatHint = formatOperatorChatActionHint(chatActionCode, t)
                   return (
                     <div
@@ -2640,6 +3504,11 @@ export default function TaskMonitor({
                           {t(`tasks_incident_action_${incident.next_action}` as TranslationKey)}
                         </div>
                       )}
+                      {confirmationSnapshot?.executionDecisionSource && (
+                        <div className="mt-1 text-[11px] text-text-muted">
+                          {t('tasks_confirmation_decision_source')} {formatDecisionSource(confirmationSnapshot.executionDecisionSource, t)}
+                        </div>
+                      )}
                       {chatHint && (
                         <div className="mt-1 text-[11px] text-violet-100/90">
                           {chatHint}
@@ -2653,10 +3522,16 @@ export default function TaskMonitor({
                         >
                           {t('tasks_supervisor_open_task')}
                         </button>
-                        {(job?.thread_id || item.thread_id || incident?.thread_id) && onOpenThread && (
+                        {(focusTarget || ((job?.thread_id || item.thread_id || incident?.thread_id) && onOpenThread)) && (
                           <button
                             type="button"
-                            onClick={() => onOpenThread((job?.thread_id ?? item.thread_id ?? incident?.thread_id) || null, item.job_id)}
+                            onClick={() => {
+                              if (focusTarget) {
+                                focusJob(item.job_id, focusTarget)
+                                return
+                              }
+                              onOpenThread?.((job?.thread_id ?? item.thread_id ?? incident?.thread_id) || null, item.job_id)
+                            }}
                             className="rounded-lg border border-violet-500/25 px-3 py-1.5 text-xs text-violet-100 transition-colors hover:bg-violet-500/10"
                           >
                             {formatOperatorChatActionCta(chatActionCode, t)}
@@ -2873,6 +3748,15 @@ export default function TaskMonitor({
             {reviewEntries.length > 0 && (
               <div className="mt-3 space-y-2">
                 {reviewEntries.slice(0, 5).map(({ item, job, incident }) => {
+                  const confirmationSnapshot = confirmationSnapshots[item.job_id]
+                  const chatActionCode = resolveOperatorChatActionCode({
+                    reason: item.incident_type === 'execution_confirmation' ? 'confirmation' : null,
+                    rollbackLevel: null,
+                    nextAction: incident?.next_action ?? item.next_action,
+                    executionDecisionSource: confirmationSnapshot?.executionDecisionSource,
+                  })
+                  const focusTarget = focusTargetForOperatorAction(chatActionCode, confirmationSnapshot)
+                  const chatHint = formatOperatorChatActionHint(chatActionCode, t)
                   const ageMinutes = item.age_seconds != null ? Math.max(1, Math.floor(item.age_seconds / 60)) : null
                   const severityClass = item.severity === 'critical'
                     ? 'border-red-500/20 bg-red-500/8'
@@ -2910,6 +3794,40 @@ export default function TaskMonitor({
                           {t(`tasks_incident_action_${incident.next_action}` as TranslationKey)}
                         </div>
                       )}
+                      {confirmationSnapshot?.executionDecisionSource && (
+                        <div className="mt-1 text-[11px] text-text-muted">
+                          {t('tasks_confirmation_decision_source')} {formatDecisionSource(confirmationSnapshot.executionDecisionSource, t)}
+                        </div>
+                      )}
+                      {chatHint && (
+                        <div className="mt-1 text-[11px] text-sky-100/90">
+                          {chatHint}
+                        </div>
+                      )}
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        <button
+                          type="button"
+                          onClick={() => focusJob(item.job_id)}
+                          className="rounded-lg border border-border-subtle px-3 py-1.5 text-xs text-text-primary transition-colors hover:bg-surface-hover"
+                        >
+                          {t('tasks_supervisor_open_task')}
+                        </button>
+                        {(focusTarget || ((job?.thread_id || item.thread_id || incident?.thread_id) && onOpenThread)) && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (focusTarget) {
+                                focusJob(item.job_id, focusTarget)
+                                return
+                              }
+                              onOpenThread?.((job?.thread_id ?? item.thread_id ?? incident?.thread_id) || null, item.job_id)
+                            }}
+                            className="rounded-lg border border-amber-500/25 px-3 py-1.5 text-xs text-amber-100 transition-colors hover:bg-amber-500/10"
+                          >
+                            {formatOperatorChatActionCta(chatActionCode, t)}
+                          </button>
+                        )}
+                      </div>
                     </div>
                   )
                 })}
@@ -2938,6 +3856,9 @@ export default function TaskMonitor({
                       supervisorReview.focus_summary.primary_lane
                         ? `lane=${formatPrimaryLane(supervisorReview.focus_summary.primary_lane, t)}`
                         : null,
+                      supervisorReview.focus_summary.decision_source
+                        ? `source=${formatDecisionSource(supervisorReview.focus_summary.decision_source, t)}`
+                        : null,
                       supervisorReview.focus_summary.top_owner
                         ? `owner=${formatFocusOwner(supervisorReview.focus_summary.top_owner, t)}`
                         : null,
@@ -2956,6 +3877,18 @@ export default function TaskMonitor({
                       typeof supervisorReview.focus_summary.user_wait_total === 'number'
                         ? `user_wait=${supervisorReview.focus_summary.user_wait_total}`
                         : null,
+                      typeof supervisorReview.focus_summary.project_memory_resource_link_count === 'number'
+                        && supervisorReview.focus_summary.project_memory_resource_link_count > 0
+                        ? `memory_resources=${supervisorReview.focus_summary.project_memory_resource_link_count}`
+                        : null,
+                      typeof supervisorReview.focus_summary.project_memory_artifact_link_count === 'number'
+                        && supervisorReview.focus_summary.project_memory_artifact_link_count > 0
+                        ? `memory_artifacts=${supervisorReview.focus_summary.project_memory_artifact_link_count}`
+                        : null,
+                      typeof supervisorReview.focus_summary.project_memory_runtime_link_count === 'number'
+                        && supervisorReview.focus_summary.project_memory_runtime_link_count > 0
+                        ? `memory_runtime=${supervisorReview.focus_summary.project_memory_runtime_link_count}`
+                        : null,
                       supervisorReview.focus_summary.top_failure_layer
                         ? `layer=${formatFailureLayer(supervisorReview.focus_summary.top_failure_layer, t)}`
                         : null,
@@ -2973,17 +3906,25 @@ export default function TaskMonitor({
                         ? `history_align=${formatHistoricalAlignment(supervisorReview.focus_summary.top_historical_rollback_alignment, t)}`
                         : null,
                       supervisorReview.focus_summary.top_rollback_target
-                        ? `target=${formatRollbackTarget(supervisorReview.focus_summary.top_rollback_target)}`
+                        ? `target=${formatRollbackTarget(supervisorReview.focus_summary.top_rollback_target, t)}`
+                        : null,
+                      supervisorReview.focus_summary.top_rollback_target === 'execution_artifact_review'
+                        && supervisorReview.focus_summary.top_execution_artifact_review_subtype
+                        ? `artifact_review=${formatExecutionArtifactReviewSubtype(supervisorReview.focus_summary.top_execution_artifact_review_subtype, t)}`
                         : null,
                       supervisorReview.focus_summary.top_historical_rollback_target
-                        ? `history_target=${formatRollbackTarget(supervisorReview.focus_summary.top_historical_rollback_target)}`
+                        ? `history_target=${formatRollbackTarget(supervisorReview.focus_summary.top_historical_rollback_target, t)}`
                         : null,
                       supervisorReview.focus_summary.top_historical_rollback_target_alignment !== undefined
                         && supervisorReview.focus_summary.top_historical_rollback_target_alignment !== null
                         ? `target_align=${formatHistoricalAlignment(supervisorReview.focus_summary.top_historical_rollback_target_alignment, t)}`
                         : null,
                       supervisorReview.focus_summary.next_best_operator_move
-                        ? `next=${formatNextBestMove(supervisorReview.focus_summary.next_best_operator_move, t)}`
+                        ? `next=${formatNextBestMove(
+                          supervisorReview.focus_summary.next_best_operator_move,
+                          supervisorReview.focus_summary.decision_source,
+                          t,
+                        )}`
                         : null,
                     ].filter(Boolean).join(' · ')}
                     {focusSummaryAutoRecovery && (
@@ -3004,6 +3945,40 @@ export default function TaskMonitor({
                         </>
                       )
                     })()}
+                  </div>
+                )}
+                {supervisorReview.project_memory_profile && (supervisorReview.project_memory_profile.episode_count ?? 0) > 0 && (
+                  <div className="mt-3 rounded-md border border-border-subtle/70 bg-surface-base/40 px-3 py-2">
+                    <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-text-muted">
+                      {t('tasks_supervisor_project_memory')}
+                    </div>
+                    <div className="text-[11px] text-text-muted">
+                      {[
+                        `${t('tasks_supervisor_project_memory_episodes')} ${supervisorReview.project_memory_profile.episode_count ?? 0}`,
+                        `${t('tasks_supervisor_project_memory_user_validated')} ${supervisorReview.project_memory_profile.user_validated_episode_count ?? 0}`,
+                        supervisorReview.project_memory_profile.preferences?.preferred_safe_action
+                          ? `${t('tasks_supervisor_project_memory_preferred_action')} ${formatSafeActionLabel(supervisorReview.project_memory_profile.preferences.preferred_safe_action, t)}`
+                          : null,
+                        supervisorReview.project_memory_profile.preferences?.preferred_rollback_level
+                          ? `${t('tasks_supervisor_project_memory_preferred_rollback')} ${formatRollbackLevel(supervisorReview.project_memory_profile.preferences.preferred_rollback_level, t)}`
+                          : null,
+                        supervisorReview.project_memory_profile.preferences?.preferred_analysis_family
+                          ? `${t('tasks_supervisor_project_memory_preferred_family')} ${supervisorReview.project_memory_profile.preferences.preferred_analysis_family}`
+                          : null,
+                      ].filter(Boolean).join(' · ')}
+                    </div>
+                    {(supervisorReview.project_memory_profile.safe_action_patterns?.length || 0) > 0 && (
+                      <div className="mt-2 space-y-1">
+                        {supervisorReview.project_memory_profile.safe_action_patterns?.slice(0, 2).map((pattern, index) => (
+                          <div key={`project-memory-action-${pattern.safe_action || 'unknown'}-${index}`} className="text-[11px] text-text-muted">
+                            {index + 1}. {formatSafeActionLabel(pattern.safe_action || undefined, t)} · {t('tasks_supervisor_project_memory_support')} {pattern.support_count ?? 0}
+                            {typeof pattern.user_validated_count === 'number' && (
+                              <> · {t('tasks_supervisor_project_memory_user_validated')} {pattern.user_validated_count}</>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    )}
                   </div>
                 )}
                 {supervisorReview.project_playbook?.step_codes && supervisorReview.project_playbook.step_codes.length > 0 && (
@@ -3055,7 +4030,14 @@ export default function TaskMonitor({
                                 ? `${t('tasks_supervisor_project_goal')} ${formatPrimaryLane(supervisorReview.project_playbook.goal, t)}`
                                 : null,
                               supervisorReview.project_playbook.next_move
-                                ? `${t('tasks_supervisor_project_next_move')} ${formatNextBestMove(supervisorReview.project_playbook.next_move, t)}`
+                                ? `${t('tasks_supervisor_project_next_move')} ${formatNextBestMove(
+                                  supervisorReview.project_playbook.next_move,
+                                  supervisorReview.project_playbook.decision_source ?? supervisorReview.focus_summary?.decision_source,
+                                  t,
+                                )}`
+                                : null,
+                              supervisorReview.project_playbook.decision_source
+                                ? `${t('tasks_supervisor_project_source')} ${formatDecisionSource(supervisorReview.project_playbook.decision_source, t)}`
                                 : null,
                             ].filter(Boolean).join(' · ')}
                           </div>
@@ -3063,7 +4045,11 @@ export default function TaskMonitor({
                         <div className="space-y-1">
                           {supervisorReview.project_playbook.step_codes.map((stepCode, index) => (
                             <div key={`project-playbook-${stepCode}-${index}`} className="text-[11px] text-text-muted">
-                              {index + 1}. {formatSupervisorPlaybookStep(stepCode, t)}
+                              {index + 1}. {formatSupervisorPlaybookStep(
+                                stepCode,
+                                supervisorReview.project_playbook?.decision_source ?? supervisorReview.focus_summary?.decision_source,
+                                t,
+                              )}
                             </div>
                           ))}
                         </div>
@@ -3213,7 +4199,7 @@ export default function TaskMonitor({
                             {topWorkspaceRequest && (
                               <button
                                 type="button"
-                                onClick={() => onOpenResourceWorkspace(topWorkspaceRequest)}
+                                onClick={() => onOpenResourceWorkspace?.(topWorkspaceRequest)}
                                 className="rounded-lg border border-emerald-500/25 px-3 py-1.5 text-xs text-emerald-200 transition-colors hover:bg-emerald-500/10"
                               >
                                 {topDominantBlocker.workspace_section === 'files'
@@ -3226,7 +4212,7 @@ export default function TaskMonitor({
                             {topRegistryRequest && topDominantBlocker.workspace_section !== 'registry' && (
                               <button
                                 type="button"
-                                onClick={() => onOpenResourceWorkspace(topRegistryRequest)}
+                                onClick={() => onOpenResourceWorkspace?.(topRegistryRequest)}
                                 className="rounded-lg border border-sky-500/25 px-3 py-1.5 text-xs text-sky-200 transition-colors hover:bg-sky-500/10"
                                 >
                                   {t('tasks_supervisor_open_resource_registry')}
@@ -3275,8 +4261,13 @@ export default function TaskMonitor({
                               {rec.priority}. {rec.job_name}
                             </span>
                             <span className="rounded-full bg-surface-overlay px-2 py-0.5 text-[10px] text-text-muted">
-                              {rec.rollback_target}
+                              {formatRollbackTarget(rec.rollback_target, t)}
                             </span>
+                            {rec.rollback_target === 'execution_artifact_review' && rec.execution_artifact_review_subtype && (
+                              <span className="rounded-full bg-amber-500/10 px-2 py-0.5 text-[10px] text-amber-200">
+                                {formatExecutionArtifactReviewSubtype(rec.execution_artifact_review_subtype, t)}
+                              </span>
+                            )}
                             {rec.recommended_action_confidence && (
                               <span className={`rounded-full px-2 py-0.5 text-[10px] ${recommendationConfidenceBadgeClass(rec.recommended_action_confidence)}`}>
                                 {formatRecommendationConfidence(rec.recommended_action_confidence, t)}
@@ -3326,6 +4317,11 @@ export default function TaskMonitor({
                               )}
                             </div>
                           )}
+                          {rec.decision_source && (
+                            <div className="mt-1 text-[11px] text-text-muted">
+                              {t('tasks_supervisor_decision_source')} {formatDecisionSource(rec.decision_source, t)}
+                            </div>
+                          )}
                           {rec.safe_action_note && (
                             <div className="mt-1 text-[11px] text-text-muted">
                               {t('tasks_supervisor_safe_action_note')} {rec.safe_action_note}
@@ -3371,10 +4367,10 @@ export default function TaskMonitor({
                                   ? `${t('tasks_supervisor_historical_policy_rollback_alignment')}=${formatHistoricalAlignment(rec.historical_policy.rollback_level_aligns_with_current, t)}`
                                   : null,
                                 rec.historical_policy.preferred_rollback_target
-                                  ? `${t('tasks_supervisor_historical_policy_target')}=${formatRollbackTarget(rec.historical_policy.preferred_rollback_target)}`
+                                  ? `${t('tasks_supervisor_historical_policy_target')}=${formatRollbackTarget(rec.historical_policy.preferred_rollback_target, t)}`
                                   : null,
                                 rec.historical_policy.current_rollback_target
-                                  ? `${t('tasks_supervisor_historical_policy_current_target')}=${formatRollbackTarget(rec.historical_policy.current_rollback_target)}`
+                                  ? `${t('tasks_supervisor_historical_policy_current_target')}=${formatRollbackTarget(rec.historical_policy.current_rollback_target, t)}`
                                   : null,
                                 typeof rec.historical_policy.rollback_target_supported_count === 'number'
                                   ? `${t('tasks_supervisor_historical_policy_target_support')}=${rec.historical_policy.rollback_target_supported_count}`
@@ -3387,7 +4383,7 @@ export default function TaskMonitor({
                             </div>
                           )}
                           <div className="mt-1 text-[11px] text-text-muted">
-                            {t('tasks_supervisor_next_action')} {formatSupervisorAction(rec.immediate_action, t)}
+                            {t('tasks_supervisor_next_action')} {formatSupervisorAction(rec.immediate_action, rec.decision_source, t)}
                           </div>
                           <div className="mt-1 text-[11px] text-text-muted">
                             {t('tasks_supervisor_why_now')} {rec.why_now}
@@ -3400,7 +4396,7 @@ export default function TaskMonitor({
                               <div className="space-y-1">
                                 {rec.recovery_playbook.step_codes.map((stepCode, index) => (
                                   <div key={`${rec.job_id}-playbook-${stepCode}-${index}`} className="text-[11px] text-text-muted">
-                                    {index + 1}. {formatSupervisorPlaybookStep(stepCode, t)}
+                                    {index + 1}. {formatSupervisorPlaybookStep(stepCode, rec.decision_source, t)}
                                   </div>
                                 ))}
                               </div>
@@ -3503,7 +4499,7 @@ export default function TaskMonitor({
                                 dominantBlocker.label || dominantBlocker.kind || dominantBlocker.id,
                                 dominantBlocker.cause ? `cause=${formatFocusCause(dominantBlocker.cause, t)}` : null,
                                 dominantBlocker.recommended_action
-                                  ? `next=${formatNextBestMove(dominantBlocker.recommended_action, t)}`
+                                  ? `next=${formatNextBestMove(dominantBlocker.recommended_action, null, t)}`
                                   : null,
                               ].filter(Boolean).join(' · ')}
                               {dominantBlocker.why_blocked ? ` · ${dominantBlocker.why_blocked}` : ''}
@@ -3623,6 +4619,96 @@ export default function TaskMonitor({
                                 `aggregate=${dossier.execution_plan_changes.filter((item) => (item.change_kinds ?? []).includes('aggregate')).length}`,
                                 `auto_injected=${dossier.execution_plan_changes.filter((item) => (item.change_kinds ?? []).includes('auto_injected')).length}`,
                               ].join(' · ')}
+                            </div>
+                          )}
+                          {dossier?.execution_semantic_guardrails && (
+                            ((dossier.execution_semantic_guardrails.ambiguity_count ?? 0) > 0 || (dossier.execution_semantic_guardrails.memory_review_count ?? 0) > 0)
+                          ) && (
+                            <div className="mt-1 text-[11px] text-text-muted">
+                              {t('tasks_supervisor_execution_guardrails')}{' '}
+                              {[
+                                dossier.execution_decision_source
+                                  ? `${t('tasks_confirmation_decision_source')} ${formatDecisionSource(dossier.execution_decision_source, t)}`
+                                  : null,
+                                (dossier.execution_semantic_guardrails.memory_review_count ?? 0) > 0
+                                  ? t('tasks_confirmation_guardrail_memory_conflicts').replace('{count}', String(dossier.execution_semantic_guardrails.memory_review_count ?? 0))
+                                  : null,
+                                (dossier.execution_semantic_guardrails.ambiguity_count ?? 0) > 0
+                                  ? t('tasks_confirmation_guardrail_ambiguities').replace('{count}', String(dossier.execution_semantic_guardrails.ambiguity_count ?? 0))
+                                  : null,
+                              ].filter(Boolean).join(' · ')}
+                            </div>
+                          )}
+                          {dossier?.execution_semantic_guardrails?.memory_binding_reviews && dossier.execution_semantic_guardrails.memory_binding_reviews.length > 0 && (
+                            <div className="mt-1 text-[11px] text-text-muted">
+                              {t('tasks_supervisor_project_memory')}{' '}
+                              {dossier.execution_semantic_guardrails.memory_binding_reviews
+                                .slice(0, 2)
+                                .map((item) => item.description || formatExecutionSemanticReviewTitle(item, t('chat_plan_step_fallback')))
+                                .filter(Boolean)
+                                .join(' · ')}
+                            </div>
+                          )}
+                          {dossier?.execution_semantic_guardrails?.ambiguity_reviews && dossier.execution_semantic_guardrails.ambiguity_reviews.length > 0 && (
+                            <div className="mt-1 text-[11px] text-text-muted">
+                              {t('tasks_supervisor_resource_focus')}{' '}
+                              {dossier.execution_semantic_guardrails.ambiguity_reviews
+                                .slice(0, 2)
+                                .map((item) => item.description || formatExecutionSemanticReviewTitle(item, t('chat_plan_step_fallback')))
+                                .filter(Boolean)
+                                .join(' · ')}
+                            </div>
+                          )}
+                          {dossier?.execution_semantic_guardrails?.project_memory_summary && (
+                            <div className="mt-1 text-[11px] text-text-muted">
+                              {t('tasks_confirmation_guardrail_memory_summary')}{' '}
+                              {[
+                                t('tasks_confirmation_guardrail_memory_facts').replace('{count}', String(dossier.execution_semantic_guardrails.project_memory_summary.stable_fact_count ?? 0)),
+                                t('tasks_confirmation_guardrail_memory_patterns').replace('{count}', String(dossier.execution_semantic_guardrails.project_memory_summary.memory_pattern_count ?? 0)),
+                                t('tasks_confirmation_guardrail_memory_preferences').replace('{count}', String(dossier.execution_semantic_guardrails.project_memory_summary.memory_preference_count ?? 0)),
+                                t('tasks_confirmation_guardrail_memory_resources').replace('{count}', String(dossier.execution_semantic_guardrails.project_memory_summary.resource_link_count ?? 0)),
+                                t('tasks_confirmation_guardrail_memory_artifacts').replace('{count}', String(dossier.execution_semantic_guardrails.project_memory_summary.artifact_link_count ?? 0)),
+                                t('tasks_confirmation_guardrail_memory_runtime').replace('{count}', String(dossier.execution_semantic_guardrails.project_memory_summary.runtime_link_count ?? 0)),
+                              ].join(' · ')}
+                            </div>
+                          )}
+                          {dossier?.semantic_memory_dossier?.resource_link_count && (
+                            <div className="mt-1 text-[11px] text-text-muted">
+                              {t('tasks_supervisor_memory_resources')}{' '}
+                              {[
+                                t('tasks_supervisor_memory_link_count').replace('{count}', String(dossier.semantic_memory_dossier.resource_link_count ?? 0)),
+                                (dossier.semantic_memory_dossier.resource_links ?? [])
+                                  .slice(0, 2)
+                                  .map((item) => formatSemanticMemoryLinkItem(item))
+                                  .filter(Boolean)
+                                  .join(' · '),
+                              ].filter(Boolean).join(' · ')}
+                            </div>
+                          )}
+                          {dossier?.semantic_memory_dossier?.artifact_link_count && (
+                            <div className="mt-1 text-[11px] text-text-muted">
+                              {t('tasks_supervisor_memory_artifacts')}{' '}
+                              {[
+                                t('tasks_supervisor_memory_link_count').replace('{count}', String(dossier.semantic_memory_dossier.artifact_link_count ?? 0)),
+                                (dossier.semantic_memory_dossier.artifact_links ?? [])
+                                  .slice(0, 2)
+                                  .map((item) => formatSemanticMemoryLinkItem(item))
+                                  .filter(Boolean)
+                                  .join(' · '),
+                              ].filter(Boolean).join(' · ')}
+                            </div>
+                          )}
+                          {dossier?.semantic_memory_dossier?.runtime_link_count && (
+                            <div className="mt-1 text-[11px] text-text-muted">
+                              {t('tasks_supervisor_memory_runtime')}{' '}
+                              {[
+                                t('tasks_supervisor_memory_link_count').replace('{count}', String(dossier.semantic_memory_dossier.runtime_link_count ?? 0)),
+                                (dossier.semantic_memory_dossier.runtime_links ?? [])
+                                  .slice(0, 2)
+                                  .map((item) => formatSemanticMemoryLinkItem(item))
+                                  .filter(Boolean)
+                                  .join(' · '),
+                              ].filter(Boolean).join(' · ')}
                             </div>
                           )}
                           {latestAutoRecovery && (
@@ -3754,8 +4840,10 @@ export default function TaskMonitor({
               key={job.id}
               job={job}
               autoExpand={autoExpandId === job.id}
+              focusTarget={jobFocusRequest?.jobId === job.id ? jobFocusRequest.target : null}
               detailRefreshNonce={detailRefreshNonce}
               onAutoExpandConsumed={() => setAutoExpandId(null)}
+              onFocusTargetConsumed={() => setJobFocusRequest((prev) => (prev?.jobId === job.id ? null : prev))}
               onDelete={(j) => setConfirmDelete({ jobId: j.id, jobName: j.name ?? j.id, outputDir: j.output_dir })}
               onJobStateSync={syncJobState}
               onResume={executeResume}

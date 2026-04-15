@@ -19,14 +19,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from tune.core.database import get_session
+from tune.core.analysis.execution_evidence import build_execution_evidence_snapshot
+from tune.core.context.semantic_dossier import (
+    build_memory_link_breakdown,
+    build_semantic_memory_dossier,
+)
 from tune.core.job_output_paths import build_output_dir_path, derive_run_dirs_from_artifact_paths
 from tune.core.models import AnalysisJob, KnownPath, ResourceEntity, ResourceFile
 from tune.core.orchestration import (
     extract_plan_steps,
     summarize_execution_confirmation_overview,
+    summarize_execution_decision_source,
     summarize_execution_plan_delta,
     summarize_execution_ir_for_confirmation,
     summarize_execution_review_changes,
+    summarize_execution_semantic_guardrails,
     summarize_expanded_dag_for_confirmation,
 )
 from tune.core.runtime.watchdog import (
@@ -59,6 +66,10 @@ _RESOURCE_DECISION_TARGETS: dict[str, dict[str, str]] = {
     "annotation_bundle": {"key": "annotation_gtf", "file_role": "annotation_gtf"},
     "annotation_gtf": {"key": "annotation_gtf", "file_role": "annotation_gtf"},
 }
+
+
+def _build_memory_link_breakdown(memory_links: list[dict] | None) -> dict:
+    return build_memory_link_breakdown(memory_links)
 
 
 class JobCreate(BaseModel):
@@ -294,6 +305,11 @@ def _build_environment_failure_diagnostic(job: AnalysisJob) -> dict | None:
 
 
 async def _get_effective_job_state(session: AsyncSession, job: AnalysisJob) -> dict:
+    from tune.core.decision_packet import (
+        attach_decision_packet,
+        generate_decision_packet,
+    )
+    from tune.core.clarification.service import normalize_resource_clarification_payload
     from tune.core.models import CommandAuthorizationRequest, RepairRequest
 
     status = job.status
@@ -306,23 +322,101 @@ async def _get_effective_job_state(session: AsyncSession, job: AnalysisJob) -> d
     if environment_failure is not None:
         runtime_diagnostics.append(environment_failure)
 
+    goal_label = getattr(job, "goal", None) or getattr(job, "name", "") or ""
+    short_name = getattr(job, "name", "") or ""
+
+    if status == "resource_clarification_required" or pending_type == "resource_clarification":
+        pending_type = "resource_clarification"
+        pending_payload = normalize_resource_clarification_payload(
+            pending_payload,
+            language=getattr(job, "language", "en") or "en",
+        )
+        if pending_payload and not error_message:
+            error_message = pending_payload.get("prompt_text")
+
     if job.status == "awaiting_plan_confirmation":
-        execution_summary = _serialize_execution_plan(job)["summary"]
+        execution_payload = _serialize_execution_plan(job)
+        execution_summary = execution_payload["summary"]
+        semantic_guardrails = execution_payload.get("semantic_guardrails") or {}
+        ambiguity_count = int(semantic_guardrails.get("ambiguity_count", 0) or 0)
+        memory_review_count = int(semantic_guardrails.get("memory_review_count", 0) or 0)
         if execution_summary["has_execution_ir"] and execution_summary["has_expanded_dag"]:
+            review_plan = summarize_expanded_dag_for_confirmation(getattr(job, "expanded_dag_json", None))
             pending_type = pending_type or "execution_confirmation"
+            prompt_text = "Execution graph is ready for final confirmation."
+            issues: list[dict[str, str]] | None = None
+            if ambiguity_count > 0:
+                prompt_text = (
+                    "Execution graph is ready for final confirmation, but ambiguous "
+                    "resource candidates require review before execution."
+                )
+                issues = [
+                    {
+                        "title": "Ambiguous resource candidates require review",
+                        "description": (
+                            f"{ambiguity_count} execution-time resource slot(s) have close competing candidates."
+                        ),
+                    }
+                ]
+            if memory_review_count > 0:
+                if ambiguity_count > 0:
+                    prompt_text = (
+                        "Execution graph is ready for final confirmation, but ambiguous "
+                        "resource candidates and project-memory conflicts require review before execution."
+                    )
+                else:
+                    prompt_text = (
+                        "Execution graph is ready for final confirmation, but project-memory "
+                        "resource conflicts require review before execution."
+                    )
+                issues = list(issues or [])
+                issues.append(
+                    {
+                        "title": "Project memory conflicts require review",
+                        "description": (
+                            f"{memory_review_count} execution-time resource slot(s) conflict with previously confirmed project memory."
+                        ),
+                    }
+                )
             pending_payload = pending_payload or {
                 "phase": "execution",
-                "prompt_text": "Execution graph is ready for final confirmation.",
+                "prompt_text": prompt_text,
                 "execution_plan_summary": execution_summary,
+                **({"issues": issues} if issues else {}),
+                **({"semantic_guardrails": semantic_guardrails} if ambiguity_count > 0 or memory_review_count > 0 else {}),
             }
+            pending_payload = attach_decision_packet(
+                pending_payload,
+                generate_decision_packet(
+                    "execution_confirmation",
+                    goal=goal_label,
+                    review_plan=review_plan,
+                    execution_payload=execution_payload,
+                    short_name=short_name,
+                    language=getattr(job, "language", "en") or "en",
+                ),
+            )
             if not error_message:
                 error_message = pending_payload["prompt_text"]
         else:
+            review_plan = extract_plan_steps(
+                getattr(job, "resolved_plan_json", None) or getattr(job, "plan", None)
+            )
             pending_type = pending_type or "plan_confirmation"
             pending_payload = pending_payload or {
                 "phase": "abstract",
                 "prompt_text": "Abstract analysis plan is waiting for confirmation.",
             }
+            pending_payload = attach_decision_packet(
+                pending_payload,
+                generate_decision_packet(
+                    "plan_confirmation",
+                    goal=goal_label,
+                    plan=review_plan,
+                    short_name=short_name,
+                    language=getattr(job, "language", "en") or "en",
+                ),
+            )
             if not error_message:
                 error_message = pending_payload["prompt_text"]
 
@@ -353,6 +447,17 @@ async def _get_effective_job_state(session: AsyncSession, job: AnalysisJob) -> d
                     }
                 ],
             }
+            pending_payload = attach_decision_packet(
+                pending_payload,
+                generate_decision_packet(
+                    "authorization",
+                    auth_request_id=auth_req.id,
+                    command=auth_req.current_command_text or auth_req.command_text or "",
+                    command_type=auth_req.command_template_type or "",
+                    step_key=job.pending_step_key or "",
+                    language=getattr(job, "language", "en") or "en",
+                ),
+            )
             if not error_message:
                 error_message = pending_payload["prompt_text"]
         else:
@@ -375,18 +480,33 @@ async def _get_effective_job_state(session: AsyncSession, job: AnalysisJob) -> d
             )
         ).scalar_one_or_none()
         if repair_req and repair_req.status == "pending":
+            from tune.core.analysis.repair_context import build_pending_repair_payload
+
             status = "waiting_for_repair"
             pending_type = "repair"
-            pending_payload = {
-                "repair_request_id": repair_req.id,
-                "step_key": job.pending_step_key,
-                "failed_command": repair_req.failed_command,
-                "stderr_excerpt": repair_req.stderr_excerpt,
-                "prompt_text": (
-                    f"Waiting for human repair input before continuing step "
-                    f"'{job.pending_step_key or 'unknown'}'."
+            execution_payload = _serialize_execution_plan(job)
+            execution_evidence = await build_execution_evidence_snapshot(session, job)
+            pending_payload = build_pending_repair_payload(
+                job,
+                repair_request_id=repair_req.id,
+                failed_command=repair_req.failed_command or "",
+                stderr_excerpt=repair_req.stderr_excerpt or "",
+                execution_payload=execution_payload,
+                execution_evidence=execution_evidence,
+            )
+            repair_context = pending_payload.get("repair_context") or {}
+            pending_payload = attach_decision_packet(
+                pending_payload,
+                generate_decision_packet(
+                    "repair",
+                    repair_request_id=repair_req.id,
+                    step_key=job.pending_step_key or "",
+                    failed_command=repair_req.failed_command or "",
+                    stderr_excerpt=repair_req.stderr_excerpt or "",
+                    repair_context=repair_context,
+                    language=getattr(job, "language", "en") or "en",
                 ),
-            }
+            )
             if not error_message:
                 error_message = pending_payload["prompt_text"]
         else:
@@ -400,6 +520,16 @@ async def _get_effective_job_state(session: AsyncSession, job: AnalysisJob) -> d
                 }
             )
 
+    if isinstance(pending_payload, dict) and "clarification_request" not in pending_payload:
+        decision_packet = pending_payload.get("decision_packet")
+        if isinstance(decision_packet, dict):
+            clarification_request = (
+                ((decision_packet.get("context_payload") or {}).get("clarification_request"))
+            )
+            if isinstance(clarification_request, dict):
+                pending_payload = dict(pending_payload)
+                pending_payload["clarification_request"] = clarification_request
+
     return {
         "status": status,
         "error_message": error_message,
@@ -407,6 +537,265 @@ async def _get_effective_job_state(session: AsyncSession, job: AnalysisJob) -> d
         "pending_interaction_payload": pending_payload,
         "runtime_diagnostics": runtime_diagnostics,
     }
+
+
+def _mapping(payload: Any) -> dict[str, Any]:
+    return payload if isinstance(payload, dict) else {}
+
+
+def _pending_decision_packet_dict(payload: dict | None) -> dict[str, Any] | None:
+    from tune.core.decision_packet import ensure_decision_packet
+
+    try:
+        packet = ensure_decision_packet(_mapping(payload))
+    except Exception:
+        packet = None
+    if packet is not None:
+        return packet.model_dump(mode="json")
+    raw_packet = _mapping(payload).get("decision_packet")
+    return raw_packet if isinstance(raw_packet, dict) else None
+
+
+def _pending_clarification_request_dict(payload: dict | None) -> dict[str, Any] | None:
+    direct = _mapping(payload).get("clarification_request")
+    if isinstance(direct, dict):
+        return direct
+
+    decision_packet = _pending_decision_packet_dict(payload)
+    if isinstance(decision_packet, dict):
+        request = _mapping(decision_packet.get("context_payload")).get("clarification_request")
+        if isinstance(request, dict):
+            return request
+    return None
+
+
+def _pending_repair_context_dict(payload: dict | None) -> dict[str, Any] | None:
+    repair_context = _mapping(payload).get("repair_context")
+    return repair_context if isinstance(repair_context, dict) else None
+
+
+def _pending_execution_evidence_dict(payload: dict | None) -> dict[str, Any] | None:
+    repair_context = _pending_repair_context_dict(payload)
+    if not isinstance(repair_context, dict):
+        return None
+    execution_evidence = repair_context.get("execution_evidence")
+    return execution_evidence if isinstance(execution_evidence, dict) else None
+
+
+def _pending_repair_loop_state_dict(payload: dict | None) -> dict[str, Any] | None:
+    repair_context = _pending_repair_context_dict(payload)
+    if not isinstance(repair_context, dict):
+        return None
+    repair_loop_state = repair_context.get("repair_loop_state")
+    return repair_loop_state if isinstance(repair_loop_state, dict) else None
+
+
+def _decision_packet_next_action(
+    decision_packet: dict[str, Any] | None,
+    *,
+    fallback: str,
+    clarification_request: dict[str, Any] | None = None,
+) -> str:
+    decision_type = str((decision_packet or {}).get("decision_type") or "").strip()
+    if decision_type == "plan_confirmation":
+        return "confirm_or_edit_plan"
+    if decision_type == "execution_confirmation":
+        return "confirm_or_edit_execution"
+    if decision_type == "authorization":
+        return "review_and_authorize_command"
+    if decision_type == "repair":
+        return "review_failure_and_choose_repair"
+    if decision_type in {"resource_clarification", "capability_gap"}:
+        return "provide_missing_resource_clarification"
+    if decision_type == "progress_readiness" and clarification_request:
+        return "provide_missing_resource_clarification"
+    return fallback
+
+
+def _pending_interaction_summary(
+    pending_payload: dict | None,
+    *,
+    fallback: str,
+) -> str:
+    decision_packet = _pending_decision_packet_dict(pending_payload)
+    if isinstance(decision_packet, dict):
+        summary = str(decision_packet.get("summary") or "").strip()
+        if summary:
+            return summary
+    clarification_request = _pending_clarification_request_dict(pending_payload)
+    if isinstance(clarification_request, dict):
+        prompt = str(clarification_request.get("prompt") or "").strip()
+        if prompt:
+            return prompt
+    prompt_text = str(_mapping(pending_payload).get("prompt_text") or "").strip()
+    if prompt_text:
+        return prompt_text
+    return fallback
+
+
+def _pending_interaction_detail(
+    pending_payload: dict | None,
+    *,
+    fallback: str,
+) -> str:
+    decision_packet = _pending_decision_packet_dict(pending_payload)
+    if isinstance(decision_packet, dict):
+        required_user_action = str(decision_packet.get("required_user_action") or "").strip()
+        if required_user_action:
+            return required_user_action
+        reason = str(decision_packet.get("reason") or "").strip()
+        if reason:
+            return reason
+    clarification_request = _pending_clarification_request_dict(pending_payload)
+    if isinstance(clarification_request, dict):
+        prompt = str(clarification_request.get("prompt") or "").strip()
+        if prompt:
+            return prompt
+    prompt_text = str(_mapping(pending_payload).get("prompt_text") or "").strip()
+    if prompt_text:
+        return prompt_text
+    return fallback
+
+
+def _attention_reason_from_progress_state(
+    incident_type: str | None,
+    progress_state: dict[str, Any] | None,
+) -> str | None:
+    if isinstance(progress_state, dict) and progress_state.get("requires_user_decision"):
+        focus = str(progress_state.get("decision_focus") or "").strip()
+        if focus in {"plan_confirmation", "execution_confirmation"}:
+            return "confirmation"
+        if focus in {"resource_clarification", "capability_gap", "progress_readiness"}:
+            return "clarification"
+        if focus in {"authorization", "repair"}:
+            return focus
+    return _normalize_attention_reason(incident_type)
+
+
+async def _load_job_progress_state(
+    session: AsyncSession,
+    job: AnalysisJob,
+    effective: dict | None = None,
+) -> dict | None:
+    from tune.core.analysis.progress_state import derive_progress_state
+    from tune.core.models import SessionState
+
+    progress_state = None
+    session_state = None
+
+    session_state_id = getattr(job, "session_state_id", None)
+    thread_id = getattr(job, "thread_id", None)
+    try:
+        if session_state_id:
+            session_state = (
+                await session.execute(
+                    select(SessionState).where(SessionState.id == session_state_id)
+                )
+            ).scalar_one_or_none()
+        elif thread_id:
+            session_state = (
+                await session.execute(
+                    select(SessionState).where(SessionState.thread_id == thread_id)
+                )
+            ).scalar_one_or_none()
+    except Exception:
+        log.exception("_load_job_progress_state: failed to load SessionState for job %s", getattr(job, "id", None))
+        session_state = None
+
+    if session_state is not None and isinstance(getattr(session_state, "progress_state_json", None), dict):
+        progress_state = dict(session_state.progress_state_json)
+    if progress_state is not None:
+        return progress_state
+
+    effective_payload = effective or {}
+    pending_type = effective_payload.get("pending_interaction_type")
+    pending_payload = effective_payload.get("pending_interaction_payload")
+    decision_packet = _pending_decision_packet_dict(pending_payload)
+    clarification_request = _pending_clarification_request_dict(pending_payload)
+    repair_context = _pending_repair_context_dict(pending_payload)
+    analysis_trace = None
+    if session_state is not None and isinstance(getattr(session_state, "analysis_intent_trace_json", None), dict):
+        analysis_trace = session_state.analysis_intent_trace_json
+    if analysis_trace is None and isinstance(getattr(job, "plan_draft_json", None), dict):
+        analysis_intent = job.plan_draft_json.get("analysis_intent")
+        if isinstance(analysis_intent, dict):
+            analysis_trace = {
+                "finalized": {
+                    "stage": "finalized",
+                    "intent": analysis_intent,
+                }
+            }
+
+    derived = derive_progress_state(
+        {
+            "analysis_intent_trace": analysis_trace,
+            "last_readiness_assessment": (
+                getattr(session_state, "latest_readiness_json", None)
+                if session_state is not None
+                else None
+            ),
+            "last_context_acquisition": (
+                getattr(session_state, "latest_context_acquisition_json", None)
+                if session_state is not None
+                else None
+            ),
+            "last_decision_packet": (
+                decision_packet
+                or (getattr(session_state, "pending_decision_packet_json", None) if session_state is not None else None)
+            ),
+            "pending_analysis_plan": (
+                {
+                    "active": True,
+                    "phase": "execution" if pending_type == "execution_confirmation" else "abstract",
+                    "job_backed": True,
+                    "job_id": getattr(job, "id", None),
+                    "goal": getattr(job, "goal", None),
+                    "short_name": getattr(job, "name", None),
+                    "plan": extract_plan_steps(
+                        getattr(job, "resolved_plan_json", None) or getattr(job, "plan", None)
+                    ),
+                    "execution_plan_summary": _mapping(pending_payload).get("execution_plan_summary"),
+                    "execution_decision_source": _mapping(pending_payload).get("execution_decision_source"),
+                }
+                if pending_type in {"plan_confirmation", "execution_confirmation"}
+                else None
+            ),
+            "pending_command_auth": (
+                {
+                    "job_id": getattr(job, "id", None),
+                    "auth_request_id": _mapping(pending_payload).get("auth_request_id"),
+                    "command": _mapping(pending_payload).get("command"),
+                    "command_type": _mapping(pending_payload).get("command_type"),
+                    "step_key": _mapping(pending_payload).get("step_key"),
+                }
+                if pending_type == "authorization"
+                else None
+            ),
+            "pending_error_recovery": (
+                {
+                    "job_id": getattr(job, "id", None),
+                    "repair_request_id": _mapping(pending_payload).get("repair_request_id"),
+                    "step_key": _mapping(pending_payload).get("step_key"),
+                    "failed_command": _mapping(pending_payload).get("failed_command"),
+                    "stderr_excerpt": _mapping(pending_payload).get("stderr_excerpt"),
+                    "repair_context": repair_context,
+                }
+                if pending_type == "repair"
+                else None
+            ),
+            "resource_clarification": (
+                {
+                    "active": True,
+                    "job_id": getattr(job, "id", None),
+                    "prompt_text": _mapping(pending_payload).get("prompt_text"),
+                    "clarification_request": clarification_request,
+                }
+                if pending_type == "resource_clarification"
+                else None
+            ),
+        }
+    ).model_dump(mode="json")
+    return derived
 
 
 def _serialize_binding(binding) -> dict:
@@ -435,41 +824,22 @@ def _serialize_binding_detail(binding, step_run=None) -> dict:
 
 
 def _serialize_execution_plan(job: AnalysisJob) -> dict:
+    from tune.core.analysis.execution_plan import build_execution_plan_backend
+
     abstract_plan = getattr(job, "resolved_plan_json", None) or getattr(job, "plan", None)
     execution_ir = getattr(job, "execution_ir_json", None)
     expanded_dag = getattr(job, "expanded_dag_json", None)
-    nodes = (
-        expanded_dag.get("nodes", [])
-        if isinstance(expanded_dag, dict)
-        else []
+    backend = build_execution_plan_backend(
+        abstract_plan=abstract_plan,
+        execution_ir=execution_ir,
+        expanded_dag=expanded_dag,
     )
-    groups = (
-        expanded_dag.get("groups", [])
-        if isinstance(expanded_dag, dict)
-        else []
-    )
-    return {
-        "abstract_plan": abstract_plan,
-        "execution_ir": execution_ir,
-        "expanded_dag": expanded_dag,
-        "review_overview": summarize_execution_confirmation_overview(
-            plan_payload=abstract_plan,
-            execution_ir=execution_ir,
-            expanded_dag=expanded_dag,
-        ),
-        "review_ir": summarize_execution_ir_for_confirmation(execution_ir),
-        "review_delta": summarize_execution_plan_delta(abstract_plan, expanded_dag),
-        "review_changes": summarize_execution_review_changes(expanded_dag),
-        "summary": {
-            "has_execution_ir": bool(execution_ir),
-            "has_expanded_dag": bool(expanded_dag),
-            "node_count": len(nodes),
-            "group_count": len(groups),
-        },
-    }
+    return backend.model_dump(mode="json")
 
 
 def _serialize_confirmation_details(job: AnalysisJob, pending_type: str | None) -> dict:
+    from tune.core.decision_packet import ensure_decision_packet
+
     phase = None
     review_plan: list[dict] = []
     execution_summary = None
@@ -477,6 +847,9 @@ def _serialize_confirmation_details(job: AnalysisJob, pending_type: str | None) 
     execution_ir_review = None
     execution_changes = None
     execution_delta = None
+    semantic_guardrails = None
+    execution_decision_source = None
+    decision_packet = ensure_decision_packet(getattr(job, "pending_interaction_payload_json", None))
 
     if pending_type == "execution_confirmation":
         phase = "execution"
@@ -487,6 +860,8 @@ def _serialize_confirmation_details(job: AnalysisJob, pending_type: str | None) 
         execution_ir_review = execution_payload["review_ir"]
         execution_changes = execution_payload["review_changes"]
         execution_delta = execution_payload["review_delta"]
+        semantic_guardrails = execution_payload["semantic_guardrails"]
+        execution_decision_source = execution_payload.get("execution_decision_source")
     elif pending_type == "plan_confirmation":
         phase = "abstract"
         review_plan = extract_plan_steps(
@@ -501,6 +876,9 @@ def _serialize_confirmation_details(job: AnalysisJob, pending_type: str | None) 
         "execution_ir_review": execution_ir_review,
         "execution_plan_delta": execution_delta,
         "execution_plan_changes": execution_changes,
+        "execution_semantic_guardrails": semantic_guardrails,
+        "execution_decision_source": execution_decision_source,
+        "decision_packet": decision_packet.model_dump(mode="json") if decision_packet is not None else None,
     }
 
 
@@ -663,11 +1041,15 @@ def _resolve_recommendation_rollback(
     if suggested_level == "abstract_plan":
         rollback_target = "abstract_plan_gate"
     elif suggested_level == "execution_ir":
-        rollback_target = (
-            "resource_clarification_gate"
-            if incident_type == "resource_clarification"
-            else (current_step_key or "execution_semantics")
-        )
+        semantic_signals = _extract_semantic_dossier_signals(dossier.get("semantic_memory_dossier") or {})
+        resource_link_count = semantic_signals["resource_link_count"]
+        artifact_link_count = semantic_signals["artifact_link_count"]
+        if incident_type == "resource_clarification" or (resource_link_count > 0 and artifact_link_count <= 0):
+            rollback_target = "resource_clarification_gate"
+        elif artifact_link_count > 0:
+            rollback_target = current_step_key or "execution_artifact_review"
+        else:
+            rollback_target = current_step_key or "execution_semantics"
     elif suggested_level == "dag":
         rollback_target = (
             "execution_confirmation_gate"
@@ -682,6 +1064,57 @@ def _resolve_recommendation_rollback(
         diagnosis = f"{diagnosis} Rollback hint: {reason}"
 
     return rollback_target, rollback_level, diagnosis
+
+
+def _build_semantic_memory_rollback_hint(dossier: dict | None) -> dict[str, str] | None:
+    if not dossier:
+        return None
+
+    semantic_signals = _extract_semantic_dossier_signals(dossier.get("semantic_memory_dossier") or {})
+    ambiguity_count = semantic_signals["ambiguity_count"]
+    has_link_graph = semantic_signals["has_link_graph"]
+    if ambiguity_count <= 0 and not has_link_graph:
+        return None
+
+    incident_type = str(dossier.get("incident_type") or "").strip()
+    current_step_key = str(((dossier.get("current_step") or {}).get("step_key")) or "").strip()
+
+    if incident_type in {"binding_required", "resource_clarification"}:
+        if ambiguity_count > 0:
+            return {
+                "suggested_level": "execution_ir",
+                "reason": (
+                    "Semantic retrieval still contains ambiguous resource candidates, "
+                    "so rollback should revisit execution semantics before retrying bindings."
+                ),
+            }
+        return {
+            "suggested_level": "execution_ir",
+            "reason": (
+                "Project semantic memory already links this incident to resolved resources or produced artifacts, "
+                "so rollback should revisit execution semantics before retrying bindings."
+            ),
+        }
+
+    if incident_type in {"failed", "repair", "resume_failed", "stalled", "interrupted"}:
+        target_label = current_step_key or "current execution step"
+        if ambiguity_count > 0:
+            return {
+                "suggested_level": "execution_ir",
+                "reason": (
+                    "Semantic retrieval still contains ambiguous resource candidates, "
+                    f"so rollback should revisit execution semantics before retrying step-level recovery for '{target_label}'."
+                ),
+            }
+        return {
+            "suggested_level": "execution_ir",
+            "reason": (
+                "Project semantic memory already links this runtime path to resolved resources or produced artifacts, "
+                f"so rollback should revisit execution semantics before retrying step-level recovery for '{target_label}'."
+            ),
+        }
+
+    return None
 
 
 def _build_supervisor_rollback_context(
@@ -899,12 +1332,36 @@ def _build_recovery_playbook(
     rollback_target: str,
     safe_action: str | None,
     auto_recoverable: bool,
+    dossier: dict | None = None,
+    decision_context: dict | None = None,
 ) -> dict:
     step_codes: list[str] = []
+    rollback_target_label = str(rollback_target or "").strip()
+    artifact_review_subtype = _infer_execution_artifact_review_subtype((dossier or {}).get("semantic_memory_dossier") or {})
 
     next_action = str(incident.get("next_action") or "").strip()
     if next_action:
         step_codes.append(next_action)
+
+    semantic_memory_dossier = (dossier or {}).get("semantic_memory_dossier") or {}
+    semantic_signals = _extract_semantic_dossier_signals(semantic_memory_dossier)
+    needs_semantic_review = (
+        bool((decision_context or {}).get("review_semantic_dossier_during_recovery"))
+        if decision_context is not None
+        else semantic_signals["has_review_signal"]
+    )
+    if (
+        rollback_level in {"execution_ir", "dag"}
+        and needs_semantic_review
+    ):
+        step_codes.append("review_semantic_memory_dossier")
+
+    if rollback_target_label == "execution_artifact_review":
+        step_codes.extend(["open_task", "inspect_artifact_lineage"])
+        if artifact_review_subtype == "upstream_output_regeneration":
+            step_codes.append("regenerate_upstream_outputs")
+        else:
+            step_codes.append("rebind_downstream_artifacts")
 
     if safe_action:
         step_codes.append("apply_safe_action")
@@ -1626,6 +2083,327 @@ async def _fetch_similar_project_execution_events(
         return []
 
 
+async def _fetch_project_memory_profile(
+    session: AsyncSession,
+    project_id: str | None,
+    *,
+    limit: int = 20,
+) -> dict | None:
+    if not project_id:
+        return None
+    try:
+        from tune.core.memory.project_memory import summarize_project_memory
+
+        return await summarize_project_memory(session, project_id, limit=limit)
+    except Exception:
+        return None
+
+
+async def _fetch_project_structured_memory_layers(
+    session: AsyncSession,
+    project_id: str | None,
+    *,
+    limit: int = 20,
+    fallback_profile: dict | None = None,
+) -> tuple[list[dict], list[dict]]:
+    if not project_id:
+        return [], []
+    try:
+        from tune.core.memory.project_memory import (
+            query_project_memory_patterns,
+            query_project_memory_preferences,
+        )
+
+        patterns = await query_project_memory_patterns(session, project_id, limit=limit)
+        preferences = await query_project_memory_preferences(session, project_id, limit=limit)
+        if patterns or preferences:
+            return patterns, preferences
+    except Exception:
+        pass
+    return _build_structured_project_memory_layers(fallback_profile)
+
+
+async def _fetch_project_memory_links(
+    session: AsyncSession,
+    project_id: str | None,
+    *,
+    limit: int = 20,
+) -> list[dict]:
+    if not project_id:
+        return []
+    try:
+        from tune.core.memory.project_memory import query_project_memory_links
+
+        return await query_project_memory_links(session, project_id, limit=limit)
+    except Exception:
+        return []
+
+
+def _build_structured_project_memory_layers(project_memory_profile: dict | None) -> tuple[list[dict], list[dict]]:
+    try:
+        from tune.core.memory.project_memory import (
+            build_project_memory_patterns,
+            build_project_memory_preferences,
+        )
+
+        return (
+            build_project_memory_patterns(project_memory_profile),
+            build_project_memory_preferences(project_memory_profile),
+        )
+    except Exception:
+        return [], []
+
+
+def _memory_confidence_rank(value: str | None) -> int:
+    return {"high": 3, "medium": 2, "low": 1}.get(str(value or "").strip(), 0)
+
+
+def _extract_dossier_structured_memory_layers(dossier: dict | None) -> tuple[list[dict], list[dict]]:
+    payload = dossier or {}
+    semantic_memory = payload.get("semantic_memory_dossier") or {}
+    memory_patterns = [
+        item for item in (
+            payload.get("memory_patterns")
+            or semantic_memory.get("memory_patterns")
+            or []
+        )
+        if isinstance(item, dict)
+    ]
+    memory_preferences = [
+        item for item in (
+            payload.get("memory_preferences")
+            or semantic_memory.get("memory_preferences")
+            or []
+        )
+        if isinstance(item, dict)
+    ]
+    return memory_patterns, memory_preferences
+
+
+def _build_structured_memory_policy(
+    memory_patterns: list[dict] | None,
+    memory_preferences: list[dict] | None,
+    *,
+    safe_action: str | None,
+    rollback_level: str | None = None,
+    rollback_target: str | None = None,
+) -> dict | None:
+    patterns = [item for item in (memory_patterns or []) if isinstance(item, dict)]
+    preferences = [item for item in (memory_preferences or []) if isinstance(item, dict)]
+    if not patterns and not preferences:
+        return None
+
+    def _entry_sort_key(entry: dict) -> tuple[int, int, int]:
+        return (
+            _memory_confidence_rank(entry.get("confidence")),
+            max(0, int(entry.get("support_count") or 0)),
+            max(0, int(entry.get("user_validated_count") or 0)),
+        )
+
+    def _best_pattern(pattern_type: str, current_value: str | None = None) -> tuple[dict | None, dict | None]:
+        typed = [
+            item for item in patterns
+            if str(item.get("pattern_type") or "").strip() == pattern_type
+        ]
+        if not typed:
+            return None, None
+        preferred = max(typed, key=_entry_sort_key)
+        current_text = str(current_value or "").strip()
+        current = None
+        if current_text:
+            matching = [
+                item for item in typed
+                if str(item.get("recommended_value") or "").strip() == current_text
+            ]
+            if matching:
+                current = max(matching, key=_entry_sort_key)
+        return preferred, current
+
+    preference_by_key = {
+        str(item.get("preference_key") or "").strip(): item
+        for item in preferences
+        if str(item.get("preference_key") or "").strip()
+    }
+
+    safe_action_preference = preference_by_key.get("preferred_safe_action")
+    rollback_level_preference = preference_by_key.get("preferred_rollback_level")
+    analysis_family_preference = preference_by_key.get("preferred_analysis_family")
+
+    preferred_safe_action_pattern, current_safe_action_pattern = _best_pattern("safe_action", safe_action)
+    preferred_rollback_pattern, current_rollback_pattern = _best_pattern("rollback_level", rollback_level)
+
+    preferred_safe_action = (
+        str((safe_action_preference or {}).get("value") or "").strip()
+        or str((preferred_safe_action_pattern or {}).get("recommended_value") or "").strip()
+        or None
+    )
+    preferred_safe_action_confidence = (
+        str((safe_action_preference or {}).get("confidence") or "").strip()
+        or str((preferred_safe_action_pattern or {}).get("confidence") or "").strip()
+        or None
+    )
+    preferred_safe_action_support = max(
+        int((safe_action_preference or {}).get("support_count") or 0),
+        int((preferred_safe_action_pattern or {}).get("support_count") or 0),
+    )
+
+    preferred_rollback_level = (
+        str((rollback_level_preference or {}).get("value") or "").strip()
+        or str((preferred_rollback_pattern or {}).get("recommended_value") or "").strip()
+        or None
+    )
+    preferred_rollback_level_confidence = (
+        str((rollback_level_preference or {}).get("confidence") or "").strip()
+        or str((preferred_rollback_pattern or {}).get("confidence") or "").strip()
+        or None
+    )
+    preferred_rollback_level_support = max(
+        int((rollback_level_preference or {}).get("support_count") or 0),
+        int((preferred_rollback_pattern or {}).get("support_count") or 0),
+    )
+
+    preferred_analysis_family = str((analysis_family_preference or {}).get("value") or "").strip() or None
+    preferred_analysis_family_confidence = str(
+        (analysis_family_preference or {}).get("confidence") or ""
+    ).strip() or None
+
+    current_safe_action = str(safe_action or "").strip() or None
+    current_rollback_level = str(rollback_level or "").strip() or None
+    current_rollback_target = str(rollback_target or "").strip() or None
+
+    return {
+        "pattern_count": len(patterns),
+        "preference_count": len(preferences),
+        "current_safe_action": current_safe_action,
+        "current_rollback_level": current_rollback_level,
+        "current_rollback_target": current_rollback_target,
+        "preferred_safe_action": preferred_safe_action,
+        "preferred_safe_action_confidence": preferred_safe_action_confidence,
+        "preferred_safe_action_support": preferred_safe_action_support,
+        "preferred_safe_action_aligns_with_current": (
+            preferred_safe_action == current_safe_action
+            if preferred_safe_action and current_safe_action
+            else None
+        ),
+        "current_safe_action_supported": current_safe_action_pattern is not None,
+        "current_safe_action_confidence": str(
+            (current_safe_action_pattern or {}).get("confidence") or ""
+        ).strip() or None,
+        "current_safe_action_support": int(
+            (current_safe_action_pattern or {}).get("support_count") or 0
+        ),
+        "preferred_rollback_level": preferred_rollback_level,
+        "preferred_rollback_level_confidence": preferred_rollback_level_confidence,
+        "preferred_rollback_level_support": preferred_rollback_level_support,
+        "preferred_rollback_level_aligns_with_current": (
+            preferred_rollback_level == current_rollback_level
+            if preferred_rollback_level and current_rollback_level
+            else None
+        ),
+        "current_rollback_level_supported": current_rollback_pattern is not None,
+        "current_rollback_level_confidence": str(
+            (current_rollback_pattern or {}).get("confidence") or ""
+        ).strip() or None,
+        "current_rollback_level_support": int(
+            (current_rollback_pattern or {}).get("support_count") or 0
+        ),
+        "preferred_analysis_family": preferred_analysis_family,
+        "preferred_analysis_family_confidence": preferred_analysis_family_confidence,
+    }
+
+
+def _build_structured_memory_policy_from_dossier(
+    dossier: dict | None,
+    *,
+    safe_action: str | None,
+    rollback_level: str | None = None,
+    rollback_target: str | None = None,
+) -> dict | None:
+    memory_patterns, memory_preferences = _extract_dossier_structured_memory_layers(dossier)
+    return _build_structured_memory_policy(
+        memory_patterns,
+        memory_preferences,
+        safe_action=safe_action,
+        rollback_level=rollback_level,
+        rollback_target=rollback_target,
+    )
+
+
+def _infer_execution_artifact_review_subtype(semantic_memory_dossier: dict | None) -> str | None:
+    dossier = semantic_memory_dossier or {}
+    artifact_links = [
+        item for item in (dossier.get("artifact_links") or [])
+        if isinstance(item, dict)
+    ]
+    if not artifact_links and int(dossier.get("artifact_link_count", 0) or 0) <= 0:
+        return None
+    link_roles = {
+        str(item.get("link_role") or "").strip()
+        for item in artifact_links
+        if str(item.get("link_role") or "").strip()
+    }
+    if "produced_artifact" in link_roles:
+        return "upstream_output_regeneration"
+    return "downstream_binding_review"
+
+
+def _extract_semantic_dossier_signals(semantic_memory_dossier: dict | None) -> dict[str, Any]:
+    dossier = semantic_memory_dossier or {}
+    ambiguity_count = int(dossier.get("ambiguity_count", 0) or 0)
+    resource_link_count = int(dossier.get("resource_link_count", 0) or 0)
+    artifact_link_count = int(dossier.get("artifact_link_count", 0) or 0)
+    runtime_link_count = int(dossier.get("runtime_link_count", 0) or 0)
+    artifact_review_subtype = _infer_execution_artifact_review_subtype(dossier)
+    has_link_graph = resource_link_count > 0 or artifact_link_count > 0 or runtime_link_count > 0
+    return {
+        "ambiguity_count": ambiguity_count,
+        "resource_link_count": resource_link_count,
+        "artifact_link_count": artifact_link_count,
+        "runtime_link_count": runtime_link_count,
+        "artifact_review_subtype": artifact_review_subtype,
+        "has_link_graph": has_link_graph,
+        "has_review_signal": ambiguity_count > 0 or has_link_graph,
+    }
+
+
+async def _fetch_project_semantic_memory_dossier(
+    session: AsyncSession,
+    project_id: str | None,
+) -> dict | None:
+    if not project_id:
+        return None
+    try:
+        from tune.core.context.builder import PlannerContextBuilder
+        from tune.core.context.models import ContextScope
+
+        ctx = await PlannerContextBuilder(session).build(ContextScope(project_id=project_id))
+        dossier = (
+            getattr(ctx, "semantic_memory_dossier", None)
+            or build_semantic_memory_dossier(
+                getattr(ctx, "summary", None),
+                project_id=getattr(getattr(ctx, "project", None), "id", None),
+            )
+            or {}
+        )
+        profile = await _fetch_project_memory_profile(session, project_id)
+        memory_patterns, memory_preferences = await _fetch_project_structured_memory_layers(
+            session,
+            project_id,
+            limit=4,
+            fallback_profile=profile,
+        )
+        memory_links = await _fetch_project_memory_links(session, project_id, limit=6)
+        return build_semantic_memory_dossier(
+            getattr(ctx, "summary", None),
+            project_id=project_id,
+            memory_patterns=memory_patterns,
+            memory_preferences=memory_preferences,
+            memory_links=memory_links,
+        ) or dossier
+    except Exception:
+        return None
+
+
 def _build_historical_guidance(
     similar_resolutions: list[dict] | None,
     *,
@@ -1635,6 +2413,8 @@ def _build_historical_guidance(
     job_status: str | None = None,
     rollback_level: str | None = None,
     rollback_target: str | None = None,
+    structured_memory_policy: dict | None = None,
+    semantic_memory_dossier: dict | None = None,
 ) -> str | None:
     historical_policy = _build_historical_policy(
         similar_resolutions,
@@ -1643,7 +2423,16 @@ def _build_historical_guidance(
         rollback_target=rollback_target,
     )
     if not historical_policy:
-        return None
+        historical_policy = {
+            "preferred_safe_action": None,
+            "support_count": 0,
+            "total_matches": 0,
+            "current_safe_action": str(safe_action or "").strip() or None,
+            "current_supported_count": 0,
+            "aligns_with_current": None,
+            "preferred_rollback_level": None,
+            "rollback_level_aligns_with_current": None,
+        }
 
     preferred_safe_action = historical_policy.get("preferred_safe_action")
     support_count = int(historical_policy.get("support_count") or 0)
@@ -1699,7 +2488,94 @@ def _build_historical_guidance(
             f"({support_count}/{total_matches})."
         )
 
-    return f"Project memory contains {total_matches} similar resolved incident record(s)."
+    if total_matches > 0:
+        return f"Project memory contains {total_matches} similar resolved incident record(s)."
+
+    structured_policy = structured_memory_policy or {}
+    preferred_safe_action = str(structured_policy.get("preferred_safe_action") or "").strip() or None
+    preferred_safe_action_confidence = str(
+        structured_policy.get("preferred_safe_action_confidence") or ""
+    ).strip() or None
+    preferred_rollback_level = str(structured_policy.get("preferred_rollback_level") or "").strip() or None
+    preferred_rollback_level_confidence = str(
+        structured_policy.get("preferred_rollback_level_confidence") or ""
+    ).strip() or None
+    current_safe_action = str(structured_policy.get("current_safe_action") or "").strip() or None
+    current_safe_action_supported = bool(structured_policy.get("current_safe_action_supported"))
+    preferred_safe_action_aligns = structured_policy.get("preferred_safe_action_aligns_with_current")
+    preferred_rollback_aligns = structured_policy.get("preferred_rollback_level_aligns_with_current")
+
+    if current_safe_action and current_safe_action_supported:
+        if preferred_rollback_aligns is False and preferred_rollback_level:
+            return (
+                f"Structured project memory supports {current_safe_action}, but it most often pairs that path "
+                f"with rollback level {preferred_rollback_level}."
+            )
+        return f"Structured project memory supports {current_safe_action}."
+
+    if preferred_safe_action:
+        confidence_fragment = f" ({preferred_safe_action_confidence} confidence)" if preferred_safe_action_confidence else ""
+        if preferred_safe_action_aligns is False and current_safe_action:
+            return (
+                f"Structured project memory prefers {preferred_safe_action}{confidence_fragment}; "
+                f"current recommendation is {current_safe_action}."
+            )
+        if (
+            not current_safe_action
+            and str(incident_type or "").strip() == "resume_failed"
+        ):
+            if safe_action_eligibility and safe_action_eligibility.get("blocking_reasons"):
+                blocker_text = "; ".join(
+                    _describe_resume_retry_blockers(
+                        safe_action_eligibility,
+                        job_status=str(job_status or "unknown").strip() or "unknown",
+                    )
+                ) or "the current retry eligibility checks are blocked"
+                return (
+                    f"Structured project memory prefers {preferred_safe_action}{confidence_fragment}, "
+                    f"but the current recommendation intentionally withholds that path because {blocker_text}."
+                )
+            if str(rollback_level or "").strip() and str(rollback_level or "").strip() != "step":
+                return (
+                    f"Structured project memory prefers {preferred_safe_action}{confidence_fragment}, "
+                    f"but the current recommendation intentionally withholds that path because the safer rollback scope "
+                    f"is {rollback_level}."
+                )
+        return f"Structured project memory prefers {preferred_safe_action}{confidence_fragment}."
+
+    if preferred_rollback_level:
+        confidence_fragment = f" ({preferred_rollback_level_confidence} confidence)" if preferred_rollback_level_confidence else ""
+        return f"Structured project memory prefers rollback level {preferred_rollback_level}{confidence_fragment}."
+
+    semantic_signals = _extract_semantic_dossier_signals(semantic_memory_dossier)
+    resource_link_count = semantic_signals["resource_link_count"]
+    artifact_link_count = semantic_signals["artifact_link_count"]
+    if resource_link_count > 0 or artifact_link_count > 0:
+        parts: list[str] = []
+        if resource_link_count > 0:
+            parts.append(f"{resource_link_count} resource trace(s)")
+        if artifact_link_count > 0:
+            parts.append(f"{artifact_link_count} artifact trace(s)")
+        return "Project semantic memory links the current recommendation to " + " and ".join(parts) + "."
+
+    return None
+
+
+def _semantic_trace_summary_from_basis(basis: list[str] | None) -> str | None:
+    basis_set = {
+        str(item).strip()
+        for item in (basis or [])
+        if str(item).strip()
+    }
+    resource = "semantic_resource_trace" in basis_set
+    artifact = "semantic_artifact_trace" in basis_set
+    if resource and artifact:
+        return "Semantic resource and artifact traces support the current recommendation."
+    if resource:
+        return "Semantic resource traces support the current recommendation."
+    if artifact:
+        return "Semantic artifact traces support the current recommendation."
+    return None
 
 
 def _build_historical_policy(
@@ -1812,6 +2688,8 @@ def _build_recommended_action_confidence(
     auto_recoverable: bool,
     safe_action_eligibility: dict | None,
     historical_policy: dict | None,
+    structured_memory_policy: dict | None = None,
+    semantic_memory_dossier: dict | None = None,
 ) -> tuple[str, list[str]]:
     basis: list[str] = []
     if not safe_action:
@@ -1843,12 +2721,43 @@ def _build_recommended_action_confidence(
         if confidence:
             basis.append(f"historical_confidence_{confidence}")
 
+    structured_policy = structured_memory_policy or {}
+    if structured_policy:
+        if structured_policy.get("current_safe_action_supported"):
+            basis.append("structured_support_current_action")
+        if structured_policy.get("preferred_safe_action_aligns_with_current") is True:
+            basis.append("structured_alignment")
+        elif structured_policy.get("preferred_safe_action_aligns_with_current") is False:
+            basis.append("structured_divergence")
+        if structured_policy.get("preferred_rollback_level_aligns_with_current") is True:
+            basis.append("structured_rollback_alignment")
+        elif structured_policy.get("preferred_rollback_level_aligns_with_current") is False:
+            basis.append("structured_rollback_divergence")
+        confidence = str(
+            structured_policy.get("preferred_safe_action_confidence")
+            or structured_policy.get("preferred_rollback_level_confidence")
+            or ""
+        ).strip()
+        if confidence:
+            basis.append(f"structured_confidence_{confidence}")
+
+    semantic_signals = _extract_semantic_dossier_signals(semantic_memory_dossier)
+    if semantic_signals["resource_link_count"] > 0:
+        basis.append("semantic_resource_trace")
+    if semantic_signals["artifact_link_count"] > 0:
+        basis.append("semantic_artifact_trace")
+
     if not safe_action:
         if (
-            "historical_rollback_alignment" in basis
+            (
+                "historical_rollback_alignment" in basis
+                or "structured_rollback_alignment" in basis
+            )
             and (
                 "historical_confidence_high" in basis
                 or "historical_confidence_medium" in basis
+                or "structured_confidence_high" in basis
+                or "structured_confidence_medium" in basis
             )
         ):
             return "medium", basis
@@ -1858,7 +2767,12 @@ def _build_recommended_action_confidence(
         return "high", basis
     if "eligibility_blocked" in basis:
         return "low", basis
-    if "historical_divergence" in basis or "historical_rollback_divergence" in basis:
+    if (
+        "historical_divergence" in basis
+        or "historical_rollback_divergence" in basis
+        or "structured_divergence" in basis
+        or "structured_rollback_divergence" in basis
+    ):
         return "low", basis
     if (
         "historical_alignment" in basis
@@ -1875,10 +2789,26 @@ def _build_recommended_action_confidence(
         and (
             "historical_alignment" in basis
             or "historical_rollback_alignment" in basis
+            or "structured_alignment" in basis
+            or "structured_rollback_alignment" in basis
+            or "structured_support_current_action" in basis
         )
     ):
         return "medium", basis
-    if "historical_alignment" in basis or "historical_rollback_alignment" in basis:
+    if (
+        "historical_alignment" in basis
+        or "historical_rollback_alignment" in basis
+        or "structured_alignment" in basis
+        or "structured_rollback_alignment" in basis
+    ):
+        return "medium", basis
+    if (
+        "eligibility_passed" in basis
+        and (
+            "semantic_resource_trace" in basis
+            or "semantic_artifact_trace" in basis
+        )
+    ):
         return "medium", basis
     return "low", basis
 
@@ -1913,6 +2843,17 @@ def _recommendation_sort_key(rec: dict, incident_age_seconds: int) -> tuple:
             rollback_alignment_rank = 0
         elif rollback_aligns is False:
             rollback_alignment_rank = 2
+    recommendation_basis = {
+        str(item).strip()
+        for item in (rec.get("recommended_action_basis") or [])
+        if str(item).strip()
+    }
+    semantic_trace_rank = 1
+    if recommendation_basis:
+        semantic_trace_count = int("semantic_resource_trace" in recommendation_basis) + int(
+            "semantic_artifact_trace" in recommendation_basis
+        )
+        semantic_trace_rank = 0 if semantic_trace_count > 0 else 1
     original_priority = int(rec.get("priority") or 9999)
     return (
         severity_rank,
@@ -1922,6 +2863,7 @@ def _recommendation_sort_key(rec: dict, incident_age_seconds: int) -> tuple:
         eligibility_rank,
         historical_alignment_rank,
         rollback_alignment_rank,
+        semantic_trace_rank,
         -max(0, int(incident_age_seconds or 0)),
         original_priority,
         str(rec.get("job_id") or ""),
@@ -1991,6 +2933,9 @@ def _build_supervisor_overview_and_message(
             message_parts.append(
                 f"Top priority is job '{top.get('job_name')}' and it still needs operator review."
             )
+        top_trace_summary = _semantic_trace_summary_from_basis(top.get("recommended_action_basis") or [])
+        if top_trace_summary:
+            message_parts.append(top_trace_summary)
 
     if system_held:
         message_parts.append(
@@ -2080,75 +3025,70 @@ def _build_supervisor_focus_summary(
         str(top_historical_policy.get("preferred_rollback_target") or "").strip() or None
     )
     top_historical_rollback_target_alignment = top_historical_policy.get("rollback_target_aligns_with_current")
+    project_memory_profile = next(
+        (
+            (item.get("project_memory_profile") or {})
+            for item in dossiers
+            if isinstance(item, dict) and (item.get("project_memory_profile") or {})
+        ),
+        {},
+    )
     dossier_by_job = {
         str(item.get("job_id") or "").strip(): item
         for item in dossiers
         if str(item.get("job_id") or "").strip()
     }
-    top_environment_failure = (dossier_by_job.get(top_job_id) or {}).get("environment_failure") or {}
+    top_dossier = dossier_by_job.get(top_job_id) or {}
+    context_dossier = dict(top_dossier)
+    if project_memory_profile and not context_dossier.get("project_memory_profile"):
+        context_dossier["project_memory_profile"] = project_memory_profile
+    top_decision_context = top_recommendation.get("decision_context") or _build_supervisor_decision_context(
+        incident_type=top_incident_type,
+        owner=top_owner,
+        failure_layer=top_failure_layer,
+        rollback_level=top_rollback_level,
+        rollback_target=top_rollback_target,
+        safe_action=top_safe_action,
+        auto_recoverable=bool(top_recommendation.get("auto_recoverable")),
+        historical_policy=top_historical_policy,
+        structured_memory_policy=_build_structured_memory_policy_from_dossier(
+            context_dossier,
+            safe_action=top_safe_action,
+            rollback_level=top_rollback_level,
+            rollback_target=top_rollback_target,
+        ),
+        historical_guidance=top_recommendation.get("historical_guidance"),
+        dossier=context_dossier,
+        blocker_cause=top_blocker_cause,
+        environment_failure=top_dossier.get("environment_failure") or {},
+    )
+    top_execution_artifact_review_subtype = (
+        str(top_decision_context.get("artifact_review_subtype") or "").strip() or None
+    )
+    top_environment_failure = top_dossier.get("environment_failure") or {}
+    top_execution_ambiguity_count = int(top_decision_context.get("execution_ambiguity_count", 0) or 0)
+    top_execution_memory_review_count = int(top_decision_context.get("execution_memory_review_count", 0) or 0)
+    top_structured_safe_action_alignment = top_decision_context.get("structured_safe_action_alignment")
+    top_structured_rollback_level = (
+        str(top_decision_context.get("structured_rollback_level") or "").strip() or None
+    )
+    top_structured_rollback_alignment = top_decision_context.get("structured_rollback_alignment")
 
     primary_lane = "operator_review"
     lane_reason = "No single dominant lane is established yet."
     next_best_operator_move = "inspect_top_incident"
     next_best_operator_reason = "Start from the highest-priority incident and inspect its current evidence."
-    if top_incident_type in {"execution_confirmation", "plan_confirmation"}:
-        primary_lane = "confirmation_gates"
-        lane_reason = "The highest-priority incidents are waiting at confirmation gates."
-        next_best_operator_move = "review_confirmation_gate"
-        next_best_operator_reason = "Confirm or revise the pending plan / execution graph so the blocked lane can continue."
-    elif top_owner == "user" and top_incident_type in {"authorization", "repair", "resource_clarification"}:
-        primary_lane = "user_intervention"
-        lane_reason = "The current project is mainly waiting on explicit user intervention."
-        if top_incident_type == "authorization":
-            next_best_operator_move = "resolve_authorization_request"
-            next_best_operator_reason = "Review and approve or reject the pending command so execution can continue."
-        elif top_incident_type == "repair":
-            next_best_operator_move = "resolve_repair_request"
-            next_best_operator_reason = "Inspect the failing command and choose a repair path before resuming."
-        else:
-            next_best_operator_move = "resolve_resource_clarification"
-            next_best_operator_reason = "Clarify the missing or ambiguous resource details so planning/binding can continue."
-    elif top_blocker_cause:
-        resource_guidance = _build_resource_readiness_guidance(top_blocker_cause)
-        primary_lane = "resource_readiness"
-        lane_reason = resource_guidance["lane_reason"]
-        next_best_operator_move = resource_guidance["next_move"]
-        next_best_operator_reason = resource_guidance["next_reason"]
-    elif top_failure_layer == "resource_binding":
-        resource_guidance = _build_resource_readiness_guidance(None)
-        primary_lane = "resource_readiness"
-        lane_reason = resource_guidance["lane_reason"]
-        next_best_operator_move = resource_guidance["next_move"]
-        next_best_operator_reason = resource_guidance["next_reason"]
-    elif top_environment_failure:
-        environment_guidance = _build_environment_readiness_guidance(top_environment_failure)
-        primary_lane = "environment_readiness"
-        lane_reason = environment_guidance["lane_reason"]
-        next_best_operator_move = environment_guidance["next_move"]
-        next_best_operator_reason = environment_guidance["next_reason"]
-    elif (
-        not top_safe_action
-        and top_historical_rollback_alignment is True
-        and top_historical_rollback_level in {"abstract_plan", "execution_ir", "dag"}
-    ):
-        primary_lane = "rollback_review"
-        if top_historical_rollback_level == "abstract_plan":
-            lane_reason = "Project memory and the current dossier both point to abstract-plan rollback review before runtime retry."
-            next_best_operator_move = "review_rollback_scope"
-            next_best_operator_reason = "Re-open the abstract plan in chat, confirm the rollback scope, and only then decide whether runtime recovery is still appropriate."
-        elif top_historical_rollback_level == "execution_ir":
-            lane_reason = "Project memory and the current dossier both point to execution-semantics rollback review before runtime retry."
-            next_best_operator_move = "review_rollback_scope"
-            next_best_operator_reason = "Review resource clarification / execution semantics first, then rebuild the execution graph before retrying runtime recovery."
-        else:
-            lane_reason = "Project memory and the current dossier both point to expanded-DAG rollback review before runtime retry."
-            next_best_operator_move = "review_rollback_scope"
-            next_best_operator_reason = "Review the expanded DAG changes in chat and reconfirm the execution graph before attempting runtime recovery."
-    elif top_safe_action or auto_recoverable_total > 0:
-        primary_lane = "runtime_recovery"
-        lane_reason = "The current project is mainly in runtime recovery / normalization work."
-        next_best_operator_move = "apply_runtime_recovery"
-        next_best_operator_reason = "Apply the top safe action or normalization path, then recheck job state consistency."
+    if top_decision_context.get("preferred_lane"):
+        primary_lane = str(top_decision_context.get("preferred_lane") or "").strip() or primary_lane
+        lane_reason = str(top_decision_context.get("preferred_lane_reason") or "").strip() or lane_reason
+        next_best_operator_move = (
+            str(top_decision_context.get("next_best_operator_move") or "").strip()
+            or next_best_operator_move
+        )
+        next_best_operator_reason = (
+            str(top_decision_context.get("next_best_operator_reason") or "").strip()
+            or next_best_operator_reason
+        )
 
     latest_auto_recovery = _find_latest_auto_recovery_event(dossiers)
     payload = {
@@ -2167,9 +3107,51 @@ def _build_supervisor_focus_summary(
         "lane_reason": lane_reason,
         "next_best_operator_move": next_best_operator_move,
         "next_best_operator_reason": next_best_operator_reason,
+        "decision_source": _resolve_decision_source(top_decision_context),
     }
+    project_memory_episode_count = int(top_decision_context.get("project_memory_episode_count", 0) or 0)
+    project_memory_pattern_count = int(top_decision_context.get("project_memory_pattern_count", 0) or 0)
+    project_memory_preference_count = int(top_decision_context.get("project_memory_preference_count", 0) or 0)
+    project_memory_resource_link_count = int(top_decision_context.get("project_memory_resource_link_count", 0) or 0)
+    project_memory_artifact_link_count = int(top_decision_context.get("project_memory_artifact_link_count", 0) or 0)
+    project_memory_runtime_link_count = int(top_decision_context.get("project_memory_runtime_link_count", 0) or 0)
+    project_memory_preferred_safe_action = (
+        str(top_decision_context.get("project_memory_preferred_safe_action") or "").strip() or None
+    )
+    project_memory_preferred_rollback_level = (
+        str(top_decision_context.get("project_memory_preferred_rollback_level") or "").strip() or None
+    )
+    project_memory_preferred_analysis_family = (
+        str(top_decision_context.get("project_memory_preferred_analysis_family") or "").strip() or None
+    )
+    if project_memory_episode_count:
+        payload["project_memory_episode_count"] = project_memory_episode_count
+    if project_memory_pattern_count:
+        payload["project_memory_pattern_count"] = project_memory_pattern_count
+    if project_memory_preference_count:
+        payload["project_memory_preference_count"] = project_memory_preference_count
+    if project_memory_resource_link_count:
+        payload["project_memory_resource_link_count"] = project_memory_resource_link_count
+    if project_memory_artifact_link_count:
+        payload["project_memory_artifact_link_count"] = project_memory_artifact_link_count
+    if project_memory_runtime_link_count:
+        payload["project_memory_runtime_link_count"] = project_memory_runtime_link_count
+    if project_memory_preferred_safe_action:
+        payload["project_memory_preferred_safe_action"] = project_memory_preferred_safe_action
+    if project_memory_preferred_rollback_level:
+        payload["project_memory_preferred_rollback_level"] = project_memory_preferred_rollback_level
+    if project_memory_preferred_analysis_family:
+        payload["project_memory_preferred_analysis_family"] = project_memory_preferred_analysis_family
+    if top_structured_safe_action_alignment is not None:
+        payload["top_structured_safe_action_alignment"] = top_structured_safe_action_alignment
+    if top_structured_rollback_alignment is not None:
+        payload["top_structured_rollback_alignment"] = top_structured_rollback_alignment
     if top_rollback_target:
         payload["top_rollback_target"] = top_rollback_target
+    if top_execution_artifact_review_subtype:
+        payload["top_execution_artifact_review_subtype"] = top_execution_artifact_review_subtype
+    if top_execution_ambiguity_count:
+        payload["top_execution_ambiguity_count"] = top_execution_ambiguity_count
     if top_historical_rollback_target or top_historical_rollback_target_alignment is not None:
         payload.update(
             {
@@ -2384,6 +3366,444 @@ def _build_environment_readiness_guidance(environment_failure: dict | None) -> d
     }
 
 
+def _build_user_intervention_guidance(incident_type: str | None) -> dict[str, object]:
+    incident = str(incident_type or "").strip()
+    if incident == "authorization":
+        return {
+            "lane_reason": "The current project is mainly waiting on explicit user authorization.",
+            "next_move": "resolve_authorization_request",
+            "next_reason": "Review and approve or reject the pending command so execution can continue.",
+            "step_codes": [
+                "open_task",
+                "review_and_authorize_command",
+                "recheck_task_state",
+            ],
+        }
+    if incident == "repair":
+        return {
+            "lane_reason": "The current project is mainly waiting on explicit user repair input.",
+            "next_move": "resolve_repair_request",
+            "next_reason": "Inspect the failing command and choose a repair path before resuming.",
+            "step_codes": [
+                "open_task",
+                "review_failure_and_choose_repair",
+                "recheck_task_state",
+            ],
+        }
+    if incident == "resource_clarification":
+        return {
+            "lane_reason": "The current project is mainly waiting on explicit user resource clarification.",
+            "next_move": "resolve_resource_clarification",
+            "next_reason": "Clarify the missing or ambiguous resource details so planning/binding can continue.",
+            "step_codes": [
+                "open_chat",
+                "provide_missing_resource_clarification",
+                "recheck_task_state",
+            ],
+        }
+    return {}
+
+
+def _build_confirmation_gate_guidance(
+    incident_type: str | None,
+    *,
+    execution_ambiguity_count: int = 0,
+    execution_memory_review_count: int = 0,
+) -> dict[str, object]:
+    incident = str(incident_type or "").strip()
+    if incident not in {"execution_confirmation", "plan_confirmation"}:
+        return {}
+    if incident == "execution_confirmation" and execution_ambiguity_count > 0:
+        ambiguous_guidance = _build_resource_readiness_guidance("ambiguous_candidates")
+        return {
+            "lane_reason": (
+                "The highest-priority incidents are waiting at confirmation gates because "
+                "execution semantics still contain ambiguous resource candidates."
+            ),
+            "next_move": "resolve_ambiguous_resource_candidates",
+            "next_reason": (
+                "Inspect the competing execution-time resource candidates, choose the preferred "
+                "match, then reconfirm the execution graph."
+            ),
+            "step_codes": list(ambiguous_guidance.get("step_codes") or []),
+        }
+    if incident == "execution_confirmation" and execution_memory_review_count > 0:
+        return {
+            "lane_reason": (
+                "The highest-priority incidents are waiting at confirmation gates because "
+                "execution semantics conflict with previously confirmed project memory."
+            ),
+            "next_move": "review_project_memory_conflicts",
+            "next_reason": (
+                "Compare the execution-time candidate choices against previously confirmed "
+                "project memory, resolve the conflict, then reconfirm the execution graph."
+            ),
+            "step_codes": [
+                "open_task",
+                "review_project_memory_patterns",
+                "inspect_resource_candidates",
+                "confirm_or_edit_execution",
+                "recheck_task_state",
+            ],
+        }
+    if incident == "plan_confirmation":
+        return {
+            "lane_reason": "The highest-priority incidents are waiting at confirmation gates.",
+            "next_move": "review_confirmation_gate",
+            "next_reason": "Confirm or revise the pending plan / execution graph so the blocked lane can continue.",
+            "step_codes": [
+                "open_chat",
+                "confirm_or_edit_execution",
+                "recheck_task_state",
+            ],
+        }
+    return {
+        "lane_reason": "The highest-priority incidents are waiting at confirmation gates.",
+        "next_move": "review_confirmation_gate",
+        "next_reason": "Confirm or revise the pending plan / execution graph so the blocked lane can continue.",
+        "step_codes": [
+            "open_chat",
+            "confirm_or_edit_execution",
+            "recheck_task_state",
+        ],
+    }
+
+
+def _infer_dossier_resource_blocker_cause(dossier: dict | None) -> str | None:
+    cause_counts = _collect_resource_readiness_cause_counts([dossier] if dossier else [])
+    return cause_counts.most_common(1)[0][0] if cause_counts else None
+
+
+def _build_trace_aware_operator_reason(
+    rollback_level: str | None,
+    rollback_target: str | None,
+    semantic_memory_dossier: dict | None,
+    fallback: str,
+) -> str:
+    level = str(rollback_level or "").strip()
+    target = str(rollback_target or "").strip()
+    if level == "execution_ir" and target == "execution_artifact_review":
+        subtype = _infer_execution_artifact_review_subtype(semantic_memory_dossier)
+        if subtype == "upstream_output_regeneration":
+            return (
+                "Review upstream produced artifact lineage first, "
+                "then decide whether affected outputs should be regenerated before retrying runtime recovery."
+            )
+        return (
+            "Review artifact lineage and downstream artifact bindings first, "
+            "then decide whether affected outputs should be rebound before retrying runtime recovery."
+        )
+    if level == "execution_ir" and target == "resource_clarification_gate":
+        return (
+            "Review resource clarification choices and registered resource bindings first, "
+            "then rebuild execution semantics before retrying runtime recovery."
+        )
+    return fallback
+
+
+def _resolve_decision_source(decision_context: dict | None) -> str | None:
+    source = str((decision_context or {}).get("preferred_lane_source") or "").strip()
+    return source or None
+
+
+def _build_supervisor_decision_context(
+    *,
+    incident_type: str | None,
+    owner: str | None,
+    failure_layer: str | None,
+    rollback_level: str | None,
+    rollback_target: str | None,
+    safe_action: str | None,
+    auto_recoverable: bool,
+    historical_policy: dict | None,
+    structured_memory_policy: dict | None,
+    historical_guidance: str | None,
+    dossier: dict | None,
+    blocker_cause: str | None = None,
+    environment_failure: dict | None = None,
+) -> dict[str, Any]:
+    decision_dossier = dossier or {}
+    semantic_memory_dossier = decision_dossier.get("semantic_memory_dossier") or {}
+    semantic_signals = _extract_semantic_dossier_signals(semantic_memory_dossier)
+    structured_policy = structured_memory_policy or {}
+    historical_policy = historical_policy or {}
+    execution_summary = decision_dossier.get("execution_plan_summary") or {}
+    project_memory_profile = decision_dossier.get("project_memory_profile") or {}
+    project_memory_preferences = project_memory_profile.get("preferences") or {}
+    top_blocker_cause = (
+        str(blocker_cause or "").strip()
+        or _infer_dossier_resource_blocker_cause(decision_dossier)
+        or None
+    )
+    top_environment_failure = environment_failure or decision_dossier.get("environment_failure") or {}
+
+    structured_safe_action_alignment = structured_policy.get("preferred_safe_action_aligns_with_current")
+    structured_rollback_level = (
+        str(structured_policy.get("preferred_rollback_level") or "").strip() or None
+    )
+    structured_rollback_alignment = structured_policy.get("preferred_rollback_level_aligns_with_current")
+    structured_analysis_family = (
+        str(structured_policy.get("preferred_analysis_family") or "").strip() or None
+    )
+    historical_rollback_level = (
+        str(historical_policy.get("preferred_rollback_level") or "").strip() or None
+    )
+    historical_rollback_alignment = historical_policy.get("rollback_level_aligns_with_current")
+    historical_rollback_target = (
+        str(historical_policy.get("preferred_rollback_target") or "").strip() or None
+    )
+    historical_rollback_target_alignment = historical_policy.get("rollback_target_aligns_with_current")
+
+    project_memory_episode_count = int(project_memory_profile.get("episode_count", 0) or 0)
+    project_memory_pattern_count = max(
+        int(structured_policy.get("pattern_count") or 0),
+        int(semantic_memory_dossier.get("memory_pattern_count", 0) or 0),
+    )
+    project_memory_preference_count = max(
+        int(structured_policy.get("preference_count") or 0),
+        int(semantic_memory_dossier.get("memory_preference_count", 0) or 0),
+    )
+    project_memory_preferred_safe_action = (
+        str(project_memory_preferences.get("preferred_safe_action") or "").strip()
+        or str(structured_policy.get("preferred_safe_action") or "").strip()
+        or None
+    )
+    project_memory_preferred_rollback_level = (
+        str(project_memory_preferences.get("preferred_rollback_level") or "").strip()
+        or structured_rollback_level
+        or None
+    )
+    project_memory_preferred_analysis_family = (
+        str(project_memory_preferences.get("preferred_analysis_family") or "").strip()
+        or structured_analysis_family
+        or None
+    )
+    requires_project_memory_review = bool(
+        (
+            project_memory_episode_count > 0
+            or project_memory_pattern_count > 0
+            or project_memory_preference_count > 0
+        )
+        and (
+            project_memory_preferred_safe_action
+            or project_memory_preferred_rollback_level
+            or project_memory_preferred_analysis_family
+            or structured_rollback_alignment is True
+            or structured_safe_action_alignment is True
+        )
+    )
+    requires_historical_review = bool(historical_guidance) or bool(
+        historical_policy.get("support_count")
+    )
+    requires_semantic_dossier_review = semantic_signals["has_link_graph"]
+    review_semantic_dossier_during_recovery = bool(
+        rollback_level in {"execution_ir", "dag"} and semantic_signals["has_review_signal"]
+    )
+    resume_after_recovery = safe_action in {
+        "retry_resume_chain",
+        "step_reenter",
+        "normalize_orphan_pending_state",
+    }
+
+    preferred_lane = None
+    preferred_lane_reason = None
+    preferred_next_move = None
+    preferred_next_reason = None
+    preferred_lane_source = None
+    preferred_step_codes: list[str] | None = None
+    current_incident_type = str(incident_type or "").strip()
+    current_failure_layer = str(failure_layer or "").strip()
+    execution_ambiguity_count = max(
+        int(execution_summary.get("ambiguity_count", 0) or 0),
+        semantic_signals["ambiguity_count"],
+    )
+    execution_memory_review_count = int(execution_summary.get("memory_review_count", 0) or 0)
+
+    if current_incident_type in {"execution_confirmation", "plan_confirmation"}:
+        confirmation_guidance = _build_confirmation_gate_guidance(
+            current_incident_type,
+            execution_ambiguity_count=execution_ambiguity_count,
+            execution_memory_review_count=execution_memory_review_count,
+        )
+        preferred_lane = "confirmation_gates"
+        preferred_lane_source = "confirmation_gate"
+        preferred_lane_reason = str(confirmation_guidance.get("lane_reason") or "").strip() or None
+        preferred_next_move = str(confirmation_guidance.get("next_move") or "").strip() or None
+        preferred_next_reason = str(confirmation_guidance.get("next_reason") or "").strip() or None
+        preferred_step_codes = list(confirmation_guidance.get("step_codes") or []) or None
+    elif current_incident_type in {"authorization", "repair", "resource_clarification"}:
+        intervention_guidance = _build_user_intervention_guidance(current_incident_type)
+        preferred_lane = "user_intervention"
+        preferred_lane_source = current_incident_type
+        preferred_lane_reason = str(intervention_guidance.get("lane_reason") or "").strip() or None
+        preferred_next_move = str(intervention_guidance.get("next_move") or "").strip() or None
+        preferred_next_reason = str(intervention_guidance.get("next_reason") or "").strip() or None
+        preferred_step_codes = list(intervention_guidance.get("step_codes") or []) or None
+    elif top_blocker_cause:
+        resource_guidance = _build_resource_readiness_guidance(top_blocker_cause)
+        preferred_lane = "resource_readiness"
+        preferred_lane_source = "resource_readiness"
+        preferred_lane_reason = str(resource_guidance.get("lane_reason") or "").strip() or None
+        preferred_next_move = str(resource_guidance.get("next_move") or "").strip() or None
+        preferred_next_reason = str(resource_guidance.get("next_reason") or "").strip() or None
+        preferred_step_codes = list(resource_guidance.get("step_codes") or []) or None
+    elif current_failure_layer == "resource_binding":
+        resource_guidance = _build_resource_readiness_guidance(None)
+        preferred_lane = "resource_readiness"
+        preferred_lane_source = "resource_readiness"
+        preferred_lane_reason = str(resource_guidance.get("lane_reason") or "").strip() or None
+        preferred_next_move = str(resource_guidance.get("next_move") or "").strip() or None
+        preferred_next_reason = str(resource_guidance.get("next_reason") or "").strip() or None
+        preferred_step_codes = list(resource_guidance.get("step_codes") or []) or None
+    elif top_environment_failure:
+        environment_guidance = _build_environment_readiness_guidance(top_environment_failure)
+        preferred_lane = "environment_readiness"
+        preferred_lane_source = "environment_readiness"
+        preferred_lane_reason = str(environment_guidance.get("lane_reason") or "").strip() or None
+        preferred_next_move = str(environment_guidance.get("next_move") or "").strip() or None
+        preferred_next_reason = str(environment_guidance.get("next_reason") or "").strip() or None
+        preferred_step_codes = list(environment_guidance.get("step_codes") or []) or None
+
+    if (
+        preferred_lane is None
+        and not safe_action
+        and str(rollback_level or "").strip() == "execution_ir"
+        and str(rollback_target or "").strip() in {"resource_clarification_gate", "execution_artifact_review"}
+    ):
+        preferred_lane = "rollback_review"
+        preferred_lane_source = "semantic_trace"
+        if rollback_target == "execution_artifact_review":
+            preferred_lane_reason = (
+                "Project semantic traces point to artifact-lineage rollback review before runtime retry."
+            )
+        else:
+            preferred_lane_reason = (
+                "Project semantic traces point to resource-clarification rollback review before runtime retry."
+            )
+        preferred_next_move = "review_rollback_scope"
+        preferred_next_reason = _build_trace_aware_operator_reason(
+            rollback_level,
+            rollback_target,
+            semantic_memory_dossier,
+            "Review resource clarification / execution semantics first, then rebuild the execution graph before retrying runtime recovery.",
+        )
+    elif (
+        preferred_lane is None
+        and not safe_action
+        and structured_rollback_alignment is True
+        and structured_rollback_level in {"abstract_plan", "execution_ir", "dag"}
+    ):
+        preferred_lane = "rollback_review"
+        preferred_lane_source = "structured_memory"
+        preferred_next_move = "review_rollback_scope"
+        if structured_rollback_level == "abstract_plan":
+            preferred_lane_reason = (
+                "Structured project memory patterns point to abstract-plan rollback review before runtime retry."
+            )
+            preferred_next_reason = (
+                "Re-open the abstract plan in chat, confirm the rollback scope, and only then decide whether runtime recovery is still appropriate."
+            )
+        elif structured_rollback_level == "execution_ir":
+            preferred_lane_reason = (
+                "Structured project memory patterns point to execution-semantics rollback review before runtime retry."
+            )
+            preferred_next_reason = _build_trace_aware_operator_reason(
+                structured_rollback_level,
+                rollback_target,
+                semantic_memory_dossier,
+                "Review resource clarification / execution semantics first, then rebuild the execution graph before retrying runtime recovery.",
+            )
+        else:
+            preferred_lane_reason = (
+                "Structured project memory patterns point to expanded-DAG rollback review before runtime retry."
+            )
+            preferred_next_reason = (
+                "Review the expanded DAG changes in chat and reconfirm the execution graph before attempting runtime recovery."
+            )
+    elif (
+        preferred_lane is None
+        and not safe_action
+        and historical_rollback_alignment is True
+        and historical_rollback_level in {"abstract_plan", "execution_ir", "dag"}
+    ):
+        preferred_lane = "rollback_review"
+        preferred_lane_source = "historical_memory"
+        preferred_next_move = "review_rollback_scope"
+        if historical_rollback_level == "abstract_plan":
+            preferred_lane_reason = (
+                "Project memory and the current dossier both point to abstract-plan rollback review before runtime retry."
+            )
+            preferred_next_reason = (
+                "Re-open the abstract plan in chat, confirm the rollback scope, and only then decide whether runtime recovery is still appropriate."
+            )
+        elif historical_rollback_level == "execution_ir":
+            preferred_lane_reason = (
+                "Project memory and the current dossier both point to execution-semantics rollback review before runtime retry."
+            )
+            preferred_next_reason = _build_trace_aware_operator_reason(
+                historical_rollback_level,
+                rollback_target,
+                semantic_memory_dossier,
+                "Review resource clarification / execution semantics first, then rebuild the execution graph before retrying runtime recovery.",
+            )
+        else:
+            preferred_lane_reason = (
+                "Project memory and the current dossier both point to expanded-DAG rollback review before runtime retry."
+            )
+            preferred_next_reason = (
+                "Review the expanded DAG changes in chat and reconfirm the execution graph before attempting runtime recovery."
+            )
+    elif preferred_lane is None and (safe_action or auto_recoverable):
+        preferred_lane = "runtime_recovery"
+        preferred_lane_source = "runtime_recovery"
+        preferred_lane_reason = "The current project is mainly in runtime recovery / normalization work."
+        preferred_next_move = "apply_runtime_recovery"
+        preferred_next_reason = (
+            "Apply the top safe action or normalization path, then recheck job state consistency."
+        )
+
+    return {
+        "incident_type": str(incident_type or "").strip() or None,
+        "owner": str(owner or "").strip() or None,
+        "failure_layer": str(failure_layer or "").strip() or None,
+        "rollback_level": str(rollback_level or "").strip() or None,
+        "rollback_target": str(rollback_target or "").strip() or None,
+        "safe_action": str(safe_action or "").strip() or None,
+        "artifact_review_subtype": semantic_signals["artifact_review_subtype"],
+        "execution_ambiguity_count": execution_ambiguity_count,
+        "execution_memory_review_count": execution_memory_review_count,
+        "resource_blocker_cause": top_blocker_cause,
+        "structured_safe_action_alignment": structured_safe_action_alignment,
+        "structured_rollback_level": structured_rollback_level,
+        "structured_rollback_alignment": structured_rollback_alignment,
+        "structured_analysis_family": structured_analysis_family,
+        "historical_rollback_level": historical_rollback_level,
+        "historical_rollback_alignment": historical_rollback_alignment,
+        "historical_rollback_target": historical_rollback_target,
+        "historical_rollback_target_alignment": historical_rollback_target_alignment,
+        "project_memory_episode_count": project_memory_episode_count,
+        "project_memory_pattern_count": project_memory_pattern_count,
+        "project_memory_preference_count": project_memory_preference_count,
+        "project_memory_resource_link_count": semantic_signals["resource_link_count"],
+        "project_memory_artifact_link_count": semantic_signals["artifact_link_count"],
+        "project_memory_runtime_link_count": semantic_signals["runtime_link_count"],
+        "project_memory_preferred_safe_action": project_memory_preferred_safe_action,
+        "project_memory_preferred_rollback_level": project_memory_preferred_rollback_level,
+        "project_memory_preferred_analysis_family": project_memory_preferred_analysis_family,
+        "requires_historical_review": requires_historical_review,
+        "requires_project_memory_review": requires_project_memory_review,
+        "requires_semantic_dossier_review": requires_semantic_dossier_review,
+        "review_semantic_dossier_during_recovery": review_semantic_dossier_during_recovery,
+        "resume_after_recovery": resume_after_recovery,
+        "preferred_lane": preferred_lane,
+        "preferred_lane_source": preferred_lane_source,
+        "preferred_lane_reason": preferred_lane_reason,
+        "next_best_operator_move": preferred_next_move,
+        "next_best_operator_reason": preferred_next_reason,
+        "preferred_step_codes": preferred_step_codes or [],
+    }
+
+
 def _build_project_playbook(
     focus_summary: dict | None,
     recommendations: list[dict] | None = None,
@@ -2391,11 +3811,38 @@ def _build_project_playbook(
     focus_summary = focus_summary or {}
     recommendations = [item for item in (recommendations or []) if isinstance(item, dict)]
     top = recommendations[0] if recommendations else {}
+    top_decision_context = top.get("decision_context") or {}
     move = str(focus_summary.get("next_best_operator_move") or "inspect_top_incident").strip()
     lane = str(focus_summary.get("primary_lane") or "operator_review").strip()
+    preferred_context_move = str(top_decision_context.get("next_best_operator_move") or "").strip()
+    preferred_context_lane = str(top_decision_context.get("preferred_lane") or "").strip()
+    preferred_context_source = _resolve_decision_source(top_decision_context)
+    preferred_context_step_codes = [
+        str(code).strip()
+        for code in (top_decision_context.get("preferred_step_codes") or [])
+        if str(code).strip()
+    ]
     step_codes: list[str] = []
+    decision_source = (
+        str(focus_summary.get("decision_source") or "").strip()
+        or preferred_context_source
+        or None
+    )
 
-    if move == "review_confirmation_gate":
+    if (
+        preferred_context_step_codes
+        and preferred_context_move == move
+        and preferred_context_lane == lane
+        and lane in {
+            "user_intervention",
+            "confirmation_gates",
+            "resource_readiness",
+            "environment_readiness",
+        }
+    ):
+        step_codes.extend(preferred_context_step_codes)
+        decision_source = preferred_context_source or decision_source
+    elif move == "review_confirmation_gate":
         step_codes.extend([
             "open_chat",
             "confirm_or_edit_execution",
@@ -2419,6 +3866,14 @@ def _build_project_playbook(
             "provide_missing_resource_clarification",
             "recheck_task_state",
         ])
+    elif move == "review_project_memory_conflicts":
+        step_codes.extend([
+            "open_task",
+            "review_project_memory_patterns",
+            "inspect_resource_candidates",
+            "confirm_or_edit_execution",
+            "recheck_task_state",
+        ])
     elif move == "inspect_environment_failure":
         step_codes.extend([
             "open_task",
@@ -2434,16 +3889,32 @@ def _build_project_playbook(
         "refresh_stale_derived_resource",
         "restore_missing_runtime_resource",
     }:
+        blocker_cause = focus_summary.get("top_blocker_cause")
+        if move == "resolve_ambiguous_resource_candidates" and not blocker_cause:
+            blocker_cause = "ambiguous_candidates"
         step_codes.extend(
             list(
                 _build_resource_readiness_guidance(
-                    focus_summary.get("top_blocker_cause")
+                    blocker_cause
                 ).get("step_codes")
                 or []
             )
         )
     elif move == "review_rollback_scope":
-        rollback_level = str(top.get("rollback_level") or "").strip()
+        rollback_level = (
+            str(top_decision_context.get("rollback_level") or "").strip()
+            or str(top.get("rollback_level") or "").strip()
+        )
+        rollback_target = (
+            str(top_decision_context.get("rollback_target") or "").strip()
+            or str(focus_summary.get("top_rollback_target") or "").strip()
+            or str(top.get("rollback_target") or "").strip()
+        )
+        artifact_review_subtype = str(
+            top_decision_context.get("artifact_review_subtype")
+            or focus_summary.get("top_execution_artifact_review_subtype")
+            or ""
+        ).strip()
         if rollback_level == "abstract_plan":
             step_codes.extend([
                 "open_chat",
@@ -2451,11 +3922,19 @@ def _build_project_playbook(
                 "recheck_task_state",
             ])
         elif rollback_level == "execution_ir":
-            step_codes.extend([
-                "open_chat",
-                "provide_missing_resource_clarification",
-                "recheck_task_state",
-            ])
+            if rollback_target == "execution_artifact_review":
+                step_codes.extend(["open_task", "review_semantic_memory_dossier", "inspect_artifact_lineage"])
+                if artifact_review_subtype == "upstream_output_regeneration":
+                    step_codes.append("regenerate_upstream_outputs")
+                else:
+                    step_codes.append("rebind_downstream_artifacts")
+                step_codes.extend(["open_chat", "recheck_task_state"])
+            else:
+                step_codes.extend([
+                    "open_chat",
+                    "provide_missing_resource_clarification",
+                    "recheck_task_state",
+                ])
         else:
             step_codes.extend([
                 "open_chat",
@@ -2476,20 +3955,79 @@ def _build_project_playbook(
         ])
 
     historical_policy = top.get("historical_policy") or {}
-    has_historical_signal = bool(top.get("historical_guidance")) or bool(
-        historical_policy.get("support_count")
-    )
-    if has_historical_signal:
-        if step_codes and step_codes[0] in {"open_task", "open_chat"}:
-            step_codes.insert(1, "review_historical_policy")
-        else:
-            step_codes.insert(0, "review_historical_policy")
+    has_historical_signal = bool(top_decision_context.get("requires_historical_review"))
+    if not has_historical_signal:
+        has_historical_signal = bool(top.get("historical_guidance")) or bool(
+            historical_policy.get("support_count")
+        )
 
-    if lane == "runtime_recovery" and top.get("safe_action") in {
-        "retry_resume_chain",
-        "step_reenter",
-        "normalize_orphan_pending_state",
-    }:
+    requires_project_memory_review = bool(
+        top_decision_context.get("requires_project_memory_review")
+    )
+    if not requires_project_memory_review:
+        project_memory_episode_count = int(focus_summary.get("project_memory_episode_count", 0) or 0)
+        project_memory_pattern_count = int(focus_summary.get("project_memory_pattern_count", 0) or 0)
+        project_memory_preference_count = int(focus_summary.get("project_memory_preference_count", 0) or 0)
+        project_memory_preferred_safe_action = str(
+            focus_summary.get("project_memory_preferred_safe_action") or ""
+        ).strip()
+        project_memory_preferred_rollback_level = str(
+            focus_summary.get("project_memory_preferred_rollback_level") or ""
+        ).strip()
+        project_memory_preferred_analysis_family = str(
+            focus_summary.get("project_memory_preferred_analysis_family") or ""
+        ).strip()
+        requires_project_memory_review = bool(
+            (
+                project_memory_episode_count > 0
+                or project_memory_pattern_count > 0
+                or project_memory_preference_count > 0
+            )
+            and (
+                project_memory_preferred_safe_action
+                or project_memory_preferred_rollback_level
+                or project_memory_preferred_analysis_family
+                or focus_summary.get("top_structured_rollback_alignment") is True
+                or focus_summary.get("top_structured_safe_action_alignment") is True
+            )
+        )
+
+    requires_semantic_dossier_review = bool(
+        top_decision_context.get("requires_semantic_dossier_review")
+    )
+    if not requires_semantic_dossier_review:
+        project_memory_resource_link_count = int(focus_summary.get("project_memory_resource_link_count", 0) or 0)
+        project_memory_artifact_link_count = int(focus_summary.get("project_memory_artifact_link_count", 0) or 0)
+        project_memory_runtime_link_count = int(focus_summary.get("project_memory_runtime_link_count", 0) or 0)
+        requires_semantic_dossier_review = bool(
+            project_memory_resource_link_count > 0
+            or project_memory_artifact_link_count > 0
+            or project_memory_runtime_link_count > 0
+        )
+
+    review_steps: list[str] = []
+    if has_historical_signal and "review_historical_policy" not in step_codes:
+        review_steps.append("review_historical_policy")
+    if requires_project_memory_review and "review_project_memory_patterns" not in step_codes:
+        review_steps.append("review_project_memory_patterns")
+    if (
+        requires_semantic_dossier_review
+        and lane in {"confirmation_gates", "resource_readiness", "rollback_review", "runtime_recovery"}
+        and "review_semantic_memory_dossier" not in step_codes
+    ):
+        review_steps.append("review_semantic_memory_dossier")
+    if review_steps:
+        insert_at = 1 if step_codes and step_codes[0] in {"open_task", "open_chat"} else 0
+        step_codes[insert_at:insert_at] = review_steps
+
+    if lane == "runtime_recovery" and (
+        bool(top_decision_context.get("resume_after_recovery"))
+        or top.get("safe_action") in {
+            "retry_resume_chain",
+            "step_reenter",
+            "normalize_orphan_pending_state",
+        }
+    ):
         step_codes.append("resume_job")
 
     deduped_step_codes: list[str] = []
@@ -2500,6 +4038,7 @@ def _build_project_playbook(
     return {
         "goal": lane or "operator_review",
         "next_move": move,
+        "decision_source": decision_source,
         "step_codes": deduped_step_codes,
     }
 
@@ -2571,6 +4110,17 @@ async def _record_supervisor_resolution_event(
             description=description,
             resolution="; ".join(resolution_parts),
             user_contributed=user_contributed,
+            thread_id=getattr(job, "thread_id", None),
+            job_id=getattr(job, "id", None),
+            step_id=getattr(job, "current_step_id", None),
+            metadata_json={
+                "incident_type": incident.get("incident_type"),
+                "failure_layer": _infer_failure_layer(str(incident.get("incident_type") or "").strip()),
+                "safe_action": safe_action,
+                "rollback_level": rollback_level,
+                "rollback_target": rollback_target,
+                "outcome_status": outcome_status,
+            },
         )
     except Exception:
         log.exception(
@@ -3248,6 +4798,58 @@ def _build_dossier_summary(dossier: dict) -> str:
     similar_resolutions = dossier.get("similar_resolutions") or []
     if similar_resolutions:
         fragments.append(f"memory_matches={len(similar_resolutions)}")
+    project_memory_profile = dossier.get("project_memory_profile") or {}
+    if project_memory_profile:
+        episode_count = int(project_memory_profile.get("episode_count", 0) or 0)
+        if episode_count:
+            fragments.append(f"memory_episodes={episode_count}")
+        safe_action_patterns = project_memory_profile.get("safe_action_patterns") or []
+        if safe_action_patterns:
+            fragments.append(f"memory_patterns={len(safe_action_patterns)}")
+        preferences = project_memory_profile.get("preferences") or {}
+        if preferences.get("preferred_safe_action"):
+            fragments.append("memory_pref_safe_action=" + str(preferences.get("preferred_safe_action")))
+        if preferences.get("preferred_analysis_family"):
+            fragments.append("memory_pref_family=" + str(preferences.get("preferred_analysis_family")))
+    memory_patterns = dossier.get("memory_patterns") or []
+    if memory_patterns:
+        fragments.append(f"structured_memory_patterns={len(memory_patterns)}")
+    memory_preferences = dossier.get("memory_preferences") or []
+    if memory_preferences:
+        fragments.append(f"structured_memory_preferences={len(memory_preferences)}")
+    semantic_memory_dossier = dossier.get("semantic_memory_dossier") or {}
+    if semantic_memory_dossier:
+        semantic_signals = _extract_semantic_dossier_signals(semantic_memory_dossier)
+        resource_candidate_count = int(semantic_memory_dossier.get("resource_candidate_count", 0) or 0)
+        stable_fact_count = int(semantic_memory_dossier.get("stable_fact_count", 0) or 0)
+        semantic_hint_count = int(semantic_memory_dossier.get("semantic_hint_count", 0) or 0)
+        ambiguity_count = semantic_signals["ambiguity_count"]
+        memory_hint_count = int(semantic_memory_dossier.get("memory_hint_count", 0) or 0)
+        memory_pattern_count = int(semantic_memory_dossier.get("memory_pattern_count", 0) or 0)
+        memory_preference_count = int(semantic_memory_dossier.get("memory_preference_count", 0) or 0)
+        memory_link_count = int(semantic_memory_dossier.get("memory_link_count", 0) or 0)
+        resource_link_count = semantic_signals["resource_link_count"]
+        artifact_link_count = semantic_signals["artifact_link_count"]
+        if resource_candidate_count:
+            fragments.append(f"semantic_candidates={resource_candidate_count}")
+        if stable_fact_count:
+            fragments.append(f"stable_facts={stable_fact_count}")
+        if semantic_hint_count:
+            fragments.append(f"semantic_hints={semantic_hint_count}")
+        if ambiguity_count:
+            fragments.append(f"semantic_ambiguities={ambiguity_count}")
+        if memory_hint_count:
+            fragments.append(f"semantic_memory_hints={memory_hint_count}")
+        if memory_pattern_count:
+            fragments.append(f"semantic_memory_patterns={memory_pattern_count}")
+        if memory_preference_count:
+            fragments.append(f"semantic_memory_preferences={memory_preference_count}")
+        if memory_link_count:
+            fragments.append(f"semantic_memory_links={memory_link_count}")
+        if resource_link_count:
+            fragments.append(f"semantic_memory_resource_links={resource_link_count}")
+        if artifact_link_count:
+            fragments.append(f"semantic_memory_artifact_links={artifact_link_count}")
     rollback_hint = dossier.get("rollback_hint") or {}
     if rollback_hint.get("suggested_level"):
         fragments.append(f"rollback_hint={rollback_hint.get('suggested_level')}")
@@ -3260,6 +4862,7 @@ def _build_dossier_rollback_hint(dossier: dict) -> dict[str, str] | None:
     current_step_key = str(((dossier.get("current_step") or {}).get("step_key")) or "").strip()
     overview = dossier.get("execution_confirmation_overview") or {}
     delta = dossier.get("execution_plan_delta") or {}
+    memory_review_count = int(overview.get("memory_review_count", 0) or 0)
 
     added_groups = {
         str(item.get("group_key") or "").strip()
@@ -3301,6 +4904,20 @@ def _build_dossier_rollback_hint(dossier: dict) -> dict[str, str] | None:
             "suggested_level": "dag",
             "reason": "Runtime failure happened after orchestration changed execution groups, so revisit the expanded DAG before retrying from a step.",
         }
+
+    if memory_review_count > 0:
+        target_label = current_step_key or incident_type or "current execution path"
+        return {
+            "suggested_level": "execution_ir",
+            "reason": (
+                "Execution-time resource choices currently conflict with previously confirmed project memory, "
+                f"so rollback should revisit execution semantics before retrying '{target_label}'."
+            ),
+        }
+
+    semantic_hint = _build_semantic_memory_rollback_hint(dossier)
+    if semantic_hint is not None:
+        return semantic_hint
 
     return None
 
@@ -3407,6 +5024,10 @@ async def _build_job_rollback_guidance(
     if incident is None:
         return None
     confirmation = _serialize_confirmation_details(job, effective.get("pending_interaction_type"))
+    semantic_memory_dossier = await _fetch_project_semantic_memory_dossier(
+        session,
+        getattr(job, "project_id", None),
+    )
     rollback_context = {
         "job_id": job.id,
         "incident_type": incident["incident_type"],
@@ -3415,6 +5036,7 @@ async def _build_job_rollback_guidance(
         },
         "execution_confirmation_overview": confirmation.get("execution_confirmation_overview"),
         "execution_plan_delta": confirmation.get("execution_plan_delta"),
+        "semantic_memory_dossier": semantic_memory_dossier or {},
     }
     rollback_context["rollback_hint"] = _build_dossier_rollback_hint(rollback_context)
     rollback_target, rollback_level, _diagnosis, _safe_action = _resolve_supervisor_incident_controls(
@@ -3443,6 +5065,7 @@ def _build_pending_request_snapshot(
     *,
     auth_requests: list[dict] | None = None,
     repair_requests: list[dict] | None = None,
+    progress_state: dict | None = None,
 ) -> dict:
     runtime_diagnostics = [
         item for item in (effective.get("runtime_diagnostics") or [])
@@ -3487,6 +5110,7 @@ def _build_pending_request_snapshot(
             }
             for item in (repair_requests or [])
         ],
+        "progress_state": progress_state,
     }
 
 
@@ -3587,8 +5211,10 @@ async def _build_job_dossier(
     effective: dict,
     incident: dict,
     current_step=None,
+    semantic_memory_dossier: dict | None = None,
 ) -> dict:
     confirmation = _serialize_confirmation_details(job, effective.get("pending_interaction_type"))
+    progress_state = await _load_job_progress_state(session, job, effective)
     execution_plan = _serialize_execution_plan(job)
     recent_logs = await _fetch_recent_job_logs(session, job.id)
     recent_decisions = await _fetch_recent_user_decisions(session, job.id)
@@ -3601,6 +5227,20 @@ async def _build_job_dossier(
         job,
         incident,
         current_step=current_step,
+    )
+    project_memory_profile = await _fetch_project_memory_profile(
+        session,
+        getattr(job, "project_id", None),
+    )
+    if semantic_memory_dossier is None:
+        semantic_memory_dossier = await _fetch_project_semantic_memory_dossier(
+            session,
+            getattr(job, "project_id", None),
+        )
+    memory_patterns, memory_preferences = await _fetch_project_structured_memory_layers(
+        session,
+        getattr(job, "project_id", None),
+        fallback_profile=project_memory_profile,
     )
     anchor_step_key = (
         getattr(current_step, "step_key", None)
@@ -3622,6 +5262,7 @@ async def _build_job_dossier(
         },
         "execution_confirmation_overview": confirmation.get("execution_confirmation_overview"),
         "execution_plan_delta": confirmation.get("execution_plan_delta"),
+        "semantic_memory_dossier": semantic_memory_dossier or {},
     }
     rollback_context["rollback_hint"] = _build_dossier_rollback_hint(rollback_context)
     rollback_target, rollback_level, _diagnosis, _safe_action = _resolve_supervisor_incident_controls(
@@ -3637,6 +5278,7 @@ async def _build_job_dossier(
         "project_id": job.project_id,
         "incident_type": incident["incident_type"],
         "pending_interaction_type": effective.get("pending_interaction_type"),
+        "progress_state": progress_state,
         "failure_layer": _infer_failure_layer(incident["incident_type"]),
         "rollback_level": rollback_level,
         "rollback_target": rollback_target,
@@ -3653,6 +5295,8 @@ async def _build_job_dossier(
         "execution_ir_review": confirmation.get("execution_ir_review") or [],
         "execution_plan_delta": confirmation.get("execution_plan_delta"),
         "execution_plan_changes": confirmation.get("execution_plan_changes") or [],
+        "execution_semantic_guardrails": confirmation.get("execution_semantic_guardrails"),
+        "execution_decision_source": confirmation.get("execution_decision_source"),
         "resource_graph": _summarize_resource_graph_snapshot(getattr(job, "resource_graph_json", None)),
         "resource_decisions": resource_decisions,
         "recent_logs": recent_logs,
@@ -3662,12 +5306,17 @@ async def _build_job_dossier(
             effective,
             auth_requests=recent_auth_requests,
             repair_requests=recent_repair_requests,
+            progress_state=progress_state,
         ),
         "pending_interaction_payload": effective.get("pending_interaction_payload"),
         "runtime_diagnostics": effective.get("runtime_diagnostics") or [],
         "environment_failure": environment_failure,
         "auto_recovery_events": auto_recovery_events,
         "similar_resolutions": similar_resolutions,
+        "project_memory_profile": project_memory_profile,
+        "memory_patterns": memory_patterns,
+        "memory_preferences": memory_preferences,
+        "semantic_memory_dossier": semantic_memory_dossier or {},
     }
     dossier["rollback_hint"] = rollback_context["rollback_hint"]
     dossier["rollback_guidance"] = _build_rollback_guidance(dossier)
@@ -3683,6 +5332,10 @@ def _derive_job_incident(
     status = effective.get("status") or getattr(job, "status", None)
     pending_type = effective.get("pending_interaction_type")
     pending_payload = effective.get("pending_interaction_payload") or {}
+    decision_packet = _pending_decision_packet_dict(pending_payload)
+    clarification_request = _pending_clarification_request_dict(pending_payload)
+    execution_evidence = _pending_execution_evidence_dict(pending_payload)
+    repair_loop_state = _pending_repair_loop_state_dict(pending_payload)
     runtime_diagnostics = [
         item for item in (effective.get("runtime_diagnostics") or [])
         if isinstance(item, dict)
@@ -3708,8 +5361,11 @@ def _derive_job_incident(
     incident_type = "unknown"
     severity = "warning"
     owner = "system"
-    summary = effective.get("error_message") or ""
-    detail = pending_payload.get("prompt_text") or summary
+    summary = _pending_interaction_summary(
+        pending_payload,
+        fallback=str(effective.get("error_message") or ""),
+    )
+    detail = _pending_interaction_detail(pending_payload, fallback=summary)
     next_action = "inspect_task"
 
     resolved_pending = [item for item in runtime_diagnostics if item.get("kind") == "resolved_pending_request"]
@@ -3767,37 +5423,78 @@ def _derive_job_incident(
         incident_type = "plan_confirmation"
         severity = "info"
         owner = "user"
-        summary = "Abstract analysis plan is waiting for confirmation."
-        detail = pending_payload.get("prompt_text") or summary
-        next_action = "confirm_or_edit_plan"
+        summary = _pending_interaction_summary(
+            pending_payload,
+            fallback="Abstract analysis plan is waiting for confirmation.",
+        )
+        detail = _pending_interaction_detail(pending_payload, fallback=summary)
+        next_action = _decision_packet_next_action(
+            decision_packet,
+            fallback="confirm_or_edit_plan",
+            clarification_request=clarification_request,
+        )
     elif pending_type == "execution_confirmation":
         incident_type = "execution_confirmation"
         severity = "info"
         owner = "user"
-        summary = "Execution graph is waiting for final confirmation."
-        detail = pending_payload.get("prompt_text") or summary
-        next_action = "confirm_or_edit_execution"
+        summary = _pending_interaction_summary(
+            pending_payload,
+            fallback="Execution graph is waiting for final confirmation.",
+        )
+        detail = _pending_interaction_detail(pending_payload, fallback=summary)
+        next_action = _decision_packet_next_action(
+            decision_packet,
+            fallback="confirm_or_edit_execution",
+            clarification_request=clarification_request,
+        )
     elif pending_type == "authorization" or status == "waiting_for_authorization":
         incident_type = "authorization"
         severity = "warning"
         owner = "user"
-        summary = "A command requires authorization before execution can continue."
-        detail = pending_payload.get("prompt_text") or summary
-        next_action = "review_and_authorize_command"
+        summary = _pending_interaction_summary(
+            pending_payload,
+            fallback="A command requires authorization before execution can continue.",
+        )
+        detail = _pending_interaction_detail(pending_payload, fallback=summary)
+        next_action = _decision_packet_next_action(
+            decision_packet,
+            fallback="review_and_authorize_command",
+            clarification_request=clarification_request,
+        )
     elif pending_type == "repair" or status == "waiting_for_repair":
         incident_type = "repair"
         severity = "critical"
         owner = "user"
-        summary = "A failed command needs repair input before the job can continue."
-        detail = pending_payload.get("prompt_text") or pending_payload.get("stderr_excerpt") or summary
-        next_action = "review_failure_and_choose_repair"
+        summary = _pending_interaction_summary(
+            pending_payload,
+            fallback="A failed command needs repair input before the job can continue.",
+        )
+        detail = _pending_interaction_detail(
+            pending_payload,
+            fallback=str(_mapping(pending_payload).get("stderr_excerpt") or summary),
+        )
+        escalation_reason = str((repair_loop_state or {}).get("escalation_reason") or "").strip()
+        if escalation_reason and escalation_reason.lower() not in detail.lower():
+            detail = f"{detail} Repair loop: {escalation_reason}."
+        next_action = _decision_packet_next_action(
+            decision_packet,
+            fallback="review_failure_and_choose_repair",
+            clarification_request=clarification_request,
+        )
     elif status == "resource_clarification_required":
         incident_type = "resource_clarification"
         severity = "warning"
         owner = "user"
-        summary = "Required resources or metadata are missing or ambiguous."
-        detail = pending_payload.get("prompt_text") or summary
-        next_action = "provide_missing_resource_clarification"
+        summary = _pending_interaction_summary(
+            pending_payload,
+            fallback="Required resources or metadata are missing or ambiguous.",
+        )
+        detail = _pending_interaction_detail(pending_payload, fallback=summary)
+        next_action = _decision_packet_next_action(
+            decision_packet,
+            fallback="provide_missing_resource_clarification",
+            clarification_request=clarification_request,
+        )
     elif status == "binding_required":
         incident_type = "binding_required"
         severity = "warning"
@@ -3861,6 +5558,10 @@ def _derive_job_incident(
         "pending_repair_request_id": getattr(job, "pending_repair_request_id", None),
         "current_step_key": getattr(current_step, "step_key", None),
         "current_step_name": getattr(current_step, "display_name", None) or getattr(current_step, "step_key", None),
+        "decision_packet": decision_packet,
+        "clarification_request": clarification_request,
+        "execution_evidence": execution_evidence,
+        "repair_loop_state": repair_loop_state,
         "runtime_diagnostics": runtime_diagnostics,
     }
 
@@ -3938,10 +5639,14 @@ def _build_task_attention_summary_payload(
     normalized: list[dict] = []
     for incident in incidents:
         job_id = str(incident.get("job_id") or "").strip()
-        reason = _normalize_attention_reason(incident.get("incident_type"))
+        dossier = dossiers_by_job.get(job_id) or {}
+        progress_state = dossier.get("progress_state") if isinstance(dossier, dict) else None
+        reason = _attention_reason_from_progress_state(
+            incident.get("incident_type"),
+            progress_state if isinstance(progress_state, dict) else None,
+        )
         if not reason:
             continue
-        dossier = dossiers_by_job.get(job_id) or {}
         rollback_guidance = dossier.get("rollback_guidance") or {}
         rollback_level = str(rollback_guidance.get("level") or "").strip() or None
         reconfirmation_required = bool(rollback_guidance.get("reconfirmation_required"))
@@ -3951,6 +5656,12 @@ def _build_task_attention_summary_payload(
             and rollback_level in {"abstract_plan", "execution_ir", "dag"}
         ):
             reason = "rollback_review"
+        decision_packet = incident.get("decision_packet") if isinstance(incident.get("decision_packet"), dict) else None
+        clarification_request = (
+            incident.get("clarification_request")
+            if isinstance(incident.get("clarification_request"), dict)
+            else None
+        )
         normalized.append({
             "key": f"{incident.get('job_id')}:{reason}",
             "job_id": incident.get("job_id"),
@@ -3959,11 +5670,26 @@ def _build_task_attention_summary_payload(
             "incident_type": incident.get("incident_type"),
             "reason": reason,
             "age_seconds": int(incident.get("age_seconds") or 0),
-            "summary": incident.get("summary"),
+            "summary": (
+                str((decision_packet or {}).get("summary") or "").strip()
+                or str((clarification_request or {}).get("prompt") or "").strip()
+                or incident.get("summary")
+            ),
             "severity": incident.get("severity"),
             "owner": incident.get("owner"),
-            "next_action": incident.get("next_action"),
+            "next_action": (
+                progress_state.get("next_recommended_action")
+                if isinstance(progress_state, dict) and progress_state.get("next_recommended_action")
+                else _decision_packet_next_action(
+                    decision_packet,
+                    fallback=incident.get("next_action"),
+                    clarification_request=clarification_request,
+                )
+            ),
             "pending_interaction_type": incident.get("pending_interaction_type"),
+            "progress_state": progress_state,
+            "decision_packet": decision_packet,
+            "clarification_request": clarification_request,
             "rollback_level": rollback_level,
             "rollback_target": str(rollback_guidance.get("target") or "").strip() or None,
             "rollback_reason": str(rollback_guidance.get("reason") or "").strip() or None,
@@ -4051,6 +5777,7 @@ async def _collect_job_supervisor_data(
     jobs = (await session.execute(q)).scalars().all()
     incidents: list[dict] = []
     dossiers: list[dict] = []
+    semantic_memory_cache: dict[str, dict | None] = {}
 
     for job in jobs:
         effective = await _get_effective_job_state(session, job)
@@ -4064,6 +5791,14 @@ async def _collect_job_supervisor_data(
         incident = _derive_job_incident(job, effective, current_step=current_step)
         if incident:
             incidents.append(incident)
+            project_id = str(getattr(job, "project_id", None) or "").strip()
+            semantic_memory_dossier = semantic_memory_cache.get(project_id) if project_id else None
+            if project_id and project_id not in semantic_memory_cache:
+                semantic_memory_dossier = await _fetch_project_semantic_memory_dossier(
+                    session,
+                    project_id,
+                )
+                semantic_memory_cache[project_id] = semantic_memory_dossier
             dossiers.append(
                 await _build_job_dossier(
                     session,
@@ -4071,6 +5806,7 @@ async def _collect_job_supervisor_data(
                     effective,
                     incident,
                     current_step=current_step,
+                    semantic_memory_dossier=semantic_memory_dossier,
                 )
             )
 
@@ -4091,6 +5827,14 @@ def _build_supervisor_review_fallback(
     summary: dict,
     dossiers: list[dict] | None = None,
 ) -> dict:
+    project_memory_profile = next(
+        (
+            (item.get("project_memory_profile") or {})
+            for item in (dossiers or [])
+            if isinstance(item, dict) and (item.get("project_memory_profile") or {})
+        ),
+        {},
+    )
     if not incidents:
         return {
             "mode": "heuristic",
@@ -4099,6 +5843,7 @@ def _build_supervisor_review_fallback(
             "supervisor_message": (
                 "No blocked execution, authorization, repair, or clarification events are active."
             ),
+            "project_memory_profile": project_memory_profile,
             "recommendations": [],
         }
 
@@ -4128,6 +5873,7 @@ def _build_supervisor_review_fallback(
             rollback_level,
             safe_action,
         )
+        failure_layer = _infer_failure_layer(incident["incident_type"])
         safe_action_eligibility = _build_safe_action_eligibility(incident)
         historical_policy = _build_historical_policy(
             (dossier or {}).get("similar_resolutions") or [],
@@ -4135,6 +5881,15 @@ def _build_supervisor_review_fallback(
             rollback_level=rollback_level,
             rollback_target=rollback_target,
         )
+        structured_memory_policy = _build_structured_memory_policy_from_dossier(
+            dossier,
+            safe_action=safe_action,
+            rollback_level=rollback_level,
+            rollback_target=rollback_target,
+        )
+        decision_dossier = dict(dossier or {})
+        if project_memory_profile and not decision_dossier.get("project_memory_profile"):
+            decision_dossier["project_memory_profile"] = project_memory_profile
         historical_guidance = _build_historical_guidance(
             (dossier or {}).get("similar_resolutions") or [],
             safe_action=safe_action,
@@ -4143,13 +5898,54 @@ def _build_supervisor_review_fallback(
             job_status=incident.get("job_status"),
             rollback_level=rollback_level,
             rollback_target=rollback_target,
+            structured_memory_policy=structured_memory_policy,
+            semantic_memory_dossier=(dossier or {}).get("semantic_memory_dossier") or {},
         )
+        decision_context = _build_supervisor_decision_context(
+            incident_type=incident.get("incident_type"),
+            owner=incident.get("owner"),
+            failure_layer=failure_layer,
+            rollback_level=rollback_level,
+            rollback_target=rollback_target,
+            safe_action=safe_action,
+            auto_recoverable=auto_recoverable,
+            historical_policy=historical_policy,
+            structured_memory_policy=structured_memory_policy,
+            historical_guidance=historical_guidance,
+            dossier=decision_dossier,
+            blocker_cause=_infer_dossier_resource_blocker_cause(dossier),
+            environment_failure=(dossier or {}).get("environment_failure") or _extract_environment_failure_signal(incident),
+        )
+        why_now = _build_trace_aware_operator_reason(
+            rollback_level,
+            rollback_target,
+            (dossier or {}).get("semantic_memory_dossier") or {},
+            str(incident["summary"] or "").strip(),
+        )
+        if str(decision_context.get("preferred_lane") or "").strip() in {
+            "user_intervention",
+            "confirmation_gates",
+            "resource_readiness",
+            "environment_readiness",
+            "rollback_review",
+        }:
+            why_now = (
+                str(decision_context.get("next_best_operator_reason") or "").strip()
+                or why_now
+            )
         recommended_action_confidence, recommended_action_basis = _build_recommended_action_confidence(
             safe_action=safe_action,
             auto_recoverable=auto_recoverable,
             safe_action_eligibility=safe_action_eligibility,
             historical_policy=historical_policy,
+            structured_memory_policy=structured_memory_policy,
+            semantic_memory_dossier=(dossier or {}).get("semantic_memory_dossier") or {},
         )
+        execution_artifact_review_subtype = None
+        if rollback_target == "execution_artifact_review":
+            execution_artifact_review_subtype = _infer_execution_artifact_review_subtype(
+                (dossier or {}).get("semantic_memory_dossier") or {}
+            )
         recommendations.append(
             {
                 "priority": index,
@@ -4160,7 +5956,7 @@ def _build_supervisor_review_fallback(
                 "severity": incident["severity"],
                 "owner": incident["owner"],
                 "diagnosis": diagnosis,
-                "failure_layer": _infer_failure_layer(incident["incident_type"]),
+                "failure_layer": failure_layer,
                 "rollback_level": rollback_level,
                 "rollback_target": rollback_target,
                 "reconfirmation_required": _requires_reconfirmation(rollback_level),
@@ -4168,10 +5964,13 @@ def _build_supervisor_review_fallback(
                 "safe_action": safe_action,
                 "safe_action_eligibility": safe_action_eligibility,
                 "historical_policy": historical_policy,
+                "structured_memory_policy": structured_memory_policy,
                 "auto_recoverable": auto_recoverable,
                 "auto_recovery_kind": auto_recovery_kind,
                 "recommended_action_confidence": recommended_action_confidence,
                 "recommended_action_basis": recommended_action_basis,
+                "decision_source": _resolve_decision_source(decision_context),
+                "execution_artifact_review_subtype": execution_artifact_review_subtype,
                 "safe_action_note": _build_safe_action_note(
                     incident,
                     rollback_level=rollback_level,
@@ -4180,7 +5979,8 @@ def _build_supervisor_review_fallback(
                 ),
                 "historical_guidance": historical_guidance,
                 "immediate_action": incident["next_action"],
-                "why_now": incident["summary"],
+                "why_now": why_now,
+                "decision_context": decision_context,
                 "dossier_summary": dossier.get("summary") if dossier else "No additional dossier signals.",
                 "recovery_playbook": _build_recovery_playbook(
                     incident,
@@ -4188,6 +5988,8 @@ def _build_supervisor_review_fallback(
                     rollback_target=rollback_target,
                     safe_action=safe_action,
                     auto_recoverable=auto_recoverable,
+                    dossier=dossier,
+                    decision_context=decision_context,
                 ),
             }
         )
@@ -4208,6 +6010,7 @@ def _build_supervisor_review_fallback(
         "supervisor_message": supervisor_message,
         "focus_summary": focus_summary,
         "project_playbook": project_playbook,
+        "project_memory_profile": project_memory_profile,
         "recommendations": recommendations[:8],
     }
 
@@ -4290,6 +6093,8 @@ async def _build_supervisor_review_with_llm(
                             "type": "array",
                             "items": {"type": "string"},
                         },
+                        "decision_source": {"type": "string"},
+                        "execution_artifact_review_subtype": {"type": "string"},
                         "safe_action_note": {"type": "string"},
                         "historical_guidance": {"type": "string"},
                         "immediate_action": {"type": "string"},
@@ -4342,11 +6147,16 @@ async def _build_supervisor_review_with_llm(
                     "lane_reason": {"type": "string"},
                     "next_best_operator_move": {"type": "string"},
                     "next_best_operator_reason": {"type": "string"},
+                    "decision_source": {"type": "string"},
                     "latest_auto_recovery_issue": {"type": "string"},
                     "latest_auto_recovery_action": {"type": "string"},
                     "latest_auto_recovery_status": {"type": "string"},
                     "latest_auto_recovery_pending_types": {"type": "string"},
                     "latest_auto_recovery_job_id": {"type": "string"},
+                    "project_memory_episode_count": {"type": "integer"},
+                    "project_memory_preferred_safe_action": {"type": "string"},
+                    "project_memory_preferred_rollback_level": {"type": "string"},
+                    "project_memory_preferred_analysis_family": {"type": "string"},
                 },
             },
             "project_playbook": {
@@ -4354,10 +6164,29 @@ async def _build_supervisor_review_with_llm(
                 "properties": {
                     "goal": {"type": "string"},
                     "next_move": {"type": "string"},
+                    "decision_source": {"type": "string"},
                     "step_codes": {
                         "type": "array",
                         "items": {"type": "string"},
                     },
+                },
+            },
+            "project_memory_profile": {
+                "type": "object",
+                "properties": {
+                    "episode_count": {"type": "integer"},
+                    "event_type_counts": {"type": "object"},
+                    "analysis_family_counts": {"type": "object"},
+                    "safe_action_patterns": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                    },
+                    "rollback_patterns": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                    },
+                    "preferences": {"type": "object"},
+                    "user_validated_episode_count": {"type": "integer"},
                 },
             },
         },
@@ -4405,6 +6234,8 @@ async def _build_supervisor_review_with_llm(
                 merged["auto_recovery_kind"] = baseline.get("auto_recovery_kind")
                 merged["recommended_action_confidence"] = baseline.get("recommended_action_confidence", "low")
                 merged["recommended_action_basis"] = baseline.get("recommended_action_basis", [])
+                merged["decision_source"] = baseline.get("decision_source")
+                merged["execution_artifact_review_subtype"] = baseline.get("execution_artifact_review_subtype")
                 merged["safe_action_note"] = baseline.get("safe_action_note")
                 merged["historical_guidance"] = baseline.get("historical_guidance")
                 merged["dossier_summary"] = baseline.get("dossier_summary", "No additional dossier signals.")
@@ -4423,6 +6254,8 @@ async def _build_supervisor_review_with_llm(
                 merged.setdefault("auto_recovery_kind", None)
                 merged.setdefault("recommended_action_confidence", "low")
                 merged.setdefault("recommended_action_basis", [])
+                merged.setdefault("decision_source", None)
+                merged.setdefault("execution_artifact_review_subtype", None)
                 merged.setdefault("safe_action_note", None)
                 merged.setdefault("historical_guidance", None)
                 merged.setdefault("dossier_summary", "No additional dossier signals.")
@@ -4444,6 +6277,7 @@ async def _build_supervisor_review_with_llm(
             "supervisor_message": result.get("supervisor_message", ""),
             "focus_summary": focus_summary,
             "project_playbook": fallback.get("project_playbook") or _build_project_playbook(focus_summary, recommendations),
+            "project_memory_profile": fallback.get("project_memory_profile") or {},
             "recommendations": recommendations[:8],
         }
     except GatewayNotConfiguredError:
@@ -4543,6 +6377,7 @@ async def list_jobs(
     payload = []
     for j in jobs:
         effective = await _get_effective_job_state(session, j)
+        progress_state = await _load_job_progress_state(session, j, effective)
         payload.append(
             {
                 "id": j.id,
@@ -4556,6 +6391,7 @@ async def list_jobs(
                 "ended_at": j.ended_at,
                 "error_message": effective["error_message"],
                 "pending_interaction_type": effective["pending_interaction_type"],
+                "progress_state": progress_state,
                 "peak_cpu_pct": j.peak_cpu_pct,
                 "peak_mem_mb": j.peak_mem_mb,
                 "has_execution_plan": bool(getattr(j, "expanded_dag_json", None)),
@@ -4696,6 +6532,7 @@ async def get_job(job_id: str, session: AsyncSession = Depends(get_session)):
         effective,
         current_step=current_step,
     )
+    progress_state = await _load_job_progress_state(session, j, effective)
     execution_plan = _serialize_execution_plan(j)
     recent_logs = await _fetch_recent_job_logs(session, job_id)
     recent_decisions = await _fetch_recent_user_decisions(session, job_id)
@@ -4703,6 +6540,7 @@ async def get_job(job_id: str, session: AsyncSession = Depends(get_session)):
     repair_requests = await _fetch_recent_repair_requests(session, job_id)
     step_runs = await _fetch_recent_step_runs(session, job_id)
     artifacts = await _fetch_recent_artifacts(session, job_id)
+    execution_evidence = await build_execution_evidence_snapshot(session, j)
     return {
         "id": j.id, "name": j.name, "status": effective["status"],
         "goal": j.goal, "plan": j.plan, "output_dir": j.output_dir,
@@ -4712,10 +6550,12 @@ async def get_job(job_id: str, session: AsyncSession = Depends(get_session)):
         "error_message": effective["error_message"],
         "pending_interaction_type": effective["pending_interaction_type"],
         "pending_interaction_payload": effective["pending_interaction_payload"],
+        "progress_state": progress_state,
         "resolved_plan": execution_plan["abstract_plan"],
         "execution_ir": execution_plan["execution_ir"],
         "expanded_dag": execution_plan["expanded_dag"],
         "execution_plan_summary": execution_plan["summary"],
+        "execution_evidence": execution_evidence,
         "rollback_guidance": rollback_guidance,
         "auto_recovery_events": _extract_auto_recovery_events(recent_logs),
         "timeline": _build_job_timeline(
@@ -4738,6 +6578,14 @@ async def get_execution_plan(job_id: str, session: AsyncSession = Depends(get_se
     if not j:
         raise HTTPException(404, "Job not found")
     return _serialize_execution_plan(j)
+
+
+@router.get("/{job_id}/execution-evidence")
+async def get_execution_evidence(job_id: str, session: AsyncSession = Depends(get_session)):
+    j = (await session.execute(select(AnalysisJob).where(AnalysisJob.id == job_id))).scalar_one_or_none()
+    if not j:
+        raise HTTPException(404, "Job not found")
+    return await build_execution_evidence_snapshot(session, j)
 
 
 @router.delete("/{job_id}")
@@ -5046,17 +6894,31 @@ async def _supervisor_refresh_execution_plan(
         raise HTTPException(409, "No abstract plan is available to rebuild the execution plan")
 
     bundle = await materialize_job_execution_plan(session, j, draft_payload)
+    execution_payload = _serialize_execution_plan(j)
+    from tune.core.decision_packet import (
+        attach_decision_packet,
+        generate_decision_packet,
+    )
     if j.status == "draft":
         ok = await transition_job(job_id, "awaiting_plan_confirmation", session)
         if not ok:
             raise HTTPException(409, f"Cannot move job {job_id} to awaiting_plan_confirmation")
     j.error_message = success_message
     j.pending_interaction_type = "execution_confirmation"
-    j.pending_interaction_payload_json = {
+    execution_decision_packet = generate_decision_packet(
+        "execution_confirmation",
+        goal=getattr(j, "goal", None) or j.name,
+        review_plan=summarize_expanded_dag_for_confirmation(j.expanded_dag_json),
+        execution_payload=execution_payload,
+        short_name=j.name,
+        language=getattr(j, "language", "en") or "en",
+    )
+    j.pending_interaction_payload_json = attach_decision_packet({
         "phase": "execution",
         "prompt_text": "Execution graph is ready for final confirmation.",
-        "execution_plan_summary": _serialize_execution_plan(j)["summary"],
-    }
+        "execution_plan_summary": execution_payload["summary"],
+        "execution_decision_source": execution_payload.get("execution_decision_source"),
+    }, execution_decision_packet)
     j.current_step_id = None
     j.pending_auth_request_id = None
     j.pending_repair_request_id = None
@@ -5092,7 +6954,7 @@ async def _supervisor_refresh_execution_plan(
     )
 
     review_plan = summarize_expanded_dag_for_confirmation(j.expanded_dag_json)
-    execution_summary = _serialize_execution_plan(j)["summary"]
+    execution_summary = execution_payload["summary"]
     thread_message = (
         "监督器已刷新执行计划，请再次确认最终执行图。"
         if getattr(j, "language", "en") == "zh"
@@ -5114,6 +6976,13 @@ async def _supervisor_refresh_execution_plan(
             "phase": "execution",
             "review_plan": review_plan,
             "execution_plan_summary": execution_summary,
+            "execution_decision_source": execution_payload.get("execution_decision_source"),
+            "execution_confirmation_overview": execution_payload.get("review_overview"),
+            "execution_ir_review": execution_payload.get("review_ir"),
+            "execution_plan_delta": execution_payload.get("review_delta"),
+            "execution_plan_changes": execution_payload.get("review_changes"),
+            "execution_semantic_guardrails": execution_payload.get("semantic_guardrails"),
+            "decision_packet": execution_decision_packet.model_dump(mode="json"),
         },
         message=thread_message,
     )
@@ -5124,7 +6993,9 @@ async def _supervisor_refresh_execution_plan(
         "rollback_level": rollback_level,
         "rollback_target": rollback_target,
         "execution_plan_summary": execution_summary,
+        "execution_decision_source": execution_payload.get("execution_decision_source"),
         "execution_review_plan": review_plan,
+        "execution_semantic_guardrails": execution_payload.get("semantic_guardrails"),
     }
 
 
@@ -5134,13 +7005,14 @@ async def supervisor_revalidate_abstract_plan(
     session: AsyncSession = Depends(get_session),
 ):
     """Re-run deterministic compilation and planner constraints on the current draft plan."""
+    from tune.core.analysis.implementation_decision import extract_implementation_decisions
     from tune.core.context.builder import PlannerContextBuilder
     from tune.core.context.models import ContextScope
     from tune.core.models import UserDecision
     from tune.core.orchestration import replace_plan_steps
     from tune.core.resources.planner_adapter import enforce_planner_constraints
     from tune.core.registry.spec_generation import augment_plan_with_dynamic_specs
-    from tune.core.workflow.plan_compiler import compile_plan
+    from tune.core.workflow.plan_compiler import compile_plan_with_decisions
     from tune.api.ws import sync_supervisor_thread_state
 
     j = (await session.execute(select(AnalysisJob).where(AnalysisJob.id == job_id))).scalar_one_or_none()
@@ -5175,7 +7047,10 @@ async def supervisor_revalidate_abstract_plan(
             "rollback_level": rollback_level,
             "issues": dynamic_issues,
         }
-    compile_result = compile_plan(current_steps)
+    compile_result = compile_plan_with_decisions(
+        current_steps,
+        implementation_decisions=extract_implementation_decisions(draft_payload),
+    )
     if not compile_result.ok:
         return {
             "ok": False,
@@ -5196,10 +7071,19 @@ async def supervisor_revalidate_abstract_plan(
     j.expanded_dag_json = None
     j.error_message = "Abstract analysis plan revalidated and waiting for confirmation."
     j.pending_interaction_type = "plan_confirmation"
-    j.pending_interaction_payload_json = {
+    from tune.core.decision_packet import attach_decision_packet, generate_decision_packet
+
+    abstract_decision_packet = generate_decision_packet(
+        "plan_confirmation",
+        goal=getattr(j, "goal", None) or j.name,
+        plan=final_steps,
+        short_name=j.name,
+        language=getattr(j, "language", "en") or "en",
+    )
+    j.pending_interaction_payload_json = attach_decision_packet({
         "phase": "abstract",
         "prompt_text": "Abstract analysis plan is waiting for confirmation.",
-    }
+    }, abstract_decision_packet)
     j.current_step_id = None
     j.pending_auth_request_id = None
     j.pending_repair_request_id = None
@@ -5255,6 +7139,7 @@ async def supervisor_revalidate_abstract_plan(
             "short_name": j.name,
             "plan": final_steps,
             "phase": "abstract",
+            "decision_packet": abstract_decision_packet.model_dump(mode="json"),
         },
         message=thread_message,
     )
@@ -5629,9 +7514,13 @@ async def confirm_plan(
     from tune.core.workflow import transition_job
     from tune.core.context.builder import PlannerContextBuilder
     from tune.core.context.models import ContextScope
+    from tune.core.decision_packet import (
+        attach_decision_packet,
+        generate_decision_packet,
+    )
     from tune.core.resources.planner_adapter import enforce_planner_constraints
     from tune.core.registry.spec_generation import augment_plan_with_dynamic_specs
-    from tune.core.workflow.plan_compiler import compile_plan
+    from tune.core.workflow.plan_compiler import compile_plan_with_decisions
 
     j = (await session.execute(select(AnalysisJob).where(AnalysisJob.id == job_id))).scalar_one_or_none()
     if not j:
@@ -5654,6 +7543,7 @@ async def confirm_plan(
             "job_id": job_id,
             "queued": True,
             "execution_plan_summary": _serialize_execution_plan(j)["summary"],
+            "execution_decision_source": _serialize_execution_plan(j).get("execution_decision_source"),
         }
 
     # First confirmation: validate abstract plan and materialize execution objects.
@@ -5680,7 +7570,12 @@ async def confirm_plan(
                 for error in dynamic_issues
             ],
         }
-    compile_result = compile_plan(current_steps)
+    from tune.core.analysis.implementation_decision import extract_implementation_decisions
+
+    compile_result = compile_plan_with_decisions(
+        current_steps,
+        implementation_decisions=extract_implementation_decisions(draft),
+    )
     if not compile_result.ok:
         return {
             "ok": False,
@@ -5736,6 +7631,28 @@ async def confirm_plan(
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 
+    execution_payload = _serialize_execution_plan(j)
+    execution_review_plan = summarize_expanded_dag_for_confirmation(j.expanded_dag_json)
+    job_name = getattr(j, "name", None) or getattr(j, "goal", None) or "analysis"
+    execution_decision_packet = generate_decision_packet(
+        "execution_confirmation",
+        goal=getattr(j, "goal", None) or job_name,
+        review_plan=execution_review_plan,
+        execution_payload=execution_payload,
+        short_name=job_name,
+        language=getattr(j, "language", "en") or "en",
+    )
+    j.pending_interaction_type = "execution_confirmation"
+    j.pending_interaction_payload_json = attach_decision_packet(
+        {
+            "phase": "execution",
+            "prompt_text": "Execution graph is ready for final confirmation.",
+            "execution_plan_summary": execution_payload["summary"],
+            "execution_decision_source": execution_payload.get("execution_decision_source"),
+        },
+        execution_decision_packet,
+    )
+
     decision = UserDecision(
         id=str(uuid.uuid4()),
         job_id=job_id,
@@ -5759,8 +7676,10 @@ async def confirm_plan(
         "ok": True,
         "job_id": job_id,
         "requires_execution_confirmation": True,
-        "execution_plan_summary": _serialize_execution_plan(j)["summary"],
-        "execution_review_plan": summarize_expanded_dag_for_confirmation(j.expanded_dag_json),
+        "execution_plan_summary": execution_payload["summary"],
+        "execution_decision_source": execution_payload.get("execution_decision_source"),
+        "execution_review_plan": execution_review_plan,
+        "decision_packet": execution_decision_packet.model_dump(mode="json"),
     }
 
 
@@ -6033,6 +7952,8 @@ async def get_bindings(
             "confirmation_phase": confirmation["confirmation_phase"],
             "confirmation_plan": confirmation["confirmation_plan"],
             "execution_plan_summary": confirmation["execution_plan_summary"],
+            "execution_decision_source": confirmation["execution_decision_source"],
+            "execution_semantic_guardrails": confirmation["execution_semantic_guardrails"],
             "bindings": by_step,
         }
 
@@ -6097,6 +8018,8 @@ async def get_bindings(
         "confirmation_phase": confirmation["confirmation_phase"],
         "confirmation_plan": confirmation["confirmation_plan"],
         "execution_plan_summary": confirmation["execution_plan_summary"],
+        "execution_decision_source": confirmation["execution_decision_source"],
+        "execution_semantic_guardrails": confirmation["execution_semantic_guardrails"],
         "steps": list(steps.values()),
     }
 

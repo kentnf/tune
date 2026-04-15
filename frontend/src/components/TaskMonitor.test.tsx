@@ -135,9 +135,17 @@ describe('TaskMonitor', () => {
         close() {}
       } as unknown as typeof WebSocket,
     )
+
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', {
+      configurable: true,
+      value: function scrollIntoViewStub() {
+        this.setAttribute('data-scrolled', 'true')
+      },
+    })
   })
 
   it('renders layered confirmation details for execution confirmation', async () => {
+    const onOpenThread = vi.fn()
     vi.stubGlobal(
       'fetch',
       vi.fn((input: RequestInfo | URL) => {
@@ -167,6 +175,7 @@ describe('TaskMonitor', () => {
                 group_count: 4,
                 node_count: 9,
               },
+              execution_decision_source: 'semantic_trace',
               execution_confirmation_overview: {
                 abstract_step_count: 3,
                 execution_ir_step_count: 3,
@@ -227,6 +236,38 @@ describe('TaskMonitor', () => {
                   node_count: 1,
                 },
               ],
+              execution_semantic_guardrails: {
+                memory_review_count: 1,
+                ambiguity_count: 1,
+                project_memory_summary: {
+                  stable_fact_count: 3,
+                  memory_pattern_count: 1,
+                  memory_preference_count: 1,
+                  resource_link_count: 2,
+                  artifact_link_count: 1,
+                  runtime_link_count: 1,
+                },
+                memory_binding_reviews: [
+                  {
+                    step_key: 'align',
+                    display_name: 'HISAT2 align',
+                    slot_name: 'reference_fasta',
+                    candidate_path: '/refs/apple-v2.fa',
+                    confirmed_path: '/refs/apple-v1.fa',
+                    description: "reference_fasta currently prefers '/refs/apple-v2.fa', but project memory previously confirmed '/refs/apple-v1.fa'.",
+                  },
+                ],
+                ambiguity_reviews: [
+                  {
+                    step_key: 'count',
+                    display_name: 'featureCounts',
+                    slot_name: 'annotation_gtf',
+                    primary_path: '/refs/apple-v2.gtf',
+                    secondary_path: '/refs/apple-v2.1.gtf',
+                    description: "annotation_gtf has close candidates '/refs/apple-v2.gtf' vs '/refs/apple-v2.1.gtf' (gap=0.02, total=2).",
+                  },
+                ],
+              },
               steps: [],
             }),
           })
@@ -240,7 +281,7 @@ describe('TaskMonitor', () => {
 
     renderTaskMonitor({
       projectId: 'proj-1',
-      onOpenThread: vi.fn(),
+      onOpenThread,
     })
 
     fireEvent.click(screen.getByRole('button', { name: /logs/i }))
@@ -250,8 +291,12 @@ describe('TaskMonitor', () => {
     expect(screen.getByText('Execution IR')).toBeInTheDocument()
     expect(screen.getByText('Expanded DAG')).toBeInTheDocument()
     expect(screen.getByText('4 groups · 9 executable nodes')).toBeInTheDocument()
+    expect(screen.getAllByText('Decision source: semantic trace').length).toBeGreaterThan(0)
     expect(screen.getByText('3 abstract steps become 3 execution-semantics steps and 4 execution groups; 1 run per-sample, 1 aggregate upstream outputs, 1 system-added, 2 orchestrated changes.')).toBeInTheDocument()
     expect(screen.getByText('Compared with the abstract plan: 3 abstract steps -> 4 execution groups · 1 unchanged · 2 changed · 1 added')).toBeInTheDocument()
+    expect(screen.getByText('Next move')).toBeInTheDocument()
+    expect(screen.getByText('Resolve semantic ambiguity before confirming')).toBeInTheDocument()
+    expect(screen.getByText('1 ambiguous candidate selection(s) need an operator decision. Review the competing resource paths in chat before approving the final execution graph.')).toBeInTheDocument()
     expect(screen.getByText('Execution semantics')).toBeInTheDocument()
     expect(screen.getByText('align.hisat2 · per_sample | align | inputs=trimmed_paired_reads, aligner_index | aggregate=same_lineage')).toBeInTheDocument()
     expect(screen.getByText('Orchestration changes')).toBeInTheDocument()
@@ -261,10 +306,18 @@ describe('TaskMonitor', () => {
     expect(screen.getByText('Auto-injected to build a missing HISAT2 index from the registered reference FASTA')).toBeInTheDocument()
     expect(screen.getByText('Expanded into 2 per-sample execution nodes')).toBeInTheDocument()
     expect(screen.getByText('Aggregates upstream outputs from align into one execution step')).toBeInTheDocument()
+    expect(screen.getByText('Execution guardrails')).toBeInTheDocument()
+    expect(screen.getAllByText('1 project-memory conflict(s)').length).toBeGreaterThan(0)
+    expect(screen.getAllByText('1 ambiguous resource candidate(s)').length).toBeGreaterThan(0)
+    expect(screen.getByText('Project memory context: 3 stable facts · 1 patterns · 1 preferences · 2 resource links · 1 artifact links · 1 runtime links')).toBeInTheDocument()
+    expect(screen.getByText("reference_fasta currently prefers '/refs/apple-v2.fa', but project memory previously confirmed '/refs/apple-v1.fa'.")).toBeInTheDocument()
+    expect(screen.getByText("annotation_gtf has close candidates '/refs/apple-v2.gtf' vs '/refs/apple-v2.1.gtf' (gap=0.02, total=2).")).toBeInTheDocument()
     expect(screen.getByText('Added by orchestration')).toBeInTheDocument()
     expect(screen.getAllByText('Changed by orchestration').length).toBeGreaterThan(0)
     expect(screen.getByText('3 review items')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Open Chat' })).toBeInTheDocument()
+    fireEvent.click(screen.getAllByRole('button', { name: 'Review Semantic Trace' })[1])
+    expect(onOpenThread).toHaveBeenCalledWith('thread-1', 'job-1')
+    expect(screen.getByRole('button', { name: 'Open Chat Instead' })).toBeInTheDocument()
   })
 
   it('shows a unified attention summary banner for normalized task input states', async () => {
@@ -280,19 +333,324 @@ describe('TaskMonitor', () => {
   })
 
   it('surfaces confirmation work in the unified pending input section', async () => {
-    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve({ ok: true, json: async () => ({}) })))
+    const onOpenThread = vi.fn()
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL) => {
+        const url = String(input)
+        if (url.includes('/api/jobs/job-1/bindings?detailed=1')) {
+          return Promise.resolve({
+            ok: true,
+            json: async () => ({
+              pending_interaction_type: 'execution_confirmation',
+              pending_interaction_payload: {
+                prompt_text: 'Execution graph is ready for final confirmation.',
+              },
+              confirmation_phase: 'execution',
+              confirmation_plan: [
+                { step_key: 'align', display_name: 'HISAT2 align', step_type: 'align.hisat2' },
+              ],
+              execution_plan_summary: {
+                has_execution_ir: true,
+                has_expanded_dag: true,
+                group_count: 1,
+                node_count: 1,
+              },
+              execution_decision_source: 'semantic_trace',
+              execution_semantic_guardrails: {
+                ambiguity_count: 2,
+                memory_review_count: 0,
+                ambiguity_reviews: [
+                  {
+                    step_key: 'align',
+                    display_name: 'HISAT2 align',
+                    slot_name: 'reference_fasta',
+                    primary_path: '/refs/apple-v2.fa',
+                    secondary_path: '/refs/apple-v1.fa',
+                    description: "reference_fasta has close candidates '/refs/apple-v2.fa' vs '/refs/apple-v1.fa' (gap=0.02, total=2).",
+                  },
+                  {
+                    step_key: 'count',
+                    display_name: 'featureCounts',
+                    slot_name: 'annotation_gtf',
+                    primary_path: '/refs/apple-v2.gtf',
+                    secondary_path: '/refs/apple-v2.1.gtf',
+                    description: "annotation_gtf has close candidates '/refs/apple-v2.gtf' vs '/refs/apple-v2.1.gtf' (gap=0.03, total=2).",
+                  },
+                ],
+              },
+            }),
+          })
+        }
+        return Promise.resolve({ ok: true, json: async () => ({}) })
+      }),
+    )
 
     renderTaskMonitor({
       projectId: 'proj-1',
-      onOpenThread: vi.fn(),
+      onOpenThread,
     })
 
     expect(await screen.findByText('Pending Operator Review')).toBeInTheDocument()
     expect(screen.getByText('1 task(s) are waiting for confirmation, clarification, or rollback review.')).toBeInTheDocument()
     expect(screen.getAllByText('Awaiting Confirmation').length).toBeGreaterThanOrEqual(2)
     expect(screen.getByText('Execution graph is waiting for final confirmation.')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Open Execution Review' })).toBeInTheDocument()
-    expect(screen.getByText('Return to chat and confirm the execution graph.')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Review Semantic Trace' })).toBeInTheDocument()
+    expect(screen.getAllByText('Decision source: semantic trace').length).toBeGreaterThan(0)
+    expect(screen.getAllByText('Return to chat and resolve the semantic ambiguity before confirming the execution graph.').length).toBeGreaterThan(0)
+    fireEvent.click(screen.getByRole('button', { name: 'Review Semantic Trace' }))
+    expect(await screen.findByText('Execution guardrails')).toBeInTheDocument()
+    const firstAmbiguityDescription = "reference_fasta has close candidates '/refs/apple-v2.fa' vs '/refs/apple-v1.fa' (gap=0.02, total=2)."
+    const secondAmbiguityDescription = "annotation_gtf has close candidates '/refs/apple-v2.gtf' vs '/refs/apple-v2.1.gtf' (gap=0.03, total=2)."
+    expect(screen.getByText(firstAmbiguityDescription)).toBeInTheDocument()
+    expect(screen.getByText(secondAmbiguityDescription)).toBeInTheDocument()
+    await waitFor(() => {
+      expect(screen.getByText(firstAmbiguityDescription).closest('[data-focus-key]')).toHaveAttribute('data-scrolled', 'true')
+    })
+    expect(screen.getByText(secondAmbiguityDescription).closest('[data-focus-key]')).not.toHaveAttribute('data-scrolled', 'true')
+    expect(onOpenThread).not.toHaveBeenCalled()
+  })
+
+  it('jumps to the specific memory conflict review item from pending operator review', async () => {
+    const onOpenThread = vi.fn()
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL) => {
+        const url = String(input)
+        if (url.includes('/api/jobs/job-1/bindings?detailed=1')) {
+          return Promise.resolve({
+            ok: true,
+            json: async () => ({
+              pending_interaction_type: 'execution_confirmation',
+              pending_interaction_payload: {
+                prompt_text: 'Execution graph is waiting on a project-memory decision.',
+              },
+              confirmation_phase: 'execution',
+              confirmation_plan: [
+                { step_key: 'align', display_name: 'HISAT2 align', step_type: 'align.hisat2' },
+              ],
+              execution_plan_summary: {
+                has_execution_ir: true,
+                has_expanded_dag: true,
+                group_count: 1,
+                node_count: 1,
+              },
+              execution_decision_source: 'structured_memory',
+              execution_semantic_guardrails: {
+                ambiguity_count: 0,
+                memory_review_count: 2,
+                memory_binding_reviews: [
+                  {
+                    step_key: 'align',
+                    display_name: 'HISAT2 align',
+                    slot_name: 'reference_fasta',
+                    candidate_path: '/refs/apple-v2.fa',
+                    confirmed_path: '/refs/apple-v1.fa',
+                    description: "reference_fasta currently prefers '/refs/apple-v2.fa', but project memory previously confirmed '/refs/apple-v1.fa'.",
+                  },
+                  {
+                    step_key: 'count',
+                    display_name: 'featureCounts',
+                    slot_name: 'annotation_gtf',
+                    candidate_path: '/refs/apple-v2.gtf',
+                    confirmed_path: '/refs/apple-v1.gtf',
+                    description: "annotation_gtf currently prefers '/refs/apple-v2.gtf', but project memory previously confirmed '/refs/apple-v1.gtf'.",
+                  },
+                ],
+              },
+            }),
+          })
+        }
+        return Promise.resolve({ ok: true, json: async () => ({}) })
+      }),
+    )
+
+    renderTaskMonitor({
+      projectId: 'proj-1',
+      onOpenThread,
+    })
+
+    expect(await screen.findByText('Pending Operator Review')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Review Memory Conflict' })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Review Memory Conflict' }))
+
+    expect(await screen.findByText('Execution guardrails')).toBeInTheDocument()
+    const firstConflictDescription = "reference_fasta currently prefers '/refs/apple-v2.fa', but project memory previously confirmed '/refs/apple-v1.fa'."
+    const secondConflictDescription = "annotation_gtf currently prefers '/refs/apple-v2.gtf', but project memory previously confirmed '/refs/apple-v1.gtf'."
+    expect(screen.getByText(firstConflictDescription)).toBeInTheDocument()
+    expect(screen.getByText(secondConflictDescription)).toBeInTheDocument()
+    await waitFor(() => {
+      expect(screen.getByText(firstConflictDescription).closest('[data-focus-key]')).toHaveAttribute('data-scrolled', 'true')
+    })
+    expect(screen.getByText(secondConflictDescription).closest('[data-focus-key]')).not.toHaveAttribute('data-scrolled', 'true')
+    expect(onOpenThread).not.toHaveBeenCalled()
+  })
+
+  it('adds a source-aware shortcut button on the incident surface for execution confirmation', async () => {
+    const onOpenThread = vi.fn()
+    mockUseProjectTaskFeed.mockReturnValue({
+      jobs: [
+        {
+          id: 'job-1',
+          name: 'RNA-seq confirmation',
+          status: 'awaiting_plan_confirmation',
+          goal: 'Analyze apple RNA-seq data',
+          thread_id: 'thread-1',
+          created_at: '2026-03-26T10:00:00Z',
+        },
+      ],
+      attentionSummary: {
+        signal: 'warning',
+        count: 1,
+        counts: {
+          running: 0,
+          authorization: 0,
+          repair: 0,
+          confirmation: 0,
+          clarification: 0,
+          rollback_review: 0,
+          warning: 1,
+          needs_input: 0,
+          needs_review: 1,
+        },
+        needs_input: [],
+        needs_review: [
+          {
+            key: 'job-1:execution_confirmation',
+            job_id: 'job-1',
+            job_name: 'RNA-seq confirmation',
+            thread_id: 'thread-1',
+            incident_type: 'execution_confirmation',
+            reason: 'warning',
+            age_seconds: 180,
+            summary: 'Execution graph needs semantic ambiguity review before confirmation.',
+            severity: 'info',
+            owner: 'user',
+            next_action: 'confirm_or_edit_execution',
+          },
+        ],
+        reminders: [],
+        auto_authorize_commands: false,
+      },
+      incidents: [
+        {
+          job_id: 'job-1',
+          job_name: 'RNA-seq confirmation',
+          job_status: 'awaiting_plan_confirmation',
+          thread_id: 'thread-1',
+          incident_type: 'execution_confirmation',
+          severity: 'info',
+          owner: 'user',
+          summary: 'Execution graph needs semantic ambiguity review before confirmation.',
+          next_action: 'confirm_or_edit_execution',
+          age_seconds: 180,
+        },
+      ],
+      incidentSummary: { total_open: 1, critical: 0, warning: 0, info: 1 },
+      overview: { total: 1, active: 1, by_status: { awaiting_plan_confirmation: 1 } },
+      eventVersion: 0,
+      totalCount: 1,
+      getJobsPage: () => [
+        {
+          id: 'job-1',
+          name: 'RNA-seq confirmation',
+          status: 'awaiting_plan_confirmation',
+          goal: 'Analyze apple RNA-seq data',
+          thread_id: 'thread-1',
+          created_at: '2026-03-26T10:00:00Z',
+        },
+      ],
+      getPageHasMore: () => false,
+      patchJob: vi.fn(),
+      locateJobPage: vi.fn().mockResolvedValue(1),
+      refreshJobPage: vi.fn().mockResolvedValue([
+        {
+          id: 'job-1',
+          name: 'RNA-seq confirmation',
+          status: 'awaiting_plan_confirmation',
+          goal: 'Analyze apple RNA-seq data',
+          thread_id: 'thread-1',
+          created_at: '2026-03-26T10:00:00Z',
+        },
+      ]),
+      refreshJobs: vi.fn().mockResolvedValue([]),
+      refreshAttentionSummary: vi.fn().mockResolvedValue(undefined),
+      refreshIncidents: vi.fn().mockResolvedValue(undefined),
+      refreshAll: vi.fn().mockResolvedValue(undefined),
+    })
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL) => {
+        const url = String(input)
+        if (url.includes('/api/jobs/job-1/bindings?detailed=1')) {
+          return Promise.resolve({
+            ok: true,
+            json: async () => ({
+              pending_interaction_type: 'execution_confirmation',
+              pending_interaction_payload: {
+                prompt_text: 'Execution graph is ready for final confirmation.',
+              },
+              confirmation_phase: 'execution',
+              confirmation_plan: [
+                { step_key: 'align', display_name: 'HISAT2 align', step_type: 'align.hisat2' },
+              ],
+              execution_plan_summary: {
+                has_execution_ir: true,
+                has_expanded_dag: true,
+                group_count: 1,
+                node_count: 1,
+              },
+              execution_decision_source: 'semantic_trace',
+              execution_semantic_guardrails: {
+                ambiguity_count: 2,
+                memory_review_count: 0,
+                ambiguity_reviews: [
+                  {
+                    step_key: 'align',
+                    display_name: 'HISAT2 align',
+                    slot_name: 'reference_fasta',
+                    primary_path: '/refs/apple-v2.fa',
+                    secondary_path: '/refs/apple-v1.fa',
+                    description: "reference_fasta has close candidates '/refs/apple-v2.fa' vs '/refs/apple-v1.fa' (gap=0.02, total=2).",
+                  },
+                  {
+                    step_key: 'count',
+                    display_name: 'featureCounts',
+                    slot_name: 'annotation_gtf',
+                    primary_path: '/refs/apple-v2.gtf',
+                    secondary_path: '/refs/apple-v2.1.gtf',
+                    description: "annotation_gtf has close candidates '/refs/apple-v2.gtf' vs '/refs/apple-v2.1.gtf' (gap=0.03, total=2).",
+                  },
+                ],
+              },
+            }),
+          })
+        }
+        return Promise.resolve({ ok: true, json: async () => ({}) })
+      }),
+    )
+
+    renderTaskMonitor({
+      projectId: 'proj-1',
+      onOpenThread,
+    })
+
+    expect(await screen.findByText('Open Incidents')).toBeInTheDocument()
+    expect(screen.getByText('Execution graph needs semantic ambiguity review before confirmation.')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Review Semantic Trace' })).toBeInTheDocument()
+    expect(screen.getByText('Return to chat and resolve the semantic ambiguity before confirming the execution graph.')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Review Semantic Trace' }))
+
+    expect(await screen.findByText('Execution guardrails')).toBeInTheDocument()
+    const firstAmbiguityDescription = "reference_fasta has close candidates '/refs/apple-v2.fa' vs '/refs/apple-v1.fa' (gap=0.02, total=2)."
+    const secondAmbiguityDescription = "annotation_gtf has close candidates '/refs/apple-v2.gtf' vs '/refs/apple-v2.1.gtf' (gap=0.03, total=2)."
+    await waitFor(() => {
+      expect(screen.getByText(firstAmbiguityDescription).closest('[data-focus-key]')).toHaveAttribute('data-scrolled', 'true')
+    })
+    expect(screen.getByText(secondAmbiguityDescription).closest('[data-focus-key]')).not.toHaveAttribute('data-scrolled', 'true')
+    expect(onOpenThread).not.toHaveBeenCalled()
   })
 
   it('allows project-level authorization directly from the supervisor playbook', async () => {
@@ -843,10 +1201,152 @@ describe('TaskMonitor', () => {
 
     const projectPlaybook = (await screen.findByText('Project Playbook')).closest('div')?.parentElement
     expect(projectPlaybook).not.toBeNull()
-    expect(within(projectPlaybook as HTMLElement).getByText('Goal: operator review · Next move: resolve resource clarification')).toBeInTheDocument()
-    expect(within(projectPlaybook as HTMLElement).getByText('2. Next: provide the missing resource clarification in chat.')).toBeInTheDocument()
+    expect(within(projectPlaybook as HTMLElement).getByText('Goal: operator review · Next move: Review Orchestration')).toBeInTheDocument()
+    expect(within(projectPlaybook as HTMLElement).getByText('2. Review Orchestration')).toBeInTheDocument()
     fireEvent.click(within(projectPlaybook as HTMLElement).getByRole('button', { name: 'Open Chat' }))
     expect(onOpenThread).toHaveBeenCalledWith('thread-clarify', 'job-clarify')
+  })
+
+  it('renders decision source across focus summary, playbook, and recommendation details', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL) => {
+        const url = String(input)
+        if (url.includes('/api/jobs/supervisor-review?project=proj-1')) {
+          return Promise.resolve({
+            ok: true,
+            json: async () => ({
+              mode: 'heuristic',
+              generated_at: '2026-03-30T09:00:00Z',
+              overview: '1 open incident.',
+              supervisor_message: 'A command is waiting for explicit authorization.',
+              focus_summary: {
+                primary_lane: 'user_intervention',
+                decision_source: 'authorization',
+                top_owner: 'user',
+                top_incident_type: 'authorization',
+                high_confidence_total: 0,
+                auto_recoverable_total: 0,
+                user_wait_total: 1,
+                next_best_operator_move: 'resolve_authorization_request',
+                lane_reason: 'The current project is mainly waiting on explicit user authorization.',
+                next_best_operator_reason: 'Review and approve or reject the pending command so execution can continue.',
+              },
+              project_playbook: {
+                goal: 'user_intervention',
+                next_move: 'resolve_authorization_request',
+                decision_source: 'authorization',
+                step_codes: ['open_task', 'review_and_authorize_command', 'recheck_task_state'],
+              },
+              recommendations: [
+                {
+                  priority: 1,
+                  job_id: 'job-1',
+                  job_name: 'RNA-seq confirmation',
+                  thread_id: 'thread-1',
+                  incident_type: 'authorization',
+                  severity: 'warning',
+                  owner: 'user',
+                  diagnosis: 'A command requires authorization before execution can continue.',
+                  immediate_action: 'review_and_authorize_command',
+                  why_now: 'Review and approve or reject the pending command so execution can continue.',
+                  rollback_target: 'authorization_request',
+                  decision_source: 'authorization',
+                },
+              ],
+              dossiers: [],
+            }),
+          })
+        }
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({}),
+        })
+      }),
+    )
+
+    renderTaskMonitor({
+      projectId: 'proj-1',
+      onOpenThread: vi.fn(),
+    })
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Supervisor Review' }))
+
+    expect(await screen.findByText(/Project focus: .*source=authorization/i)).toBeInTheDocument()
+    expect(screen.getByText('Goal: user intervention · Next move: resolve authorization request · Source: authorization')).toBeInTheDocument()
+    expect(screen.getByText('Decision source: authorization')).toBeInTheDocument()
+  })
+
+  it('reuses source-aware confirmation action names across supervisor surfaces', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL) => {
+        const url = String(input)
+        if (url.includes('/api/jobs/supervisor-review?project=proj-1')) {
+          return Promise.resolve({
+            ok: true,
+            json: async () => ({
+              mode: 'heuristic',
+              generated_at: '2026-03-30T10:00:00Z',
+              overview: '1 open incident.',
+              supervisor_message: 'Execution confirmation is blocked on semantic ambiguity review.',
+              focus_summary: {
+                primary_lane: 'confirmation_gates',
+                decision_source: 'semantic_trace',
+                top_owner: 'user',
+                top_incident_type: 'execution_confirmation',
+                high_confidence_total: 0,
+                auto_recoverable_total: 0,
+                user_wait_total: 1,
+                next_best_operator_move: 'review_confirmation_gate',
+                lane_reason: 'The current execution graph still has unresolved semantic ambiguity.',
+                next_best_operator_reason: 'Review the competing resource paths before confirming the expanded execution graph.',
+              },
+              project_playbook: {
+                goal: 'confirmation_gates',
+                next_move: 'review_confirmation_gate',
+                decision_source: 'semantic_trace',
+                step_codes: ['open_task', 'confirm_or_edit_execution', 'recheck_task_state'],
+              },
+              recommendations: [
+                {
+                  priority: 1,
+                  job_id: 'job-1',
+                  job_name: 'RNA-seq confirmation',
+                  thread_id: 'thread-1',
+                  incident_type: 'execution_confirmation',
+                  severity: 'warning',
+                  owner: 'user',
+                  diagnosis: 'Execution confirmation is blocked on semantic ambiguity review.',
+                  immediate_action: 'confirm_or_edit_execution',
+                  why_now: 'The operator still needs to resolve the semantic ambiguity before the final execution graph can be confirmed.',
+                  rollback_target: 'execution_confirmation_gate',
+                  decision_source: 'semantic_trace',
+                },
+              ],
+              dossiers: [],
+            }),
+          })
+        }
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({}),
+        })
+      }),
+    )
+
+    renderTaskMonitor({
+      projectId: 'proj-1',
+      onOpenThread: vi.fn(),
+    })
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Supervisor Review' }))
+
+    const focusLine = await screen.findByText(/Project focus: .*source=semantic trace/i)
+    expect(focusLine.textContent || '').toContain('next=Review Semantic Trace')
+    expect(screen.getByText('Goal: confirmation gates · Next move: Review Semantic Trace · Source: semantic trace')).toBeInTheDocument()
+    expect(screen.getByText('2. Review Semantic Trace')).toBeInTheDocument()
+    expect(screen.getByText('Next move: Review Semantic Trace')).toBeInTheDocument()
   })
 
   it('renders environment failure diagnostics with package candidates in the task panel', async () => {
@@ -2073,6 +2573,9 @@ describe('TaskMonitor', () => {
                 high_confidence_total: 0,
                 auto_recoverable_total: 0,
                 user_wait_total: 0,
+                project_memory_resource_link_count: 2,
+                project_memory_artifact_link_count: 1,
+                project_memory_runtime_link_count: 3,
                 top_failure_layer: 'step_execution',
                 top_rollback_level: 'dag',
                 top_rollback_target: 'align',
@@ -2088,7 +2591,7 @@ describe('TaskMonitor', () => {
               project_playbook: {
                 goal: 'rollback_review',
                 next_move: 'review_rollback_scope',
-                step_codes: ['inspect_resume_chain', 'open_chat', 'recheck_task_state'],
+                step_codes: ['inspect_resume_chain', 'review_semantic_memory_dossier', 'open_chat', 'recheck_task_state'],
               },
               recommendations: [
                 {
@@ -2113,7 +2616,13 @@ describe('TaskMonitor', () => {
                   historical_guidance:
                     'Project memory most often resolved similar incidents via retry_resume_chain (2/2), but the current recommendation intentionally withholds that path because the safer rollback scope is dag.',
                   recommended_action_confidence: 'low',
-                  recommended_action_basis: ['no_safe_action', 'historical_rollback_divergence', 'historical_target_alignment'],
+                  recommended_action_basis: [
+                    'no_safe_action',
+                    'historical_rollback_divergence',
+                    'historical_target_alignment',
+                    'semantic_resource_trace',
+                    'semantic_artifact_trace',
+                  ],
                   historical_policy: {
                     preferred_safe_action: 'retry_resume_chain',
                     support_count: 2,
@@ -2156,6 +2665,71 @@ describe('TaskMonitor', () => {
                     added_group_count: 1,
                     changed_group_count: 2,
                   },
+                  execution_semantic_guardrails: {
+                    memory_review_count: 1,
+                    ambiguity_count: 1,
+                    memory_binding_reviews: [
+                      {
+                        step_key: 'align',
+                        display_name: 'HISAT2 align',
+                        slot_name: 'reference_fasta',
+                        candidate_path: '/refs/apple-v2.fa',
+                        confirmed_path: '/refs/apple-v1.fa',
+                        description:
+                          "reference_fasta currently prefers '/refs/apple-v2.fa', but project memory previously confirmed '/refs/apple-v1.fa'.",
+                      },
+                    ],
+                    ambiguity_reviews: [
+                      {
+                        step_key: 'count',
+                        display_name: 'featureCounts',
+                        slot_name: 'annotation_gtf',
+                        primary_path: '/refs/apple-v2.gtf',
+                        secondary_path: '/refs/apple-v2.1.gtf',
+                        description:
+                          "annotation_gtf has close candidates '/refs/apple-v2.gtf' vs '/refs/apple-v2.1.gtf' (gap=0.02, total=2).",
+                      },
+                    ],
+                    project_memory_summary: {
+                      stable_fact_count: 3,
+                      memory_pattern_count: 1,
+                      memory_preference_count: 1,
+                      resource_link_count: 2,
+                      artifact_link_count: 1,
+                      runtime_link_count: 1,
+                    },
+                  },
+                  semantic_memory_dossier: {
+                    resource_link_count: 2,
+                    artifact_link_count: 1,
+                    runtime_link_count: 2,
+                    resource_links: [
+                      {
+                        entity_id: 'res-apple-ref',
+                        link_role: 'resolved_resource',
+                      },
+                      {
+                        entity_id: 'res-apple-ann',
+                        link_role: 'candidate_resource',
+                      },
+                    ],
+                    artifact_links: [
+                      {
+                        entity_id: 'art-counts-1',
+                        link_role: 'produced_artifact',
+                      },
+                    ],
+                    runtime_links: [
+                      {
+                        entity_id: 'job-resume',
+                        link_role: 'related_runtime',
+                      },
+                      {
+                        entity_id: 'step-align',
+                        link_role: 'affected_step',
+                      },
+                    ],
+                  },
                   runtime_diagnostics: [],
                   recent_decisions: [],
                   recent_logs: [],
@@ -2194,19 +2768,30 @@ describe('TaskMonitor', () => {
     const focusLine = screen.getByText(/lane=rollback review/)
     expect(focusLine).toBeInTheDocument()
     expect(focusLine.textContent || '').toContain('layer=Step Execution')
+    expect(focusLine.textContent || '').toContain('memory_resources=2')
+    expect(focusLine.textContent || '').toContain('memory_artifacts=1')
+    expect(focusLine.textContent || '').toContain('memory_runtime=3')
     expect(focusLine.textContent || '').toContain('rollback=DAG')
     expect(focusLine.textContent || '').toContain('history_rollback=DAG')
     expect(focusLine.textContent || '').toContain('history_align=aligned')
     expect(focusLine.textContent || '').toContain('target=align')
     expect(focusLine.textContent || '').toContain('history_target=align')
     expect(focusLine.textContent || '').toContain('target_align=aligned')
-    expect(focusLine.textContent || '').toContain('next=review rollback scope')
+    expect(focusLine.textContent || '').toContain('next=Open Rollback Review')
     expect(screen.getByText('Failure layer: Step Execution')).toBeInTheDocument()
     expect(screen.getByText('Rollback hint: DAG · The current failing / blocked step was materially re-orchestrated in the expanded DAG, so rollback should revisit the execution graph.')).toBeInTheDocument()
     expect(screen.getByText('Needs reconfirmation: Yes · History: matches=2')).toBeInTheDocument()
     expect(screen.getByText('Execution overview: 3 abstract steps become 3 execution-semantics steps and 4 execution groups; 1 run per-sample, 1 aggregate upstream outputs, 1 system-added, 2 orchestrated changes.')).toBeInTheDocument()
+    expect(screen.getByText('Execution guardrails: 1 project-memory conflict(s) · 1 ambiguous resource candidate(s)')).toBeInTheDocument()
+    expect(screen.getByText("Project memory: reference_fasta currently prefers '/refs/apple-v2.fa', but project memory previously confirmed '/refs/apple-v1.fa'.")).toBeInTheDocument()
+    expect(screen.getByText("Resource focus: annotation_gtf has close candidates '/refs/apple-v2.gtf' vs '/refs/apple-v2.1.gtf' (gap=0.02, total=2).")).toBeInTheDocument()
+    expect(screen.getByText('Project memory context: 3 stable facts · 1 patterns · 1 preferences · 2 resource links · 1 artifact links · 1 runtime links')).toBeInTheDocument()
+    expect(screen.getByText('Semantic resources: 2 link(s) · resolved resource=res-apple-ref · candidate resource=res-apple-ann')).toBeInTheDocument()
+    expect(screen.getByText('Semantic artifacts: 1 link(s) · produced artifact=art-counts-1')).toBeInTheDocument()
+    expect(screen.getByText('Semantic runtime links: 2 link(s) · related runtime=job-resume · affected step=step-align')).toBeInTheDocument()
     expect(screen.getByText('Action boundary: Resume-chain retry is intentionally withheld because the safer rollback scope is dag, so operator review should revisit that layer before resuming.')).toBeInTheDocument()
     expect(screen.getByText('Historical guidance: Project memory most often resolved similar incidents via retry_resume_chain (2/2), but the current recommendation intentionally withholds that path because the safer rollback scope is dag.')).toBeInTheDocument()
+    expect(screen.getByText('2. Next: review the semantic-memory dossier, including linked resources and artifacts, before continuing.')).toBeInTheDocument()
     const historicalPolicyLine = screen.getByText(/Historical policy:/)
     expect(historicalPolicyLine).toBeInTheDocument()
     expect(historicalPolicyLine.textContent || '').toContain('prefer=Retry Resume Chain')
@@ -2220,13 +2805,180 @@ describe('TaskMonitor', () => {
     expect(historicalPolicyLine.textContent || '').toContain('current target=align')
     expect(historicalPolicyLine.textContent || '').toContain('target support=2')
     expect(historicalPolicyLine.textContent || '').toContain('target alignment')
-    expect(screen.getByText(/Basis: no safe action available · historical rollback scope diverges · historical rollback target aligns/)).toBeInTheDocument()
+    expect(screen.getByText(/Basis: no safe action available · historical rollback scope diverges · historical rollback target aligns · semantic resource trace is available · semantic artifact trace is available/)).toBeInTheDocument()
     expect(screen.getByText('Recovery Playbook')).toBeInTheDocument()
     expect(screen.getAllByText('2. Open Chat').length).toBeGreaterThan(0)
     expect(screen.getByText('3. Open Task')).toBeInTheDocument()
     fireEvent.click(within(projectPlaybook as HTMLElement).getByRole('button', { name: 'Open Chat' }))
     expect(onOpenThread).toHaveBeenCalledWith('thread-resume', 'job-resume')
     expect(within(projectPlaybook as HTMLElement).getByRole('button', { name: 'Open Task' })).toBeInTheDocument()
+  })
+
+  it('formats execution_artifact_review rollback targets with a human label', async () => {
+    mockUseProjectTaskFeed.mockReturnValue({
+      jobs: [
+        {
+          id: 'job-artifact',
+          name: 'Artifact review job',
+          status: 'failed',
+          goal: 'Inspect downstream artifact lineage',
+          thread_id: 'thread-artifact',
+          created_at: '2026-03-28T10:00:00Z',
+        },
+      ],
+      attentionSummary: {
+        signal: 'warning',
+        count: 1,
+        counts: {
+          running: 0,
+          authorization: 0,
+          repair: 0,
+          confirmation: 0,
+          clarification: 0,
+          warning: 1,
+          needs_input: 0,
+          needs_review: 1,
+        },
+        needs_input: [],
+        needs_review: [
+          {
+            key: 'job-artifact:failed',
+            job_id: 'job-artifact',
+            job_name: 'Artifact review job',
+            incident_type: 'failed',
+            reason: 'warning',
+            age_seconds: 120,
+            summary: 'Artifact lineage should be reviewed before retry.',
+            severity: 'warning',
+            owner: 'system',
+          },
+        ],
+        reminders: [],
+        auto_authorize_commands: false,
+      },
+      incidents: [
+        {
+          job_id: 'job-artifact',
+          job_name: 'Artifact review job',
+          job_status: 'failed',
+          incident_type: 'failed',
+          severity: 'warning',
+          owner: 'system',
+          summary: 'Artifact lineage should be reviewed before retry.',
+          next_action: 'inspect_failure_context',
+          age_seconds: 120,
+          thread_id: 'thread-artifact',
+        },
+      ],
+      incidentSummary: { total_open: 1, critical: 0, warning: 1, info: 0 },
+      overview: { total: 1, active: 1, by_status: { failed: 1 } },
+      eventVersion: 0,
+      totalCount: 1,
+      getJobsPage: () => [
+        {
+          id: 'job-artifact',
+          name: 'Artifact review job',
+          status: 'failed',
+          goal: 'Inspect downstream artifact lineage',
+          thread_id: 'thread-artifact',
+          created_at: '2026-03-28T10:00:00Z',
+        },
+      ],
+      getPageHasMore: () => false,
+      patchJob: vi.fn(),
+      locateJobPage: vi.fn().mockResolvedValue(1),
+      refreshJobPage: vi.fn().mockResolvedValue([]),
+      refreshJobs: vi.fn().mockResolvedValue([]),
+      refreshAttentionSummary: vi.fn().mockResolvedValue(undefined),
+      refreshIncidents: vi.fn().mockResolvedValue(undefined),
+      refreshAll: vi.fn().mockResolvedValue(undefined),
+    })
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL) => {
+        const url = String(input)
+        if (url.includes('/api/jobs/supervisor-review?project=proj-1')) {
+          return Promise.resolve({
+            ok: true,
+            json: async () => ({
+              mode: 'heuristic',
+              generated_at: '2026-03-28T13:00:00Z',
+              overview: '1 open incident.',
+              supervisor_message: 'Artifact lineage should be reviewed before retrying runtime recovery.',
+              focus_summary: {
+                primary_lane: 'rollback_review',
+                top_owner: 'system',
+                top_incident_type: 'failed',
+                high_confidence_total: 0,
+                auto_recoverable_total: 0,
+                user_wait_total: 0,
+                top_failure_layer: 'step_execution',
+                top_rollback_level: 'execution_ir',
+                top_rollback_target: 'execution_artifact_review',
+                top_execution_artifact_review_subtype: 'upstream_output_regeneration',
+                next_best_operator_move: 'review_rollback_scope',
+                lane_reason: 'Artifact lineage needs review.',
+                next_best_operator_reason: 'Inspect the relevant outputs before retrying.',
+              },
+              project_playbook: {
+                goal: 'rollback_review',
+                next_move: 'review_rollback_scope',
+                step_codes: ['open_task', 'review_semantic_memory_dossier', 'inspect_artifact_lineage', 'regenerate_upstream_outputs', 'recheck_task_state'],
+              },
+              recommendations: [
+                {
+                  priority: 1,
+                  job_id: 'job-artifact',
+                  job_name: 'Artifact review job',
+                  incident_type: 'failed',
+                  severity: 'warning',
+                  owner: 'system',
+                  diagnosis: 'Artifact lineage should be reviewed before retry.',
+                  immediate_action: 'inspect_failure_context',
+                  why_now: 'The produced outputs may no longer match downstream expectations.',
+                  failure_layer: 'step_execution',
+                  rollback_level: 'execution_ir',
+                  rollback_target: 'execution_artifact_review',
+                  reconfirmation_required: true,
+                  historical_matches: 0,
+                  safe_action: null,
+                  recommended_action_confidence: 'medium',
+                  recommended_action_basis: ['semantic_artifact_trace'],
+                  execution_artifact_review_subtype: 'upstream_output_regeneration',
+                  recovery_playbook: {
+                    goal: 'restore_execution_progress',
+                    rollback_target: 'execution_artifact_review',
+                    step_codes: ['open_task', 'review_semantic_memory_dossier', 'inspect_artifact_lineage', 'regenerate_upstream_outputs', 'recheck_task_state'],
+                  },
+                },
+              ],
+              dossiers: [],
+            }),
+          })
+        }
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({}),
+        })
+      }),
+    )
+
+    renderTaskMonitor({
+      projectId: 'proj-1',
+      onOpenThread: vi.fn(),
+    })
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Supervisor Review' }))
+
+    const focusLine = await screen.findByText(/lane=rollback review/)
+    expect(focusLine.textContent || '').toContain('target=Execution artifact review')
+    expect(focusLine.textContent || '').toContain('artifact_review=Regenerate upstream outputs')
+    expect(screen.getByText('Execution artifact review')).toBeInTheDocument()
+    expect(screen.getAllByText('Regenerate upstream outputs').length).toBeGreaterThan(0)
+    expect(screen.getAllByText('3. Next: inspect the upstream artifact lineage and confirm which produced outputs are still valid.').length).toBeGreaterThan(0)
+    expect(screen.getAllByText('4. Next: regenerate the affected upstream outputs before re-running dependent steps.').length).toBeGreaterThan(0)
+    expect(screen.queryByText('execution_artifact_review')).not.toBeInTheDocument()
   })
 
   it('shows rollback guidance directly in task details and timeline', async () => {
@@ -2876,6 +3628,161 @@ describe('TaskMonitor', () => {
       expect(refreshAll).toHaveBeenCalled()
       expect(refreshJobPage).toHaveBeenCalledWith(1, { force: true })
     })
+  })
+
+  it('renders structured clarification requests from decision packets', async () => {
+    const onOpenThread = vi.fn()
+
+    mockUseProjectTaskFeed.mockReturnValue({
+      jobs: [
+        {
+          id: 'job-clarify',
+          name: 'Reference clarification',
+          status: 'resource_clarification_required',
+          goal: 'Clarify which reference should be used',
+          thread_id: 'thread-clarify',
+          created_at: '2026-03-29T11:00:00Z',
+        },
+      ],
+      attentionSummary: {
+        signal: 'attention',
+        count: 1,
+        counts: {
+          running: 0,
+          authorization: 0,
+          repair: 0,
+          confirmation: 0,
+          clarification: 1,
+          warning: 0,
+          needs_input: 1,
+          needs_review: 0,
+        },
+        needs_input: [
+          {
+            key: 'job-clarify:clarification',
+            job_id: 'job-clarify',
+            job_name: 'Reference clarification',
+            thread_id: 'thread-clarify',
+            incident_type: 'resource_clarification',
+            reason: 'clarification',
+            age_seconds: 150,
+            summary: 'A resource clarification is required.',
+            severity: 'info',
+            owner: 'user',
+          },
+        ],
+        needs_review: [],
+        reminders: [],
+        auto_authorize_commands: false,
+      },
+      incidents: [],
+      incidentSummary: { total_open: 0, critical: 0, warning: 0, info: 0 },
+      overview: { total: 1, active: 1, by_status: { resource_clarification_required: 1 } },
+      eventVersion: 0,
+      totalCount: 1,
+      getJobsPage: () => [
+        {
+          id: 'job-clarify',
+          name: 'Reference clarification',
+          status: 'resource_clarification_required',
+          goal: 'Clarify which reference should be used',
+          thread_id: 'thread-clarify',
+          created_at: '2026-03-29T11:00:00Z',
+        },
+      ],
+      getPageHasMore: () => false,
+      patchJob: vi.fn(),
+      locateJobPage: vi.fn().mockResolvedValue(1),
+      refreshJobPage: vi.fn().mockResolvedValue([]),
+      refreshJobs: vi.fn().mockResolvedValue([]),
+      refreshAttentionSummary: vi.fn().mockResolvedValue(undefined),
+      refreshIncidents: vi.fn().mockResolvedValue(undefined),
+      refreshAll: vi.fn().mockResolvedValue(undefined),
+    })
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL) => {
+        const url = String(input)
+        if (url.includes('/api/jobs/job-clarify/bindings?detailed=1')) {
+          return Promise.resolve({
+            ok: true,
+            json: async () => ({
+              job_status: 'resource_clarification_required',
+              error_message: 'Analysis is paused pending resource clarification.',
+              pending_interaction_type: 'resource_clarification',
+              pending_interaction_payload: {
+                prompt_text: 'Please provide or confirm the following resource information.',
+                decision_packet: {
+                  decision_type: 'resource_clarification',
+                  context_payload: {
+                    clarification_request: {
+                      request_id: 'job-clarify',
+                      request_type: 'resource_clarification',
+                      prompt: 'Please provide or confirm the following resource information.',
+                      questions: [
+                        {
+                          question_id: 'issue-1',
+                          prompt: 'Reference FASTA required',
+                          response_kind: 'select_option',
+                          required: true,
+                          allows_free_text: true,
+                          free_text_hint: 'Choose one of the candidates or provide a different path.',
+                          options: [
+                            {
+                              option_id: 'candidate_1',
+                              label: '/refs/apple-v1.fa [apple, v1]',
+                              value: '/refs/apple-v1.fa',
+                            },
+                            {
+                              option_id: 'candidate_2',
+                              label: '/refs/apple-v2.fa [apple, v2]',
+                              value: '/refs/apple-v2.fa',
+                            },
+                          ],
+                          context: {
+                            description: "Step 'align': required slot 'reference_fasta' could not be resolved",
+                            suggestion: 'Select one of the detected candidates, or provide a different valid path.',
+                          },
+                        },
+                      ],
+                      context: {
+                        job_id: 'job-clarify',
+                        project_id: 'proj-1',
+                        context_id: 'job-clarify',
+                      },
+                    },
+                  },
+                },
+              },
+              steps: [],
+            }),
+          })
+        }
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({}),
+        })
+      }),
+    )
+
+    renderTaskMonitor({
+      projectId: 'proj-1',
+      onOpenThread,
+    })
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Logs' }))
+
+    expect(await screen.findByText('Pending Resource Clarification')).toBeInTheDocument()
+    expect(screen.getByText('Clarification Questions')).toBeInTheDocument()
+    expect(screen.getAllByText(/Reference FASTA required/).length).toBeGreaterThan(0)
+    expect(screen.getAllByText(/required slot 'reference_fasta' could not be resolved/).length).toBeGreaterThan(0)
+    expect(screen.getByText('/refs/apple-v1.fa [apple, v1]')).toBeInTheDocument()
+    expect(screen.getByText('/refs/apple-v2.fa [apple, v2]')).toBeInTheDocument()
+    expect(screen.getByText(/Expected input:/)).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Open Clarification Chat' }))
+    expect(onOpenThread).toHaveBeenCalledWith('thread-clarify', 'job-clarify')
   })
 
   it('shows an auto-authorization status banner when workspace auto-approve is enabled', async () => {

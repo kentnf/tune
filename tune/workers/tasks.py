@@ -570,9 +570,9 @@ async def _preview_semantic_bindings_for_step(
     try:
         from tune.core.binding.resolver import (
             _collect_transitive_dep_keys,
-            _select_semantic_candidates,
             load_registered_resource_bindings,
         )
+        from tune.core.binding.semantic_retrieval import retrieve_semantic_candidates
         from tune.core.database import get_session_factory
         from tune.core.registry import get_step_type
 
@@ -602,7 +602,7 @@ async def _preview_semantic_bindings_for_step(
             )
             preview: dict[str, Any] = {}
             for slot in defn.input_slots:
-                candidates = await _select_semantic_candidates(
+                candidates = await retrieve_semantic_candidates(
                     job_id=job_id,
                     dep_keys=transitive_dep_keys,
                     slot=slot,
@@ -2503,6 +2503,33 @@ async def run_analysis_task(job_id: str) -> None:
                 result = await run_subprocess(pixi_command, cwd=step_dir, job_id=job_id)
                 append_command_log(cmd_log, command, result)
                 if result.success:
+                    latest_verification = None
+                    if attempt_history:
+                        try:
+                            from tune.core.analysis.repair_loop import verify_repair_outcome
+
+                            latest_verification = verify_repair_outcome(
+                                step_dir=step_dir,
+                                renderer_outputs=renderer_outputs,
+                                command=command,
+                            )
+                        except Exception:
+                            latest_verification = None
+                            log.exception(
+                                "run_analysis_task: repair-loop verification failed for job %s step '%s'",
+                                job_id,
+                                _step_key,
+                            )
+                    if isinstance(latest_verification, dict) and latest_verification.get("verified") is False:
+                        attempt_history.append({
+                            "command": command,
+                            "stderr": latest_verification.get("summary", "post-repair verification failed"),
+                            "repair_level": 0,
+                            "verification_failed": True,
+                            "semantic_scope": "semantic_preserving",
+                            "verification": latest_verification,
+                        })
+                        continue
                     succeeded = True
                     break
 
@@ -2510,7 +2537,55 @@ async def run_analysis_task(job_id: str) -> None:
                     "command": command,
                     "stderr": result.stderr,
                     "repair_level": 0,
+                    "semantic_scope": "semantic_preserving",
                 })
+
+                current_execution_evidence = None
+                repair_loop_state = None
+                try:
+                    from tune.core.analysis.execution_evidence import build_execution_evidence_snapshot
+                    from tune.core.analysis.repair_loop import build_failure_episode
+                    from tune.core.database import get_session_factory as _rl_sf
+
+                    async with _rl_sf()() as _rl_sess:
+                        current_execution_evidence = await build_execution_evidence_snapshot(_rl_sess, job)
+                    repair_loop_state = build_failure_episode(
+                        step_key=_step_key,
+                        step_type=step.get("step_type"),
+                        command=command,
+                        stderr=result.stderr,
+                        attempt_history=attempt_history,
+                        execution_evidence=current_execution_evidence,
+                        latest_verification=(attempt_history[-1].get("verification") if attempt_history else None),
+                    )
+                    attempt_history[-1]["failure_signature"] = repair_loop_state.get("failure_signature")
+                    attempt_history[-1]["repair_loop_state"] = repair_loop_state
+                except Exception:
+                    current_execution_evidence = None
+                    repair_loop_state = None
+                    log.exception(
+                        "run_analysis_task: failed to build repair-loop state for job %s step '%s'",
+                        job_id,
+                        _step_key,
+                    )
+
+                if isinstance(repair_loop_state, dict) and not repair_loop_state.get("may_continue_automatically", False):
+                    from tune.core.repair.engine import RepairAction, RepairResult, escalate_to_human
+
+                    req_id = await escalate_to_human(
+                        job_id=job_id,
+                        step_id=step_run_id or None,
+                        command=command,
+                        stderr=result.stderr,
+                    )
+                    attempt_history[-1]["escalation_reason"] = repair_loop_state.get("escalation_reason")
+                    repair = RepairResult(
+                        action=RepairAction.ESCALATED,
+                        escalation_repair_request_id=req_id,
+                        notes=str(repair_loop_state.get("escalation_reason") or "repair loop escalated"),
+                    )
+                else:
+                    repair = None
 
                 # Phase 6: if the previous attempt used a memory-recalled command and it
                 # failed again, increment its failure_count so it gets deprioritised.
@@ -2526,16 +2601,17 @@ async def run_analysis_task(job_id: str) -> None:
                 # Repair engine: try Tier-0 memory, L1 rules, L2 constrained LLM, L3 human
                 from tune.core.repair import attempt_repair, RepairAction
                 step_run_id = step.get("_run_id") or ""
-                repair = await attempt_repair(
-                    job_id=job_id,
-                    step_id=step_run_id or None,
-                    command=command,
-                    stderr=result.stderr,
-                    output_dir=str(step_dir),
-                    attempt_history=attempt_history,
-                    step_type=step.get("step_type"),
-                    project_id=job.project_id or "",
-                )
+                if repair is None:
+                    repair = await attempt_repair(
+                        job_id=job_id,
+                        step_id=step_run_id or None,
+                        command=command,
+                        stderr=result.stderr,
+                        output_dir=str(step_dir),
+                        attempt_history=attempt_history,
+                        step_type=step.get("step_type"),
+                        project_id=job.project_id or "",
+                    )
 
                 if repair.action in (RepairAction.APPLIED_RULE, RepairAction.LLM_REPAIRED,
                                      RepairAction.MEMORY_RECALLED):
@@ -2555,6 +2631,7 @@ async def run_analysis_task(job_id: str) -> None:
                         log.info("Repair engine L2 LLM repair applied for step '%s'",
                                  _step_display_name(step))
                     attempt_history[-1]["repair_level"] = level
+                    attempt_history[-1]["semantic_scope"] = "semantic_preserving"
                     command = repair.repaired_command
                     # continue the while loop to retry with repaired command
 
@@ -2577,8 +2654,12 @@ async def run_analysis_task(job_id: str) -> None:
                     # Persist the resume context so the next invocation knows where to start
                     try:
                         from tune.core.database import get_session_factory as _gsf
+                        from tune.api.routes.jobs import _serialize_execution_plan as _serialize_exec_plan
+                        from tune.core.analysis.execution_evidence import build_execution_evidence_snapshot
+                        from tune.core.analysis.repair_context import build_repair_context_snapshot
                         from tune.core.models import AnalysisJob as _AJ
                         from sqlalchemy import select as _sel
+                        repair_context = None
                         async with _gsf()() as _sess:
                             _jb = (await _sess.execute(
                                 _sel(_AJ).where(_AJ.id == job_id)
@@ -2586,8 +2667,28 @@ async def run_analysis_task(job_id: str) -> None:
                             if _jb:
                                 _jb.pending_repair_request_id = req_id
                                 _jb.pending_step_key = _step_key
+                                _jb.pending_interaction_type = "repair"
+                                _exec_evidence = current_execution_evidence or await build_execution_evidence_snapshot(
+                                    _sess,
+                                    _jb,
+                                )
+                                repair_context = build_repair_context_snapshot(
+                                    _jb,
+                                    execution_payload=_serialize_exec_plan(_jb),
+                                    execution_evidence=_exec_evidence,
+                                    repair_loop_state=repair_loop_state,
+                                )
+                                _jb.pending_interaction_payload_json = {
+                                    "repair_request_id": req_id,
+                                    "step_key": _step_key,
+                                    "failed_command": command,
+                                    "stderr_excerpt": result.stderr[-2000:],
+                                    "repair_context": repair_context,
+                                    "attempt_history": attempt_history,
+                                }
                             await _sess.commit()
                     except Exception:
+                        repair_context = None
                         log.exception(
                             "run_analysis_task: failed to save pending_repair_request_id for job %s",
                             job_id,
@@ -2601,6 +2702,7 @@ async def run_analysis_task(job_id: str) -> None:
                         command=command,
                         stderr=result.stderr,
                         attempt_history=attempt_history,
+                        repair_context=repair_context,
                         language=job_language,
                         thread_id=job_thread_id,
                     )
@@ -2637,6 +2739,7 @@ async def run_analysis_task(job_id: str) -> None:
                 # Phase 6: write RepairMemory when a human-provided command succeeds.
                 # This persists the fix pattern for future Tier-0 automatic reuse.
                 if _repair_resume_active and _resume_ctx and _resume_ctx.get("repair_command"):
+                    human_assisted = True
                     _repair_stderr = _resume_ctx.get("stderr", "")
                     _repair_cmd = _resume_ctx["repair_command"]
                     _orig_cmd = locals().get("_original_command_before_repair", "") or ""
@@ -2836,6 +2939,14 @@ async def run_analysis_task(job_id: str) -> None:
                                 description=f"Step '{_step_display_name(step)}' failed with: {attempt_history[-1]['stderr'][:200]}",
                                 resolution=f"Resolved using command: {command}",
                                 user_contributed=human_assisted,
+                                thread_id=getattr(job, "thread_id", None),
+                                job_id=getattr(job, "id", None),
+                                step_id=step_run_id,
+                                metadata_json={
+                                    "step_key": step.get("step_key"),
+                                    "step_type": step.get("step_type"),
+                                    "human_assisted": bool(human_assisted),
+                                },
                             )
                     except Exception:
                         pass  # Memory write is best-effort

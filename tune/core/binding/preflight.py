@@ -11,7 +11,7 @@ import uuid as _uuid_mod
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from tune.core.resources.models import ReadinessIssue
+from tune.core.resources.models import ReadinessIssue, ResourceCandidate
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -50,9 +50,12 @@ async def run_preflight(
     Returns PreflightResult with ok=True if no blocking issues found.
     """
     from tune.core.binding.resolver import (
-        _select_semantic_candidate,
-        _select_semantic_candidates,
         load_registered_resource_bindings,
+    )
+    from tune.core.binding.semantic_retrieval import (
+        retrieve_best_semantic_candidate,
+        retrieve_semantic_candidates,
+        summarize_candidate_ambiguity,
     )
     from tune.core.models import KnownPath, File, InputBinding
     from tune.core.registry import ensure_registry_loaded, get_step_type
@@ -375,7 +378,7 @@ async def run_preflight(
             if not resolved_value:
                 dep_keys = list(step.get("depends_on") or [])
                 if slot.multiple:
-                    candidates = await _select_semantic_candidates(
+                    candidates = await retrieve_semantic_candidates(
                         job_id=job_id,
                         dep_keys=dep_keys,
                         slot=slot,
@@ -393,7 +396,7 @@ async def run_preflight(
                     if resolved_paths:
                         resolved_value = resolved_paths
                 else:
-                    candidate = await _select_semantic_candidate(
+                    candidates = await retrieve_semantic_candidates(
                         job_id=job_id,
                         dep_keys=dep_keys,
                         slot=slot,
@@ -403,6 +406,19 @@ async def run_preflight(
                         db=db,
                         preferred_lineage=preferred_lineage,
                     )
+                    ambiguity = summarize_candidate_ambiguity(candidates[:3])
+                    if ambiguity:
+                        issues.append(
+                            _issue_for_ambiguous_slot(
+                                step_key=step_key,
+                                step_type=step_type,
+                                slot_name=slot.name,
+                                candidates=candidates[:6],
+                                ambiguity=ambiguity,
+                            )
+                        )
+                        continue
+                    candidate = candidates[0] if candidates else None
                     if candidate and candidate.get("file_path"):
                         resolved_value = candidate["file_path"]
 
@@ -677,13 +693,22 @@ def _slot_issue_fields(slot_name: str) -> tuple[str, str, str, str]:
     )
 
 
-def _slot_binding_key(slot_name: str) -> str | None:
-    return {
-        "annotation_gtf": "annotation_gtf",
-        "index_prefix": "hisat2_index",
-        "genome_dir": "star_genome_dir",
-        "reference_fasta": "reference_fasta",
-    }.get(slot_name)
+def _slot_binding_key(slot_name: str, *, step_type: str | None = None) -> str | None:
+    if slot_name == "annotation_gtf":
+        return "annotation_gtf"
+    if slot_name == "reference_fasta":
+        return "reference_fasta"
+    if slot_name == "genome_dir":
+        return "star_genome_dir"
+    if slot_name == "index_prefix":
+        mapping = {
+            "align.hisat2": "hisat2_index",
+            "align.bwa": "bwa_index",
+            "align.bowtie2": "bowtie2_index",
+        }
+        if step_type:
+            return mapping.get(step_type)
+    return None
 
 
 def _issue_for_auto_build(
@@ -740,7 +765,73 @@ def _issue_for_missing_slot(step_key: str, step_type: str, slot_name: str) -> Re
         affected_step_keys=[step_key] if step_key else [],
         resolution_type="provide_path",
     )
-    binding_key = _slot_binding_key(slot_name)
+    binding_key = _slot_binding_key(slot_name, step_type=step_type)
+    if binding_key:
+        setattr(issue, "binding_key", binding_key)
+    return issue
+
+
+def _issue_for_ambiguous_slot(
+    *,
+    step_key: str,
+    step_type: str,
+    slot_name: str,
+    candidates: list[dict],
+    ambiguity: dict,
+) -> ReadinessIssue:
+    if slot_name == "reference_fasta":
+        issue_kind = "ambiguous_reference"
+        title = "Reference FASTA input is ambiguous"
+    elif slot_name == "annotation_gtf":
+        issue_kind = "ambiguous_annotation"
+        title = "Annotation input is ambiguous"
+    elif slot_name in {"index_prefix", "genome_dir"}:
+        issue_kind = "ambiguous_index"
+        title = "Reference index input is ambiguous"
+    else:
+        issue_kind = "missing_concrete_path"
+        title = f"Required input '{slot_name}' is ambiguous"
+
+    issue = ReadinessIssue(
+        kind=issue_kind,  # type: ignore[arg-type]
+        severity="blocking",
+        title=title,
+        description=(
+            f"Step '{step_key}' ({step_type}) has multiple close candidates for slot '{slot_name}'. "
+            f"Top candidates are '{ambiguity.get('primary_path')}' and '{ambiguity.get('secondary_path')}', "
+            f"with score gap {ambiguity.get('score_gap')}."
+        ),
+        suggestion="Select the correct candidate before execution continues.",
+        affected_step_keys=[step_key] if step_key else [],
+        resolution_type="select_candidate",
+        candidates=[],
+        details={
+            "slot_name": slot_name,
+            "semantic_candidates": [
+                {
+                    "path": candidate.get("file_path"),
+                    "source_type": candidate.get("source_type"),
+                    "score": candidate.get("score"),
+                    "organism": candidate.get("organism"),
+                    "genome_build": candidate.get("genome_build"),
+                }
+                for candidate in candidates
+            ],
+            "ambiguity_summary": dict(ambiguity),
+        },
+    )
+    issue.candidates = [
+        ResourceCandidate(
+            path=str(candidate.get("file_path") or ""),
+            organism=candidate.get("organism"),
+            genome_build=candidate.get("genome_build"),
+            source_type=candidate.get("source_type"),
+            confidence=max(min(float(candidate.get("score", 0)) / 100.0, 1.0), 0.0),
+        )
+        for candidate in candidates
+        if candidate.get("file_path")
+    ]
+    binding_key = _slot_binding_key(slot_name, step_type=step_type)
     if binding_key:
         setattr(issue, "binding_key", binding_key)
     return issue
@@ -782,7 +873,7 @@ def _issue_for_missing_concrete_path(
         affected_step_keys=[step_key] if step_key else [],
         resolution_type="provide_path",
     )
-    binding_key = _slot_binding_key(slot_name)
+    binding_key = _slot_binding_key(slot_name, step_type=step_type)
     if binding_key:
         setattr(issue, "binding_key", binding_key)
     return issue

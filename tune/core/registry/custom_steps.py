@@ -27,11 +27,20 @@ def _spec_paths(analysis_dir: Path | None) -> list[Path]:
     )
 
 
-def _compute_signature(paths: list[Path]) -> tuple[tuple[str, int, int], ...]:
-    signature: list[tuple[str, int, int]] = []
+def _compute_signature(
+    analysis_dir: Path | None,
+    paths: list[Path],
+) -> tuple[tuple[str, int, int], ...]:
+    signature: list[tuple[str, int, int]] = [
+        (
+            f"__analysis_dir__:{analysis_dir.resolve()}" if analysis_dir is not None else "__analysis_dir__:none",
+            0,
+            0,
+        )
+    ]
     for path in paths:
         stat = path.stat()
-        signature.append((path.name, stat.st_mtime_ns, stat.st_size))
+        signature.append((str(path.resolve()), stat.st_mtime_ns, stat.st_size))
     return tuple(signature)
 
 
@@ -141,7 +150,7 @@ def sync_runtime_custom_step_registry(analysis_dir: Path | None, steps_module) -
     global _LAST_SIGNATURE
 
     paths = _spec_paths(analysis_dir)
-    signature = _compute_signature(paths)
+    signature = _compute_signature(analysis_dir, paths)
     if signature == _LAST_SIGNATURE:
         return
 

@@ -260,6 +260,61 @@ def _set_thread_session_field(
         state[field_name] = value.copy()
 
 
+def _sync_thread_analysis_case_from_pending_plan(
+    thread_id: str | None,
+    pending_plan: dict[str, Any] | None,
+) -> None:
+    from tune.core.analysis.analysis_case import build_analysis_case_payload_from_pending_plan
+
+    for state in _iter_session_states_for_thread(thread_id):
+        existing_case = state.get("active_analysis_case")
+        existing_case_id = (
+            str(existing_case.get("analysis_case_id") or "").strip()
+            if isinstance(existing_case, dict)
+            else None
+        )
+        payload = build_analysis_case_payload_from_pending_plan(
+            pending_plan,
+            existing_case_id=existing_case_id,
+        )
+        if payload is not None:
+            state["active_analysis_case"] = payload
+
+
+def _enrich_pending_plan_with_thread_analysis_case(
+    thread_id: str | None,
+    pending_plan: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not isinstance(pending_plan, dict):
+        return pending_plan
+    if str(pending_plan.get("analysis_case_id") or "").strip():
+        return pending_plan
+
+    analysis_case_id = ""
+    analysis_family = ""
+    for state in _iter_session_states_for_thread(thread_id):
+        active_case = state.get("active_analysis_case")
+        if isinstance(active_case, dict):
+            analysis_case_id = str(active_case.get("analysis_case_id") or "").strip()
+            analysis_family = str(active_case.get("analysis_family") or "").strip()
+            if analysis_case_id:
+                break
+        existing_pending = state.get("pending_analysis_plan")
+        if isinstance(existing_pending, dict):
+            analysis_case_id = str(existing_pending.get("analysis_case_id") or "").strip()
+            if analysis_case_id:
+                break
+
+    if not analysis_case_id:
+        return pending_plan
+
+    enriched = dict(pending_plan)
+    enriched["analysis_case_id"] = analysis_case_id
+    if analysis_family and not str(enriched.get("analysis_family") or "").strip():
+        enriched["analysis_family"] = analysis_family
+    return enriched
+
+
 def clear_chat_state_for_job(field_name: str, job_id: str) -> None:
     for state in list(_active_session_states):
         value = state.get(field_name)
@@ -431,6 +486,8 @@ async def sync_supervisor_thread_state(
     job_name: str | None = None,
 ) -> bool:
     """Synchronize active chat sessions after a supervisor action mutates job state."""
+    from tune.core.analysis.persistence import patch_session_pending_plan
+
     thread_id, _project_id = await _load_job_route(job_id)
     if not thread_id:
         return False
@@ -445,14 +502,33 @@ async def sync_supervisor_thread_state(
         clear_chat_state_for_job("pending_error_recovery", job_id)
         cleared_fields.append("error_recovery")
     if clear_resource_clarification:
-        _clear_thread_session_fields(thread_id, "resource_clarification")
+        _clear_thread_session_fields(thread_id, "resource_clarification", "pending_clarification_request")
         cleared_fields.append("resource_clarification")
     if clear_pending_analysis_plan:
         _clear_thread_session_fields(thread_id, "pending_analysis_plan")
         cleared_fields.append("analysis_plan")
 
     if pending_analysis_plan is not None:
+        pending_analysis_plan = _enrich_pending_plan_with_thread_analysis_case(
+            thread_id,
+            pending_analysis_plan,
+        )
         _set_thread_session_field(thread_id, "pending_analysis_plan", pending_analysis_plan)
+        _sync_thread_analysis_case_from_pending_plan(thread_id, pending_analysis_plan)
+        _clear_thread_session_fields(thread_id, "pending_clarification_request")
+        await patch_session_pending_plan(
+            thread_id=thread_id,
+            project_id=_project_id,
+            pending_analysis_plan=pending_analysis_plan,
+            event_type="supervisor_pending_plan_set",
+        )
+    elif clear_pending_analysis_plan:
+        await patch_session_pending_plan(
+            thread_id=thread_id,
+            project_id=_project_id,
+            clear_pending_analysis_plan=True,
+            event_type="supervisor_pending_plan_cleared",
+        )
 
     if cleared_fields:
         await broadcast_thread_chat_event(
@@ -480,9 +556,11 @@ async def sync_supervisor_thread_state(
                     "job_id": job_id,
                     "execution_plan_summary": pending_analysis_plan.get("execution_plan_summary"),
                     "execution_confirmation_overview": pending_analysis_plan.get("execution_confirmation_overview"),
+                    "execution_decision_source": pending_analysis_plan.get("execution_decision_source"),
                     "execution_ir_review": pending_analysis_plan.get("execution_ir_review"),
                     "execution_plan_delta": pending_analysis_plan.get("execution_plan_delta"),
                     "execution_plan_changes": pending_analysis_plan.get("execution_plan_changes"),
+                    "execution_semantic_guardrails": pending_analysis_plan.get("execution_semantic_guardrails"),
                     "requires_confirmation": True,
                 },
             )
@@ -643,7 +721,13 @@ async def _load_thread_rehydration_snapshot(thread_id: str) -> dict[str, Any] | 
     from sqlalchemy.orm import selectinload
 
     from tune.core.database import get_session_factory
-    from tune.core.models import AnalysisJob, CommandAuthorizationRequest, RepairRequest, Thread
+    from tune.core.models import (
+        AnalysisJob,
+        CommandAuthorizationRequest,
+        RepairRequest,
+        SessionState,
+        Thread,
+    )
 
     async with get_session_factory()() as session:
         thread = (
@@ -662,11 +746,78 @@ async def _load_thread_rehydration_snapshot(thread_id: str) -> dict[str, Any] | 
                 {"role": m.role, "content": m.content}
                 for m in sorted(thread.messages, key=lambda msg: msg.created_at)[-100:]
             ],
+            "session_state_id": None,
+            "active_intent_revision_id": None,
+            "active_capability_plan_revision_id": None,
+            "progress_state": None,
+            "analysis_intent_trace": None,
+            "last_readiness_assessment": None,
+            "last_context_acquisition": None,
+            "last_decision_packet": None,
+            "pending_clarification_request": None,
             "pending_plan": None,
             "pending_command_auth": None,
             "pending_error_recovery": None,
             "pending_resource_clarification": None,
         }
+
+        try:
+            persisted_session_state = (
+                await session.execute(
+                    select(SessionState).where(SessionState.thread_id == thread.id)
+                )
+            ).scalar_one_or_none()
+        except Exception:
+            log.exception(
+                "_load_thread_rehydration_snapshot: failed to load SessionState for thread_id=%s",
+                thread.id,
+            )
+            persisted_session_state = None
+        if persisted_session_state:
+            snapshot["project_id"] = snapshot.get("project_id") or getattr(
+                persisted_session_state,
+                "project_id",
+                None,
+            )
+            snapshot["session_state_id"] = getattr(persisted_session_state, "id", None)
+            snapshot["active_intent_revision_id"] = getattr(
+                persisted_session_state,
+                "active_intent_revision_id",
+                None,
+            )
+            snapshot["active_capability_plan_revision_id"] = (
+                getattr(
+                    persisted_session_state,
+                    "active_capability_plan_revision_id",
+                    None,
+                )
+            )
+            snapshot["progress_state"] = getattr(persisted_session_state, "progress_state_json", None)
+            snapshot["analysis_intent_trace"] = getattr(
+                persisted_session_state,
+                "analysis_intent_trace_json",
+                None,
+            )
+            snapshot["last_readiness_assessment"] = getattr(
+                persisted_session_state,
+                "latest_readiness_json",
+                None,
+            )
+            snapshot["last_context_acquisition"] = getattr(
+                persisted_session_state,
+                "latest_context_acquisition_json",
+                None,
+            )
+            snapshot["last_decision_packet"] = getattr(
+                persisted_session_state,
+                "pending_decision_packet_json",
+                None,
+            )
+            snapshot["pending_clarification_request"] = getattr(
+                persisted_session_state,
+                "pending_clarification_request_json",
+                None,
+            )
 
         pending_plan_job = (
             await session.execute(
@@ -680,16 +831,21 @@ async def _load_thread_rehydration_snapshot(thread_id: str) -> dict[str, Any] | 
             )
         ).scalars().first()
         if pending_plan_job:
-            snapshot["project_id"] = snapshot.get("project_id") or pending_plan_job.project_id
+            snapshot["project_id"] = snapshot.get("project_id") or getattr(
+                pending_plan_job,
+                "project_id",
+                None,
+            )
             plan_steps = _extract_plan_steps(
-                pending_plan_job.plan_draft_json or pending_plan_job.plan or []
+                getattr(pending_plan_job, "plan_draft_json", None)
+                or getattr(pending_plan_job, "plan", None)
+                or []
             )
             if plan_steps:
+                from tune.core.decision_packet import (
+                    select_decision_packet_for_state,
+                )
                 from tune.core.orchestration import (
-                    summarize_execution_confirmation_overview,
-                    summarize_execution_plan_delta,
-                    summarize_execution_ir_for_confirmation,
-                    summarize_execution_review_changes,
                     summarize_expanded_dag_for_confirmation,
                 )
 
@@ -697,43 +853,131 @@ async def _load_thread_rehydration_snapshot(thread_id: str) -> dict[str, Any] | 
                     getattr(pending_plan_job, "execution_ir_json", None)
                     and getattr(pending_plan_job, "expanded_dag_json", None)
                 )
+                analysis_intent = (
+                    (pending_plan_job.plan_draft_json or {}).get("analysis_intent")
+                    if isinstance(getattr(pending_plan_job, "plan_draft_json", None), dict)
+                    else None
+                )
+                capability_plan = (
+                    (pending_plan_job.plan_draft_json or {}).get("capability_plan")
+                    if isinstance(getattr(pending_plan_job, "plan_draft_json", None), dict)
+                    else None
+                )
+                implementation_decisions = (
+                    (pending_plan_job.plan_draft_json or {}).get("implementation_decisions")
+                    if isinstance(getattr(pending_plan_job, "plan_draft_json", None), dict)
+                    else None
+                )
+                decision_packet = (
+                    (pending_plan_job.plan_draft_json or {}).get("decision_packet")
+                    if isinstance(getattr(pending_plan_job, "plan_draft_json", None), dict)
+                    else None
+                )
                 snapshot["pending_plan"] = {
                     "job_id": pending_plan_job.id,
                     "goal": pending_plan_job.goal or pending_plan_job.name,
                     "project_id": pending_plan_job.project_id,
                     "plan": plan_steps,
                     "phase": "execution" if has_execution_plan else "abstract",
-                    "review_plan": summarize_expanded_dag_for_confirmation(
-                        getattr(pending_plan_job, "expanded_dag_json", None)
-                    ) if has_execution_plan else None,
-                    "execution_confirmation_overview": summarize_execution_confirmation_overview(
-                        plan_payload=getattr(pending_plan_job, "resolved_plan_json", None) or getattr(pending_plan_job, "plan", None),
-                        execution_ir=getattr(pending_plan_job, "execution_ir_json", None),
-                        expanded_dag=getattr(pending_plan_job, "expanded_dag_json", None),
-                    ) if has_execution_plan else None,
-                    "execution_ir_review": summarize_execution_ir_for_confirmation(
-                        getattr(pending_plan_job, "execution_ir_json", None)
-                    ) if has_execution_plan else None,
-                    "execution_plan_delta": summarize_execution_plan_delta(
-                        getattr(pending_plan_job, "resolved_plan_json", None) or getattr(pending_plan_job, "plan", None),
-                        getattr(pending_plan_job, "expanded_dag_json", None),
-                    ) if has_execution_plan else None,
-                    "execution_plan_changes": summarize_execution_review_changes(
-                        getattr(pending_plan_job, "expanded_dag_json", None)
-                    ) if has_execution_plan else None,
-                    "execution_plan_summary": {
-                        "has_execution_ir": bool(getattr(pending_plan_job, "execution_ir_json", None)),
-                        "has_expanded_dag": bool(getattr(pending_plan_job, "expanded_dag_json", None)),
-                        "node_count": len((getattr(pending_plan_job, "expanded_dag_json", {}) or {}).get("nodes", []))
-                        if isinstance(getattr(pending_plan_job, "expanded_dag_json", None), dict)
-                        else 0,
-                        "group_count": len((getattr(pending_plan_job, "expanded_dag_json", {}) or {}).get("groups", []))
-                        if isinstance(getattr(pending_plan_job, "expanded_dag_json", None), dict)
-                        else 0,
-                    } if has_execution_plan else None,
+                    "review_plan": None,
+                    "execution_confirmation_overview": None,
+                    "execution_decision_source": None,
+                    "execution_ir_review": None,
+                    "execution_plan_delta": None,
+                    "execution_plan_changes": None,
+                    "execution_semantic_guardrails": None,
+                    "execution_plan_summary": None,
                     "short_name": pending_plan_job.name,
                     "job_backed": True,
                 }
+                if has_execution_plan:
+                    from tune.api.routes.jobs import _serialize_execution_plan
+
+                    execution_payload = _serialize_execution_plan(pending_plan_job)
+                    snapshot["pending_plan"]["review_plan"] = summarize_expanded_dag_for_confirmation(
+                        getattr(pending_plan_job, "expanded_dag_json", None)
+                    )
+                    snapshot["pending_plan"]["execution_confirmation_overview"] = execution_payload.get("review_overview")
+                    snapshot["pending_plan"]["execution_decision_source"] = execution_payload.get("execution_decision_source")
+                    snapshot["pending_plan"]["execution_ir_review"] = execution_payload.get("review_ir")
+                    snapshot["pending_plan"]["execution_plan_delta"] = execution_payload.get("review_delta")
+                    snapshot["pending_plan"]["execution_plan_changes"] = execution_payload.get("review_changes")
+                    snapshot["pending_plan"]["execution_semantic_guardrails"] = execution_payload.get("semantic_guardrails")
+                    summary = execution_payload.get("summary") or {}
+                    snapshot["pending_plan"]["execution_plan_summary"] = {
+                        "has_execution_ir": bool(summary.get("has_execution_ir")),
+                        "has_expanded_dag": bool(summary.get("has_expanded_dag")),
+                        "node_count": int(summary.get("node_count", 0) or 0),
+                        "group_count": int(summary.get("group_count", 0) or 0),
+                    }
+                if analysis_intent is not None:
+                    snapshot["pending_plan"]["analysis_intent"] = analysis_intent
+                if capability_plan is not None:
+                    snapshot["pending_plan"]["capability_plan"] = capability_plan
+                if implementation_decisions is not None:
+                    snapshot["pending_plan"]["implementation_decisions"] = implementation_decisions
+                if decision_packet is None:
+                    selected_packet = select_decision_packet_for_state(
+                        {
+                            "progress_state": snapshot.get("progress_state"),
+                            "pending_analysis_plan": {
+                                "active": True,
+                                **snapshot["pending_plan"],
+                            },
+                            "last_decision_packet": snapshot.get("last_decision_packet"),
+                        },
+                        language=getattr(pending_plan_job, "language", "en") or "en",
+                        goal=pending_plan_job.goal or pending_plan_job.name,
+                        short_name=pending_plan_job.name,
+                        review_plan=snapshot["pending_plan"].get("review_plan") or [],
+                        execution_payload={
+                            "summary": snapshot["pending_plan"].get("execution_plan_summary"),
+                            "execution_decision_source": snapshot["pending_plan"].get(
+                                "execution_decision_source"
+                            ),
+                        },
+                    )
+                    if selected_packet is not None:
+                        decision_packet = selected_packet.model_dump(mode="json")
+                if decision_packet is not None:
+                    snapshot["pending_plan"]["decision_packet"] = decision_packet
+        elif (
+            persisted_session_state is not None
+            and isinstance(persisted_session_state.pending_analysis_plan_json, dict)
+            and persisted_session_state.pending_analysis_plan_json.get("active")
+        ):
+            from tune.core.decision_packet import select_decision_packet_for_state
+
+            pending_plan = dict(persisted_session_state.pending_analysis_plan_json)
+            pending_plan.setdefault("job_backed", False)
+            pending_plan.setdefault("phase", "abstract")
+            pending_plan.setdefault("review_plan", None)
+            pending_plan.setdefault("execution_confirmation_overview", None)
+            pending_plan.setdefault("execution_decision_source", None)
+            pending_plan.setdefault("execution_ir_review", None)
+            pending_plan.setdefault("execution_plan_delta", None)
+            pending_plan.setdefault("execution_plan_changes", None)
+            pending_plan.setdefault("execution_semantic_guardrails", None)
+            pending_plan.setdefault("execution_plan_summary", None)
+            if not isinstance(pending_plan.get("decision_packet"), dict):
+                selected_packet = select_decision_packet_for_state(
+                    {
+                        "progress_state": snapshot.get("progress_state"),
+                        "pending_analysis_plan": pending_plan,
+                        "last_decision_packet": snapshot.get("last_decision_packet"),
+                    },
+                    language="en",
+                    goal=pending_plan.get("goal"),
+                    short_name=pending_plan.get("short_name"),
+                    review_plan=pending_plan.get("review_plan"),
+                    execution_payload={
+                        "summary": pending_plan.get("execution_plan_summary"),
+                        "execution_decision_source": pending_plan.get("execution_decision_source"),
+                    },
+                )
+                if selected_packet is not None:
+                    pending_plan["decision_packet"] = selected_packet.model_dump(mode="json")
+            snapshot["pending_plan"] = pending_plan
 
         pending_auth_job = (
             await session.execute(
@@ -757,6 +1001,8 @@ async def _load_thread_rehydration_snapshot(thread_id: str) -> dict[str, Any] | 
                 )
             ).scalar_one_or_none()
             if auth_req and auth_req.status == "pending":
+                from tune.core.decision_packet import select_decision_packet_for_state
+
                 snapshot["pending_command_auth"] = {
                     "job_id": pending_auth_job.id,
                     "auth_request_id": auth_req.id,
@@ -766,6 +1012,19 @@ async def _load_thread_rehydration_snapshot(thread_id: str) -> dict[str, Any] | 
                         "step_key": pending_auth_job.pending_step_key,
                     },
                 }
+                selected_packet = select_decision_packet_for_state(
+                    {
+                        "progress_state": snapshot.get("progress_state"),
+                        "pending_command_auth": snapshot["pending_command_auth"],
+                        "last_decision_packet": snapshot.get("last_decision_packet"),
+                    },
+                    language=getattr(pending_auth_job, "language", "en") or "en",
+                    authorization_request=snapshot["pending_command_auth"],
+                )
+                if selected_packet is not None:
+                    snapshot["pending_command_auth"]["decision_packet"] = selected_packet.model_dump(
+                        mode="json"
+                    )
 
         pending_repair_job = (
             await session.execute(
@@ -789,17 +1048,67 @@ async def _load_thread_rehydration_snapshot(thread_id: str) -> dict[str, Any] | 
                 )
             ).scalar_one_or_none()
             if repair_req and repair_req.status == "pending":
+                from tune.api.routes.jobs import _serialize_execution_plan
+                from tune.core.analysis.execution_evidence import build_execution_evidence_snapshot
+                from tune.core.analysis.repair_context import build_pending_repair_payload
+                from tune.core.decision_packet import select_decision_packet_for_state
+
+                execution_payload = _serialize_execution_plan(pending_repair_job)
+                execution_evidence = await build_execution_evidence_snapshot(
+                    session,
+                    pending_repair_job,
+                )
+                pending_payload = build_pending_repair_payload(
+                    pending_repair_job,
+                    repair_request_id=repair_req.id,
+                    failed_command=repair_req.failed_command or "",
+                    stderr_excerpt=repair_req.stderr_excerpt or "",
+                    execution_payload=execution_payload,
+                    execution_evidence=execution_evidence,
+                )
+                repair_context = pending_payload.get("repair_context") or {}
+                attempt_history = pending_payload.get("attempt_history")
+                if not isinstance(attempt_history, list):
+                    attempt_history = []
+
                 snapshot["pending_error_recovery"] = {
                     "job_id": pending_repair_job.id,
                     "context": {
                         "step": pending_repair_job.pending_step_key or "",
                         "command": repair_req.failed_command or "",
                         "stderr": repair_req.stderr_excerpt or "",
-                        "attempt_history": [],
+                        "attempt_history": attempt_history,
                         "language": pending_repair_job.language or "en",
                         "repair_request_id": repair_req.id,
+                        "repair_context": repair_context,
                     },
                 }
+                selected_packet = select_decision_packet_for_state(
+                    {
+                        "progress_state": snapshot.get("progress_state"),
+                        "pending_error_recovery": {
+                            "job_id": pending_repair_job.id,
+                            "repair_request_id": repair_req.id,
+                            "step_key": pending_repair_job.pending_step_key or "",
+                            "failed_command": repair_req.failed_command or "",
+                            "stderr_excerpt": repair_req.stderr_excerpt or "",
+                            "repair_context": repair_context,
+                        },
+                        "last_decision_packet": snapshot.get("last_decision_packet"),
+                    },
+                    language=getattr(pending_repair_job, "language", "en") or "en",
+                    repair_request={
+                        "repair_request_id": repair_req.id,
+                        "step_key": pending_repair_job.pending_step_key or "",
+                        "failed_command": repair_req.failed_command or "",
+                        "stderr_excerpt": repair_req.stderr_excerpt or "",
+                        "repair_context": repair_context,
+                    },
+                )
+                if selected_packet is not None:
+                    snapshot["pending_error_recovery"]["decision_packet"] = selected_packet.model_dump(
+                        mode="json"
+                    )
 
         pending_resource_job = (
             await session.execute(
@@ -820,8 +1129,16 @@ async def _load_thread_rehydration_snapshot(thread_id: str) -> dict[str, Any] | 
             )
             if normalized_payload:
                 snapshot["pending_resource_clarification"] = normalized_payload
+                if snapshot.get("pending_clarification_request") is None:
+                    snapshot["pending_clarification_request"] = (
+                        ((normalized_payload.get("decision_packet") or {}).get("context_payload") or {}).get(
+                            "clarification_request"
+                        )
+                    )
                 if changed:
-                    await session.commit()
+                    commit = getattr(session, "commit", None)
+                    if callable(commit):
+                        await commit()
             else:
                 log.warning(
                     "_load_thread_rehydration_snapshot: job %s is %s but has no normalizable persisted payload",
@@ -836,7 +1153,27 @@ def _apply_thread_rehydration_snapshot(
     state: dict[str, Any],
     snapshot: dict[str, Any],
 ) -> list[dict[str, Any]]:
+    from tune.core.analysis.analysis_case import build_analysis_case_payload_from_pending_plan
+
     state["project_id"] = snapshot.get("project_id")
+    if snapshot.get("session_state_id"):
+        state["session_state_id"] = snapshot["session_state_id"]
+    if snapshot.get("active_intent_revision_id"):
+        state["active_intent_revision_id"] = snapshot["active_intent_revision_id"]
+    if snapshot.get("active_capability_plan_revision_id"):
+        state["active_capability_plan_revision_id"] = snapshot["active_capability_plan_revision_id"]
+    if isinstance(snapshot.get("progress_state"), dict):
+        state["progress_state"] = snapshot["progress_state"]
+    if isinstance(snapshot.get("analysis_intent_trace"), dict):
+        state["analysis_intent_trace"] = snapshot["analysis_intent_trace"]
+    if isinstance(snapshot.get("last_readiness_assessment"), dict):
+        state["last_readiness_assessment"] = snapshot["last_readiness_assessment"]
+    if isinstance(snapshot.get("last_context_acquisition"), dict):
+        state["last_context_acquisition"] = snapshot["last_context_acquisition"]
+    if isinstance(snapshot.get("last_decision_packet"), dict):
+        state["last_decision_packet"] = snapshot["last_decision_packet"]
+    if isinstance(snapshot.get("pending_clarification_request"), dict):
+        state["pending_clarification_request"] = snapshot["pending_clarification_request"]
     events: list[dict[str, Any]] = [
         {"type": "history", "messages": snapshot.get("history", [])}
     ]
@@ -852,6 +1189,9 @@ def _apply_thread_rehydration_snapshot(
             "active": True,
             **pending_plan,
         }
+        analysis_case_payload = build_analysis_case_payload_from_pending_plan(pending_plan)
+        if analysis_case_payload is not None:
+            state["active_analysis_case"] = analysis_case_payload
         events.append(
             {
                 "type": "plan",
@@ -866,9 +1206,11 @@ def _apply_thread_rehydration_snapshot(
                     "job_id": pending_plan.get("job_id"),
                     "execution_plan_summary": pending_plan.get("execution_plan_summary"),
                     "execution_confirmation_overview": pending_plan.get("execution_confirmation_overview"),
+                    "execution_decision_source": pending_plan.get("execution_decision_source"),
                     "execution_ir_review": pending_plan.get("execution_ir_review"),
                     "execution_plan_delta": pending_plan.get("execution_plan_delta"),
                     "execution_plan_changes": pending_plan.get("execution_plan_changes"),
+                    "execution_semantic_guardrails": pending_plan.get("execution_semantic_guardrails"),
                     "requires_confirmation": True,
                 }
             )
@@ -937,6 +1279,10 @@ async def start_resource_clarification_chat(
     engine._advance_resource_clarification instead of normal intent detection.
     """
     from tune.core.clarification.service import ResourceClarificationService, render_issue_prompt
+    from tune.core.decision_packet import (
+        attach_decision_packet,
+        build_resource_clarification_decision_packet,
+    )
 
     if not thread_id:
         thread_id, resolved_project_id = await _load_job_route(job_id)
@@ -967,9 +1313,7 @@ async def start_resource_clarification_chat(
         )
     )
 
-    await persist_job_pending_interaction(
-        job_id,
-        "resource_clarification",
+    payload = attach_decision_packet(
         {
             "job_id": job_id,
             "project_id": project_id,
@@ -977,7 +1321,16 @@ async def start_resource_clarification_chat(
             "context_id": job_id,
             "prompt_text": initial_prompt,
         },
+        build_resource_clarification_decision_packet(
+            issues=[_serialize_clarification_issue(issue) for issue in issues],
+            job_id=job_id,
+            project_id=project_id,
+            context_id=job_id,
+            language=language,
+        ),
     )
+
+    await persist_job_pending_interaction(job_id, "resource_clarification", payload)
 
     await broadcast_thread_chat_event(thread_id, {"type": "start"})
     try:
@@ -1003,9 +1356,7 @@ async def start_resource_clarification_chat(
             if lang_zh else
             f"Job paused: resource issues detected ({issue_titles}). Please provide the required information."
         )
-        await persist_job_pending_interaction(
-            job_id,
-            "resource_clarification",
+        fallback_payload = attach_decision_packet(
             {
                 "job_id": job_id,
                 "project_id": project_id,
@@ -1013,7 +1364,15 @@ async def start_resource_clarification_chat(
                 "context_id": job_id,
                 "prompt_text": fallback,
             },
+            build_resource_clarification_decision_packet(
+                issues=[_serialize_clarification_issue(issue) for issue in issues],
+                job_id=job_id,
+                project_id=project_id,
+                context_id=job_id,
+                language=language,
+            ),
         )
+        await persist_job_pending_interaction(job_id, "resource_clarification", fallback_payload)
         await broadcast_thread_chat_event(thread_id, {"type": "token", "content": fallback})
     await broadcast_thread_chat_event(thread_id, {"type": "end"})
     await broadcast_project_task_event(job_id, reason="resource_clarification_pending")
@@ -1144,6 +1503,7 @@ async def activate_error_recovery(
     command: str,
     stderr: str,
     attempt_history: list[dict],
+    repair_context: dict[str, Any] | None = None,
     language: str = "en",
     thread_id: str | None = None,
 ) -> None:
@@ -1161,6 +1521,7 @@ async def activate_error_recovery(
         "attempt_history": attempt_history,
         "language": language,
         "repair_request_id": repair_request_id,
+        **({"repair_context": repair_context} if isinstance(repair_context, dict) and repair_context else {}),
     }
 
     resolved_thread_id = thread_id
@@ -1179,6 +1540,7 @@ async def activate_error_recovery(
             "stderr": stderr,
             "attempt_history": attempt_history,
             "repair_request_id": repair_request_id,
+            **({"repair_context": repair_context} if isinstance(repair_context, dict) and repair_context else {}),
         })
     else:
         log.warning(
@@ -1439,6 +1801,8 @@ async def chat_ws(websocket: WebSocket, thread_id: str | None = None):
 
 async def _handle_confirm_plan(websocket: WebSocket, msg: dict, state: dict) -> None:
     """Handle confirm_plan WebSocket messages — create a job or cancel the pending plan."""
+    from tune.core.analysis.persistence import persist_session_snapshot
+
     lang_zh = state.get("language") == "zh"
 
     # Check for pending skill edit first
@@ -1529,6 +1893,14 @@ async def _handle_confirm_plan(websocket: WebSocket, msg: dict, state: dict) -> 
                 existing_draft["steps"] = plan
             else:
                 existing_draft = {"steps": plan}
+            if pending.get("analysis_intent") is not None:
+                existing_draft["analysis_intent"] = pending["analysis_intent"]
+            if pending.get("capability_plan") is not None:
+                existing_draft["capability_plan"] = pending["capability_plan"]
+            if pending.get("implementation_decisions") is not None:
+                existing_draft["implementation_decisions"] = pending["implementation_decisions"]
+            if pending.get("decision_packet") is not None:
+                existing_draft["decision_packet"] = pending["decision_packet"]
             job.plan_draft_json = existing_draft
             await session.commit()
 
@@ -1543,8 +1915,13 @@ async def _handle_confirm_plan(websocket: WebSocket, msg: dict, state: dict) -> 
         from sqlalchemy import select
 
         from tune.api.routes.jobs import _serialize_execution_plan
+        from tune.core.analysis.progress_state import derive_progress_state
         from tune.core.config import get_config
         from tune.core.database import get_session_factory
+        from tune.core.decision_packet import (
+            attach_decision_packet,
+            select_decision_packet_for_state,
+        )
         from tune.core.job_output_paths import build_output_dir_path
         from tune.core.models import AnalysisJob, Project
         from tune.core.orchestration import (
@@ -1623,8 +2000,24 @@ async def _handle_confirm_plan(websocket: WebSocket, msg: dict, state: dict) -> 
                 draft_payload["steps"] = plan
             else:
                 draft_payload = {"steps": plan}
+            if pending.get("analysis_intent") is not None:
+                draft_payload["analysis_intent"] = pending["analysis_intent"]
+            if pending.get("capability_plan") is not None:
+                draft_payload["capability_plan"] = pending["capability_plan"]
+            if pending.get("implementation_decisions") is not None:
+                draft_payload["implementation_decisions"] = pending["implementation_decisions"]
+            if pending.get("decision_packet") is not None:
+                draft_payload["decision_packet"] = pending["decision_packet"]
             job.plan_draft_json = draft_payload
             job.plan = plan
+            job.session_state_id = state.get("session_state_id")
+            job.intent_revision_id = (
+                pending.get("intent_revision_id") or state.get("active_intent_revision_id")
+            )
+            job.capability_plan_revision_id = (
+                pending.get("capability_plan_revision_id")
+                or state.get("active_capability_plan_revision_id")
+            )
             await materialize_job_execution_plan(session, job, draft_payload)
             if state.get("thread_id") and not job.thread_id:
                 job.thread_id = state["thread_id"]
@@ -1637,6 +2030,59 @@ async def _handle_confirm_plan(websocket: WebSocket, msg: dict, state: dict) -> 
 
             execution_payload = _serialize_execution_plan(job)
             review_plan = summarize_expanded_dag_for_confirmation(job.expanded_dag_json)
+            pending_plan_state = {
+                "progress_state": derive_progress_state(
+                    {
+                        "progress_state": state.get("progress_state"),
+                        "pending_analysis_plan": {
+                            "active": True,
+                            "phase": "execution",
+                            "goal": goal or getattr(job, "goal", "") or job.name,
+                            "short_name": job.name,
+                            "analysis_case_id": pending.get("analysis_case_id"),
+                            "review_plan": review_plan,
+                            "execution_plan_summary": execution_payload.get("summary"),
+                            "execution_decision_source": execution_payload.get(
+                                "execution_decision_source"
+                            ),
+                        },
+                    }
+                ).model_dump(mode="json"),
+                "pending_analysis_plan": {
+                    "active": True,
+                    "phase": "execution",
+                    "goal": goal or getattr(job, "goal", "") or job.name,
+                    "short_name": job.name,
+                    "analysis_case_id": pending.get("analysis_case_id"),
+                    "review_plan": review_plan,
+                    "execution_plan_summary": execution_payload.get("summary"),
+                    "execution_decision_source": execution_payload.get("execution_decision_source"),
+                },
+            }
+            execution_decision_packet = select_decision_packet_for_state(
+                pending_plan_state,
+                goal=goal or getattr(job, "goal", "") or job.name,
+                short_name=job.name,
+                review_plan=review_plan,
+                execution_payload=execution_payload,
+                language=state.get("language", "en"),
+            )
+            if execution_decision_packet is None:
+                raise RuntimeError("Execution confirmation decision packet could not be selected")
+            if isinstance(job.plan_draft_json, dict):
+                updated_draft = dict(job.plan_draft_json)
+                updated_draft["decision_packet"] = execution_decision_packet.model_dump(mode="json")
+                job.plan_draft_json = updated_draft
+            job.pending_interaction_type = "execution_confirmation"
+            job.pending_interaction_payload_json = attach_decision_packet(
+                {
+                    "phase": "execution",
+                    "prompt_text": "Execution graph is ready for final confirmation.",
+                    "execution_plan_summary": execution_payload["summary"],
+                    "execution_decision_source": execution_payload.get("execution_decision_source"),
+                },
+                execution_decision_packet,
+            )
             await session.commit()
             return job.id, execution_payload, review_plan
 
@@ -1654,6 +2100,14 @@ async def _handle_confirm_plan(websocket: WebSocket, msg: dict, state: dict) -> 
                 })
                 await websocket.send_json({"type": "end"})
                 state.pop("pending_analysis_plan", None)
+                state.pop("last_decision_packet", None)
+                await persist_session_snapshot(
+                    state,
+                    thread_id=state.get("thread_id") or "",
+                    project_id=state.get("project_id"),
+                    event_type="execution_confirmation_lost",
+                    clear_pending_analysis_plan=True,
+                )
                 return
 
             from sqlalchemy import select
@@ -1661,13 +2115,28 @@ async def _handle_confirm_plan(websocket: WebSocket, msg: dict, state: dict) -> 
             from tune.core.database import get_session_factory
             from tune.core.models import AnalysisJob
             from tune.api.routes.jobs import _serialize_execution_plan
+            from tune.core.analysis.analysis_case import update_active_analysis_case
             from tune.core.workflow import transition_job
             from tune.workers.defer import defer_async_with_fallback
             from tune.workers.tasks import run_analysis_task
 
             job_id = pending["job_id"]
             job_name = pending.get("short_name") or pending.get("goal") or "analysis"
+            update_active_analysis_case(
+                state,
+                status="running",
+                current_stage="execution",
+                note="execution_confirmed",
+            )
             state.pop("pending_analysis_plan", None)
+            state.pop("last_decision_packet", None)
+            await persist_session_snapshot(
+                state,
+                thread_id=state.get("thread_id") or "",
+                project_id=state.get("project_id"),
+                event_type="execution_confirmed",
+                clear_pending_analysis_plan=True,
+            )
 
             try:
                 async with get_session_factory()() as session:
@@ -1713,10 +2182,26 @@ async def _handle_confirm_plan(websocket: WebSocket, msg: dict, state: dict) -> 
         amended_plan, feasibility_issues = await _revalidate_pending_plan()
         if amended_plan != pending.get("plan", []):
             from tune.core.analysis.engine import _format_plan
+            from tune.core.analysis.progress_state import derive_progress_state
+            from tune.core.decision_packet import select_decision_packet_for_state
 
             pending["plan"] = amended_plan
             state["pending_analysis_plan"]["plan"] = amended_plan
+            state["progress_state"] = derive_progress_state(state).model_dump(mode="json")
+            refreshed_packet = select_decision_packet_for_state(
+                state,
+                language=state.get("language", "en"),
+            )
+            if refreshed_packet is not None:
+                state["pending_analysis_plan"]["decision_packet"] = refreshed_packet.model_dump(mode="json")
+                state["last_decision_packet"] = state["pending_analysis_plan"]["decision_packet"]
             await _persist_pending_plan(amended_plan)
+            await persist_session_snapshot(
+                state,
+                thread_id=state.get("thread_id") or "",
+                project_id=state.get("project_id"),
+                event_type="abstract_plan_revalidated",
+            )
             plan_text = _format_plan(amended_plan)
             rewrite_msg = (
                 f"我根据当前资源状态修正了执行计划，请再次确认：\n\n{plan_text}"
@@ -1747,6 +2232,9 @@ async def _handle_confirm_plan(websocket: WebSocket, msg: dict, state: dict) -> 
 
         try:
             from tune.core.analysis.engine import _format_plan
+            from tune.core.analysis.progress_state import derive_progress_state
+            from tune.core.analysis.analysis_case import update_active_analysis_case
+            from tune.core.decision_packet import select_decision_packet_for_state
 
             job_id, execution_payload, review_plan = await _prepare_execution_confirmation(
                 plan=amended_plan,
@@ -1765,10 +2253,36 @@ async def _handle_confirm_plan(websocket: WebSocket, msg: dict, state: dict) -> 
                 "review_plan": review_plan,
                 "execution_plan_summary": execution_payload["summary"],
                 "execution_confirmation_overview": execution_payload.get("review_overview"),
+                "execution_decision_source": execution_payload.get("execution_decision_source"),
                 "execution_ir_review": execution_payload.get("review_ir"),
                 "execution_plan_delta": execution_payload.get("review_delta"),
                 "execution_plan_changes": execution_payload.get("review_changes"),
+                "execution_semantic_guardrails": execution_payload.get("semantic_guardrails"),
             }
+            update_active_analysis_case(
+                state,
+                status="pending_execution_confirmation",
+                current_stage="execution_plan",
+                note="execution_plan_pending_confirmation",
+            )
+            state["progress_state"] = derive_progress_state(state).model_dump(mode="json")
+            refreshed_packet = select_decision_packet_for_state(
+                state,
+                goal=pending.get("goal", ""),
+                short_name=pending.get("short_name") or "",
+                review_plan=review_plan,
+                execution_payload=execution_payload,
+                language=state.get("language", "en"),
+            )
+            if refreshed_packet is not None:
+                state["pending_analysis_plan"]["decision_packet"] = refreshed_packet.model_dump(mode="json")
+                state["last_decision_packet"] = state["pending_analysis_plan"]["decision_packet"]
+            await persist_session_snapshot(
+                state,
+                thread_id=state.get("thread_id") or "",
+                project_id=state.get("project_id"),
+                event_type="execution_plan_pending_confirmation",
+            )
             await broadcast_project_task_event(job_id, reason="awaiting_execution_confirmation")
             execution_plan_text = (
                 "下面是最终执行图的分组视图。请再次确认；你也可以继续用自然语言修改分析步骤，系统会重新编排。\n\n"
@@ -1784,9 +2298,11 @@ async def _handle_confirm_plan(websocket: WebSocket, msg: dict, state: dict) -> 
                 "job_id": job_id,
                 "execution_plan": execution_payload,
                 "execution_confirmation_overview": execution_payload.get("review_overview"),
+                "execution_decision_source": execution_payload.get("execution_decision_source"),
                 "execution_ir_review": execution_payload.get("review_ir"),
                 "execution_plan_delta": execution_payload.get("review_delta"),
                 "execution_plan_changes": execution_payload.get("review_changes"),
+                "execution_semantic_guardrails": execution_payload.get("semantic_guardrails"),
                 "requires_confirmation": True,
             })
             await websocket.send_json({
@@ -1829,6 +2345,14 @@ async def _handle_confirm_plan(websocket: WebSocket, msg: dict, state: dict) -> 
                 )
 
         state.pop("pending_analysis_plan", None)
+        state.pop("last_decision_packet", None)
+        await persist_session_snapshot(
+            state,
+            thread_id=state.get("thread_id") or "",
+            project_id=state.get("project_id"),
+            event_type="analysis_cancelled",
+            clear_pending_analysis_plan=True,
+        )
         cancel_msg = (
             "已取消分析。如需重新开始，请再次描述您的分析需求。"
             if lang_zh
@@ -1844,6 +2368,13 @@ async def _handle_chat(websocket: WebSocket, msg: dict, state: dict) -> None:
     user_text = msg.get("content", "")
     if not user_text.strip():
         return
+
+    async def _safe_send(payload: dict[str, Any]) -> bool:
+        try:
+            await websocket.send_json(payload)
+            return True
+        except (WebSocketDisconnect, RuntimeError):
+            return False
 
     # Propagate language preference into session state
     if "language" in msg:
@@ -1873,28 +2404,36 @@ async def _handle_chat(websocket: WebSocket, msg: dict, state: dict) -> None:
                 state.get("thread_id"),
             )
 
+    state["_prev_user_text"] = state.get("_last_user_text")
+    state["_prev_assistant_text"] = state.get("_last_assistant_text")
     state["_last_user_text"] = user_text
 
     if thread_payload is not None:
-        await websocket.send_json({"type": "thread_bound", "thread": thread_payload})
+        if not await _safe_send({"type": "thread_bound", "thread": thread_payload}):
+            return
 
-    await websocket.send_json({"type": "start"})
+    if not await _safe_send({"type": "start"}):
+        return
     assistant_chunks: list[str] = []
     try:
         async for chunk in handle_chat_message(user_text, state):
-            await websocket.send_json(chunk)
+            if not await _safe_send(chunk):
+                return
             if chunk.get("type") == "token":
                 assistant_chunks.append(chunk.get("content", ""))
     except Exception as e:
         log.exception("Chat error")
-        await websocket.send_json({"type": "error", "message": str(e)})
+        if not await _safe_send({"type": "error", "message": str(e)}):
+            return
     finally:
-        await websocket.send_json({"type": "end"})
+        await _safe_send({"type": "end"})
 
     # Persist to thread if thread_id is set
     thread_id = state.get("thread_id")
-    if thread_id and assistant_chunks:
+    if assistant_chunks:
         assistant_content = "".join(assistant_chunks)
+        state["_last_assistant_text"] = assistant_content
+    if thread_id and assistant_chunks:
         try:
             from tune.core.database import get_session_factory
             from tune.core.models import Thread, ThreadMessage

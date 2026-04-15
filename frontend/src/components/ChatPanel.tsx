@@ -17,6 +17,8 @@ interface PlanSummary {
   has_expanded_dag?: boolean
   node_count?: number
   group_count?: number
+  ambiguity_count?: number
+  memory_review_count?: number
 }
 
 interface ExecutionConfirmationOverview {
@@ -86,6 +88,48 @@ interface ExecutionPlanChangeItem {
   auto_injected_cause?: string | null
 }
 
+interface ExecutionAmbiguityReviewItem {
+  step_key?: string
+  step_type?: string
+  display_name?: string
+  slot_name?: string | null
+  binding_key?: string | null
+  primary_path?: string | null
+  secondary_path?: string | null
+  score_gap?: number | null
+  candidate_count?: number | null
+  description?: string | null
+}
+
+interface ExecutionMemoryBindingReviewItem {
+  step_key?: string
+  step_type?: string
+  display_name?: string
+  slot_name?: string | null
+  binding_key?: string | null
+  fact_key?: string | null
+  confirmed_path?: string | null
+  candidate_path?: string | null
+  candidate_count?: number | null
+  description?: string | null
+}
+
+interface ExecutionSemanticGuardrails {
+  ambiguity_count?: number | null
+  ambiguity_reviews?: ExecutionAmbiguityReviewItem[] | null
+  memory_review_count?: number | null
+  memory_binding_reviews?: ExecutionMemoryBindingReviewItem[] | null
+  project_memory_summary?: {
+    stable_fact_count?: number | null
+    memory_pattern_count?: number | null
+    memory_preference_count?: number | null
+    memory_link_count?: number | null
+    resource_link_count?: number | null
+    artifact_link_count?: number | null
+    runtime_link_count?: number | null
+  } | null
+}
+
 interface Message {
   id: string
   role: 'user' | 'assistant' | 'system'
@@ -98,6 +142,7 @@ interface Message {
   executionIrReview?: ExecutionIrReviewItem[] | null
   executionPlanDelta?: ExecutionPlanDelta | null
   executionPlanChanges?: ExecutionPlanChangeItem[] | null
+  executionSemanticGuardrails?: ExecutionSemanticGuardrails | null
   results?: ResultItem[]
   newFilesEvent?: { count: number; types: Record<string, number> }
 }
@@ -242,6 +287,10 @@ export default function ChatPanel({ ws, projectId, lang, threadTitle, llmReachab
     return detailParts.join(' · ') || item.summary || ''
   }
 
+  const formatExecutionSemanticReviewTitle = (
+    item: { display_name?: string | null; step_key?: string | null; step_type?: string | null },
+  ) => item.display_name || item.step_key || item.step_type || t('chat_plan_step_fallback')
+
   const buildExecutionPlanDeltaStatusMap = (delta: ExecutionPlanDelta | null | undefined) => {
     const statusMap: Record<string, 'added' | 'changed'> = {}
     for (const item of delta?.added_groups ?? []) {
@@ -371,6 +420,7 @@ export default function ChatPanel({ ws, projectId, lang, threadTitle, llmReachab
             last.executionIrReview = null
             last.executionPlanDelta = null
             last.executionPlanChanges = null
+            last.executionSemanticGuardrails = null
           }
         }))
       } else if (msg.type === 'execution_plan') {
@@ -400,6 +450,11 @@ export default function ChatPanel({ ws, projectId, lang, threadTitle, llmReachab
           last.executionPlanChanges = (
             (msg.execution_plan_changes as ExecutionPlanChangeItem[] | undefined)
             ?? ((msg.execution_plan as { review_changes?: ExecutionPlanChangeItem[] } | undefined)?.review_changes)
+            ?? null
+          )
+          last.executionSemanticGuardrails = (
+            (msg.execution_semantic_guardrails as ExecutionSemanticGuardrails | undefined)
+            ?? ((msg.execution_plan as { semantic_guardrails?: ExecutionSemanticGuardrails } | undefined)?.semantic_guardrails)
             ?? null
           )
         }))
@@ -618,6 +673,92 @@ export default function ChatPanel({ ws, projectId, lang, threadTitle, llmReachab
                           .replace('{unchanged}', String(m.executionPlanDelta.unchanged_group_count ?? 0))
                           .replace('{changed}', String(m.executionPlanDelta.changed_group_count ?? 0))
                           .replace('{added}', String(m.executionPlanDelta.added_group_count ?? 0))}
+                      </div>
+                    )}
+                    {m.confirmationPhase === 'execution' && m.executionSemanticGuardrails && (
+                      ((m.executionSemanticGuardrails.ambiguity_count ?? 0) > 0 || (m.executionSemanticGuardrails.memory_review_count ?? 0) > 0)
+                    ) && (
+                      <div className="mt-3 rounded-lg border border-rose-500/20 bg-rose-500/8 px-3 py-3">
+                        <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-rose-200">
+                          {t('tasks_confirmation_semantic_guardrails')}
+                        </div>
+                        <div className="mb-3 flex flex-wrap gap-2">
+                          {(m.executionSemanticGuardrails.memory_review_count ?? 0) > 0 && (
+                            <span className="rounded-full border border-rose-500/25 bg-rose-500/12 px-2 py-0.5 text-[10px] font-medium text-rose-200">
+                              {t('tasks_confirmation_guardrail_memory_conflicts').replace('{count}', String(m.executionSemanticGuardrails.memory_review_count ?? 0))}
+                            </span>
+                          )}
+                          {(m.executionSemanticGuardrails.ambiguity_count ?? 0) > 0 && (
+                            <span className="rounded-full border border-amber-500/25 bg-amber-500/12 px-2 py-0.5 text-[10px] font-medium text-amber-200">
+                              {t('tasks_confirmation_guardrail_ambiguities').replace('{count}', String(m.executionSemanticGuardrails.ambiguity_count ?? 0))}
+                            </span>
+                          )}
+                        </div>
+                        {m.executionSemanticGuardrails.project_memory_summary && (
+                          <div className="mb-3 text-[11px] text-rose-100/85 break-words">
+                            {t('tasks_confirmation_guardrail_memory_summary')}{' '}
+                            {[
+                              t('tasks_confirmation_guardrail_memory_facts').replace('{count}', String(m.executionSemanticGuardrails.project_memory_summary.stable_fact_count ?? 0)),
+                              t('tasks_confirmation_guardrail_memory_patterns').replace('{count}', String(m.executionSemanticGuardrails.project_memory_summary.memory_pattern_count ?? 0)),
+                              t('tasks_confirmation_guardrail_memory_preferences').replace('{count}', String(m.executionSemanticGuardrails.project_memory_summary.memory_preference_count ?? 0)),
+                              t('tasks_confirmation_guardrail_memory_resources').replace('{count}', String(m.executionSemanticGuardrails.project_memory_summary.resource_link_count ?? 0)),
+                              t('tasks_confirmation_guardrail_memory_artifacts').replace('{count}', String(m.executionSemanticGuardrails.project_memory_summary.artifact_link_count ?? 0)),
+                              t('tasks_confirmation_guardrail_memory_runtime').replace('{count}', String(m.executionSemanticGuardrails.project_memory_summary.runtime_link_count ?? 0)),
+                            ].join(' · ')}
+                          </div>
+                        )}
+                        {(m.executionSemanticGuardrails.memory_binding_reviews?.length ?? 0) > 0 && (
+                          <div className="space-y-2">
+                            {m.executionSemanticGuardrails.memory_binding_reviews?.map((item, index) => (
+                              <div
+                                key={`${m.id}-memory-guardrail-${item.binding_key ?? item.step_key ?? index}`}
+                                className="rounded-lg border border-rose-500/15 bg-surface-base/70 px-3 py-2"
+                              >
+                                <div className="text-xs font-medium text-text-primary">
+                                  {formatExecutionSemanticReviewTitle(item)}
+                                </div>
+                                {item.description && (
+                                  <div className="mt-1 text-[11px] text-text-muted break-words">
+                                    {item.description}
+                                  </div>
+                                )}
+                                <div className="mt-1 text-[11px] text-rose-100/90 break-words">
+                                  {[
+                                    item.slot_name ? `${t('tasks_confirmation_guardrail_slot')} ${item.slot_name}` : null,
+                                    item.candidate_path ? `${t('tasks_confirmation_guardrail_candidate')} ${item.candidate_path}` : null,
+                                    item.confirmed_path ? `${t('tasks_confirmation_guardrail_confirmed')} ${item.confirmed_path}` : null,
+                                  ].filter(Boolean).join(' · ')}
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                        {(m.executionSemanticGuardrails.ambiguity_reviews?.length ?? 0) > 0 && (
+                          <div className="mt-3 space-y-2">
+                            {m.executionSemanticGuardrails.ambiguity_reviews?.map((item, index) => (
+                              <div
+                                key={`${m.id}-ambiguity-guardrail-${item.binding_key ?? item.step_key ?? index}`}
+                                className="rounded-lg border border-amber-500/15 bg-surface-base/70 px-3 py-2"
+                              >
+                                <div className="text-xs font-medium text-text-primary">
+                                  {formatExecutionSemanticReviewTitle(item)}
+                                </div>
+                                {item.description && (
+                                  <div className="mt-1 text-[11px] text-text-muted break-words">
+                                    {item.description}
+                                  </div>
+                                )}
+                                <div className="mt-1 text-[11px] text-amber-100/90 break-words">
+                                  {[
+                                    item.slot_name ? `${t('tasks_confirmation_guardrail_slot')} ${item.slot_name}` : null,
+                                    item.primary_path ? `${t('tasks_confirmation_guardrail_primary')} ${item.primary_path}` : null,
+                                    item.secondary_path ? `${t('tasks_confirmation_guardrail_secondary')} ${item.secondary_path}` : null,
+                                  ].filter(Boolean).join(' · ')}
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        )}
                       </div>
                     )}
                     {m.confirmationPhase === 'execution' && (m.executionIrReview?.length ?? 0) > 0 && (

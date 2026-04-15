@@ -16,6 +16,7 @@ from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
+from tune.core.context.semantic_dossier import build_project_memory_summary
 
 
 @dataclass
@@ -611,6 +612,108 @@ def summarize_execution_ir_for_confirmation(execution_ir: dict[str, Any] | None)
     return review_items
 
 
+def summarize_execution_semantic_guardrails(
+    execution_ir: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not isinstance(execution_ir, dict):
+        return None
+    payload = execution_ir.get("semantic_guardrails")
+    if not isinstance(payload, dict):
+        return None
+
+    ambiguity_reviews: list[dict[str, Any]] = []
+    for item in payload.get("ambiguity_reviews") or []:
+        if not isinstance(item, dict):
+            continue
+        ambiguity_reviews.append(
+            {
+                "step_key": str(item.get("step_key") or "").strip(),
+                "step_type": str(item.get("step_type") or "").strip(),
+                "display_name": str(
+                    item.get("display_name")
+                    or item.get("step_key")
+                    or item.get("step_type")
+                    or "unknown_step"
+                ).strip(),
+                "slot_name": str(item.get("slot_name") or "").strip(),
+                "binding_key": str(item.get("binding_key") or "").strip(),
+                "primary_path": item.get("primary_path"),
+                "secondary_path": item.get("secondary_path"),
+                "score_gap": item.get("score_gap"),
+                "candidate_count": item.get("candidate_count"),
+                "description": (
+                    f"{item.get('slot_name') or 'input'} has close candidates "
+                    f"'{item.get('primary_path')}' vs '{item.get('secondary_path')}'"
+                    f" (gap={item.get('score_gap')}, total={item.get('candidate_count')})."
+                ),
+            }
+        )
+
+    memory_binding_reviews: list[dict[str, Any]] = []
+    for item in payload.get("memory_binding_reviews") or []:
+        if not isinstance(item, dict):
+            continue
+        memory_binding_reviews.append(
+            {
+                "step_key": str(item.get("step_key") or "").strip(),
+                "step_type": str(item.get("step_type") or "").strip(),
+                "display_name": str(
+                    item.get("display_name")
+                    or item.get("step_key")
+                    or item.get("step_type")
+                    or "unknown_step"
+                ).strip(),
+                "slot_name": str(item.get("slot_name") or "").strip(),
+                "binding_key": str(item.get("binding_key") or "").strip(),
+                "fact_key": str(item.get("fact_key") or "").strip(),
+                "confirmed_path": item.get("confirmed_path"),
+                "candidate_path": item.get("candidate_path"),
+                "candidate_count": item.get("candidate_count"),
+                "description": (
+                    f"{item.get('slot_name') or 'input'} currently prefers '{item.get('candidate_path')}', "
+                    f"but project memory previously confirmed '{item.get('confirmed_path')}'."
+                ),
+            }
+        )
+
+    result = {
+        "ambiguity_count": len(ambiguity_reviews),
+        "ambiguity_reviews": ambiguity_reviews,
+        "memory_review_count": len(memory_binding_reviews),
+        "memory_binding_reviews": memory_binding_reviews,
+    }
+    project_memory_summary = payload.get("project_memory_summary")
+    if isinstance(project_memory_summary, dict) and project_memory_summary:
+        result["project_memory_summary"] = build_project_memory_summary(
+            stable_facts=[{}] * int(project_memory_summary.get("stable_fact_count", 0) or 0),
+            memory_patterns=[{}] * int(project_memory_summary.get("memory_pattern_count", 0) or 0),
+            memory_preferences=[{}] * int(project_memory_summary.get("memory_preference_count", 0) or 0),
+            memory_links=(
+                [{"entity_type": "resource_entity"}] * int(project_memory_summary.get("resource_link_count", 0) or 0)
+                + [{"entity_type": "artifact_record"}] * int(project_memory_summary.get("artifact_link_count", 0) or 0)
+                + [{"entity_type": "memory_episode"}] * int(project_memory_summary.get("runtime_link_count", 0) or 0)
+            ),
+            resource_binding_fact_count=int(project_memory_summary.get("resource_binding_fact_count", 0) or 0),
+        )
+    return result
+
+
+def summarize_execution_decision_source(
+    execution_ir: dict[str, Any] | None,
+) -> str | None:
+    if not isinstance(execution_ir, dict):
+        return None
+    semantic_guardrails = summarize_execution_semantic_guardrails(execution_ir) or {}
+    if int(semantic_guardrails.get("ambiguity_count", 0) or 0) > 0:
+        return "semantic_trace"
+    if int(semantic_guardrails.get("memory_review_count", 0) or 0) > 0:
+        return "structured_memory"
+    steps = execution_ir.get("steps")
+    if isinstance(steps, list) and steps:
+        return "confirmation_gate"
+    return None
+
+
 def summarize_execution_confirmation_overview(
     *,
     plan_payload: Any,
@@ -621,6 +724,7 @@ def summarize_execution_confirmation_overview(
     ir_review = summarize_execution_ir_for_confirmation(execution_ir)
     delta = summarize_execution_plan_delta(plan_payload, expanded_dag)
     changes = summarize_execution_review_changes(expanded_dag)
+    semantic_guardrails = summarize_execution_semantic_guardrails(execution_ir) or {}
 
     scope_counts = {"global": 0, "per_sample": 0, "aggregate": 0}
     for item in ir_review:
@@ -648,6 +752,8 @@ def summarize_execution_confirmation_overview(
         "fan_out_change_count": change_kind_counts["fan_out"],
         "aggregate_change_count": change_kind_counts["aggregate"],
         "auto_injected_change_count": change_kind_counts["auto_injected"],
+        "ambiguity_review_count": int(semantic_guardrails.get("ambiguity_count", 0) or 0),
+        "memory_review_count": int(semantic_guardrails.get("memory_review_count", 0) or 0),
     }
 
 
@@ -656,6 +762,46 @@ def build_execution_bundle(
     project_files: list[dict[str, Any]],
 ) -> OrchestrationBundle:
     return build_execution_payload({"steps": steps}, project_files)
+
+
+async def _load_project_memory_guardrail_inputs(
+    session,
+    project_id: str | None,
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    if not project_id:
+        return {}, {}
+    try:
+        from tune.core.memory.project_memory import (
+            query_project_memory_facts,
+            query_project_memory_links,
+            query_project_memory_patterns,
+            query_project_memory_preferences,
+        )
+
+        facts = await query_project_memory_facts(session, project_id, limit=20)
+        patterns = await query_project_memory_patterns(session, project_id, limit=10)
+        preferences = await query_project_memory_preferences(session, project_id, limit=10)
+        links = await query_project_memory_links(session, project_id, limit=20)
+    except Exception:
+        return {}, {}
+
+    fact_by_binding_key: dict[str, dict[str, Any]] = {}
+    for fact in facts:
+        binding_key = str(fact.get("binding_key") or "").strip()
+        path = str(fact.get("path") or "").strip()
+        if binding_key and path and binding_key not in fact_by_binding_key:
+            fact_by_binding_key[binding_key] = fact
+
+    return (
+        build_project_memory_summary(
+            stable_facts=facts,
+            memory_patterns=patterns,
+            memory_preferences=preferences,
+            memory_links=links,
+            resource_binding_fact_count=len(fact_by_binding_key),
+        ),
+        fact_by_binding_key,
+    )
 
 
 async def load_project_execution_files(session, project_id: str | None) -> list[dict[str, Any]]:
@@ -718,8 +864,9 @@ async def materialize_job_execution_plan(
     job,
     plan_payload: Any,
 ) -> OrchestrationBundle:
+    from tune.core.analysis.implementation_decision import extract_implementation_decisions
     from tune.core.registry.spec_generation import augment_plan_with_dynamic_specs
-    from tune.core.workflow.plan_compiler import compile_plan
+    from tune.core.workflow.plan_compiler import compile_plan_with_decisions
 
     raw_steps = extract_plan_steps(plan_payload)
     raw_steps, dynamic_issues = await augment_plan_with_dynamic_specs(
@@ -731,14 +878,126 @@ async def materialize_job_execution_plan(
     )
     if dynamic_issues:
         raise ValueError("; ".join(dynamic_issues) or "Failed to generate dynamic step specs")
-    compile_result = compile_plan(raw_steps)
+    compile_result = compile_plan_with_decisions(
+        raw_steps,
+        implementation_decisions=extract_implementation_decisions(plan_payload),
+    )
     if not compile_result.ok:
         raise ValueError("; ".join(compile_result.errors) or "Failed to compile confirmed plan")
 
     normalized_payload = replace_plan_steps(plan_payload, compile_result.compiled_steps)
     project_files = await load_project_execution_files(session, getattr(job, "project_id", None))
     bundle = build_execution_payload(normalized_payload, project_files)
+    semantic_guardrails = await analyze_execution_plan_semantic_guardrails(
+        session,
+        project_id=getattr(job, "project_id", None),
+        steps=compile_result.compiled_steps,
+        project_files=project_files,
+    )
+    if (
+        semantic_guardrails.get("ambiguity_reviews")
+        or semantic_guardrails.get("memory_binding_reviews")
+    ):
+        bundle.execution_ir["semantic_guardrails"] = semantic_guardrails
     job.resolved_plan_json = bundle.abstract_plan
     job.execution_ir_json = bundle.execution_ir
     job.expanded_dag_json = bundle.expanded_dag
     return bundle
+
+
+async def analyze_execution_plan_semantic_guardrails(
+    session,
+    *,
+    project_id: str | None,
+    steps: list[dict[str, Any]],
+    project_files: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if not project_id or not steps:
+        return {"ambiguity_reviews": []}
+
+    from tune.core.binding.preflight import _slot_binding_key, _upstream_can_provide
+    from tune.core.binding.resolver import load_registered_resource_bindings
+    from tune.core.binding.semantic_retrieval import (
+        retrieve_semantic_candidates,
+        summarize_candidate_ambiguity,
+    )
+    from tune.core.registry import ensure_registry_loaded, get_step_type
+
+    ensure_registry_loaded()
+    kp_bindings = await load_registered_resource_bindings(project_id, session)
+    ambiguity_reviews: list[dict[str, Any]] = []
+    memory_binding_reviews: list[dict[str, Any]] = []
+    project_memory_summary, stable_fact_by_binding_key = await _load_project_memory_guardrail_inputs(
+        session,
+        project_id,
+    )
+
+    for step in steps:
+        step_key = _step_key(step)
+        step_type = str(step.get("step_type") or "").strip()
+        defn = get_step_type(step_type)
+        if defn is None:
+            continue
+        preferred_lineage = dict(step.get("_preferred_lineage") or {}) or None
+        dep_keys = list(step.get("depends_on") or [])
+
+        for slot in defn.input_slots:
+            if not slot.required or slot.multiple:
+                continue
+            if slot.name not in {"reference_fasta", "annotation_gtf", "index_prefix", "genome_dir"}:
+                continue
+            if _upstream_can_provide(step, slot, steps):
+                continue
+
+            candidates = await retrieve_semantic_candidates(
+                job_id="",
+                dep_keys=dep_keys,
+                slot=slot,
+                project_id=project_id,
+                project_files=project_files,
+                kp_bindings=kp_bindings,
+                db=session,
+                preferred_lineage=preferred_lineage,
+            )
+            ambiguity = summarize_candidate_ambiguity(candidates[:3])
+            if not ambiguity:
+                pass
+            else:
+                ambiguity_reviews.append(
+                    {
+                        "step_key": step_key,
+                        "step_type": step_type,
+                        "display_name": _step_display_name(step),
+                        "slot_name": slot.name,
+                        "binding_key": _slot_binding_key(slot.name, step_type=step_type),
+                        **ambiguity,
+                    }
+                )
+
+            binding_key = _slot_binding_key(slot.name, step_type=step_type)
+            stable_fact = stable_fact_by_binding_key.get(binding_key)
+            top_candidate = candidates[0] if candidates else {}
+            candidate_path = str((top_candidate or {}).get("path") or "").strip()
+            confirmed_path = str((stable_fact or {}).get("path") or "").strip()
+            if stable_fact and confirmed_path and candidate_path and candidate_path != confirmed_path:
+                memory_binding_reviews.append(
+                    {
+                        "step_key": step_key,
+                        "step_type": step_type,
+                        "display_name": _step_display_name(step),
+                        "slot_name": slot.name,
+                        "binding_key": binding_key,
+                        "fact_key": str(stable_fact.get("fact_key") or "").strip(),
+                        "confirmed_path": confirmed_path,
+                        "candidate_path": candidate_path,
+                        "candidate_count": len(candidates),
+                    }
+                )
+
+    payload: dict[str, Any] = {
+        "ambiguity_reviews": ambiguity_reviews,
+        "memory_binding_reviews": memory_binding_reviews,
+    }
+    if project_memory_summary:
+        payload["project_memory_summary"] = project_memory_summary
+    return payload

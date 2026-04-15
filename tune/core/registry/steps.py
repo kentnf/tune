@@ -281,6 +281,38 @@ register(StepTypeDefinition(
 ))
 
 register(StepTypeDefinition(
+    step_type="align.bwa",
+    display_name="DNA Alignment (BWA-MEM)",
+    input_slots=[
+        SlotDefinition("read1", "R1 FASTQ", ["fastq", "fastq.gz", "fq", "fq.gz"],
+                       accepted_roles=["trimmed_reads_read1", "raw_reads_read1"],
+                       artifact_scope="per_sample"),
+        SlotDefinition("read2", "R2 FASTQ (PE only)",
+                       ["fastq", "fastq.gz", "fq", "fq.gz"], required=False,
+                       accepted_roles=["trimmed_reads_read2", "raw_reads_read2"],
+                       artifact_scope="per_sample"),
+        SlotDefinition("index_prefix", "BWA index prefix",
+                       ["*"], accepted_roles=["bwa_index"]),
+    ],
+    output_slots=[
+        SlotDefinition("sam", "Output SAM file", ["sam"],
+                       artifact_role="alignment_sam", artifact_scope="per_sample"),
+    ],
+    params_schema={
+        "type": "object",
+        "properties": {
+            "threads": {"type": "integer", "default": 8, "minimum": 1},
+            "paired_end": {"type": "boolean", "default": False},
+            "mark_shorter_split_hits_as_secondary": {"type": "boolean", "default": True},
+        },
+    },
+    fanout_mode=FanoutMode.PER_SAMPLE,
+    repair_policy=RepairPolicy(max_l1_retries=3, max_l2_retries=1),
+    safety_policy=SafetyPolicy(command_type="bwa", safety_flags=["write_to_disk"]),
+    pixi_packages=["bwa", "samtools"],
+))
+
+register(StepTypeDefinition(
     step_type="align.hisat2",
     display_name="RNA-seq Alignment (HISAT2)",
     input_slots=[
@@ -421,6 +453,29 @@ register(StepTypeDefinition(
     repair_policy=RepairPolicy(max_l1_retries=2, max_l2_retries=1),
     safety_policy=SafetyPolicy(command_type="rscript", safety_flags=["write_to_disk"]),
     pixi_packages=["r-base", "bioconductor-deseq2", "bioconductor-genomeinfodbdata"],
+))
+
+register(StepTypeDefinition(
+    step_type="util.bwa_index",
+    display_name="Build BWA Index",
+    input_slots=[
+        SlotDefinition("reference_fasta", "Genome FASTA", ["fa", "fasta", "fna"],
+                       accepted_roles=["reference_fasta"]),
+    ],
+    output_slots=[
+        SlotDefinition("index_prefix", "BWA index prefix", ["*"],
+                       artifact_role="bwa_index"),
+    ],
+    params_schema={
+        "type": "object",
+        "properties": {
+            "prefix_name": {"type": "string", "default": "genome"},
+        },
+    },
+    fanout_mode=FanoutMode.NONE,
+    repair_policy=RepairPolicy(max_l1_retries=2, max_l2_retries=0, allow_l2_llm=False),
+    safety_policy=SafetyPolicy(command_type="bwa", safety_flags=["write_to_disk"]),
+    pixi_packages=["bwa"],
 ))
 
 register(StepTypeDefinition(

@@ -63,6 +63,7 @@ class TuneConfig(BaseModel):
     llm_configs: list[ApiConfig] = []
     active_llm_config_id: Optional[str] = None
     auto_authorize_commands: bool = False
+    developer_show_llm_io_in_chat: bool = False
     database_url: str = "postgresql+psycopg://tune:tune@localhost:5432/tune"
     pixi_path: str = "pixi"
     host: str = "0.0.0.0"
@@ -237,7 +238,10 @@ def set_config(cfg: TuneConfig) -> None:
 
 
 def resolve_runtime_analysis_dir_from_env() -> Path | None:
-    for env_name in ("TUNE_WORKSPACE_ROOT", "TUNE_ANALYSIS_DIR"):
+    # Prefer the explicit analysis-dir override when both vars are present.
+    # This keeps tests and one-off tooling able to redirect runtime artifacts
+    # without having to also mutate the workspace-root env var.
+    for env_name in ("TUNE_ANALYSIS_DIR", "TUNE_WORKSPACE_ROOT"):
         raw = os.environ.get(env_name)
         if not raw:
             continue

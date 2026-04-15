@@ -271,6 +271,44 @@ def render_fastp(
 
 
 # ---------------------------------------------------------------------------
+# align.bwa
+# ---------------------------------------------------------------------------
+
+def render_bwa(
+    params: dict, bindings: dict, output_dir: str, renderer_version: int = 1
+) -> RenderedCommand:
+    read1 = _require(bindings, "read1")
+    index_prefix = _require(bindings, "index_prefix")
+    paired_end = bool(params.get("paired_end", False))
+    threads = _threads(params, default=8)
+    mark_shorter_split_hits = bool(params.get("mark_shorter_split_hits_as_secondary", True))
+
+    sample = Path(read1).name.split(".")[0]
+    out_sam = os.path.join(output_dir, f"{sample}.sam")
+    split_flag = " -M" if mark_shorter_split_hits else ""
+
+    if paired_end:
+        read2 = bindings.get("read2")
+        if not read2:
+            raise RendererError("paired_end=true but slot 'read2' is not bound")
+        cmd = (
+            f"bwa mem -t {threads}{split_flag} {index_prefix} {read1} {read2}"
+            f" > {out_sam}"
+        )
+    else:
+        cmd = (
+            f"bwa mem -t {threads}{split_flag} {index_prefix} {read1}"
+            f" > {out_sam}"
+        )
+
+    return RenderedCommand(
+        command_text=cmd,
+        expected_outputs=[out_sam],
+        renderer_version=renderer_version,
+    )
+
+
+# ---------------------------------------------------------------------------
 # align.hisat2
 # ---------------------------------------------------------------------------
 
@@ -686,6 +724,25 @@ def render_deseq2(
 
 
 # ---------------------------------------------------------------------------
+# util.bwa_index
+# ---------------------------------------------------------------------------
+
+def render_bwa_index(
+    params: dict, bindings: dict, output_dir: str, renderer_version: int = 1
+) -> RenderedCommand:
+    fasta = _require(bindings, "reference_fasta")
+    prefix_name = str(params.get("prefix_name") or "genome").strip() or "genome"
+    prefix = os.path.join(output_dir, "bwa_index", prefix_name)
+    os.makedirs(os.path.dirname(prefix), exist_ok=True)
+    cmd = f"bwa index -p {prefix} {fasta}"
+    return RenderedCommand(
+        command_text=cmd,
+        expected_outputs=[prefix + ".bwt"],
+        renderer_version=renderer_version,
+    )
+
+
+# ---------------------------------------------------------------------------
 # util.star_genome_generate
 # ---------------------------------------------------------------------------
 
@@ -804,10 +861,12 @@ def ensure_renderers_loaded() -> None:
         "qc.fastqc": render_fastqc,
         "qc.multiqc": render_multiqc,
         "trim.fastp": render_fastp,
+        "align.bwa": render_bwa,
         "align.hisat2": render_hisat2,
         "align.star": render_star,
         "quant.featurecounts": render_featurecounts,
         "stats.deseq2": render_deseq2,
+        "util.bwa_index": render_bwa_index,
         "util.hisat2_build": render_hisat2_build,
         "util.star_genome_generate": render_star_genome_generate,
         "util.samtools_sort": render_samtools_sort,
@@ -832,10 +891,12 @@ RENDERER_REGISTRY: dict[str, callable] = {
     "qc.fastqc":            render_fastqc,
     "qc.multiqc":           render_multiqc,
     "trim.fastp":           render_fastp,
+    "align.bwa":            render_bwa,
     "align.hisat2":         render_hisat2,
     "align.star":           render_star,
     "quant.featurecounts":  render_featurecounts,
     "stats.deseq2":        render_deseq2,
+    "util.bwa_index":       render_bwa_index,
     "util.hisat2_build":         render_hisat2_build,
     "util.star_genome_generate": render_star_genome_generate,
     "util.samtools_sort":   render_samtools_sort,

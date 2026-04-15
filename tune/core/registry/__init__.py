@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 
 _REQUIRED_STEP_TYPES = {
+    "align.bwa",
     "align.hisat2",
     "align.star",
     "qc.fastqc",
@@ -13,6 +14,7 @@ _REQUIRED_STEP_TYPES = {
     "quant.featurecounts",
     "stats.deseq2",
     "trim.fastp",
+    "util.bwa_index",
     "util.hisat2_build",
     "util.samtools_index",
     "util.samtools_sort",

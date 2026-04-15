@@ -236,6 +236,111 @@ class ThreadMessage(Base):
 
 
 # ---------------------------------------------------------------------------
+# Session continuity & authoritative analysis revisions
+# ---------------------------------------------------------------------------
+
+
+class SessionState(Base):
+    __tablename__ = "session_states"
+    __table_args__ = (UniqueConstraint("thread_id", name="uq_session_states_thread_id"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    thread_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("threads.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    project_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("projects.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    current_focus: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    current_stage: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    last_action: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    progress_state_json: Mapped[Optional[Any]] = mapped_column(JSONB, nullable=True)
+    latest_readiness_json: Mapped[Optional[Any]] = mapped_column(JSONB, nullable=True)
+    latest_context_acquisition_json: Mapped[Optional[Any]] = mapped_column(JSONB, nullable=True)
+    analysis_intent_trace_json: Mapped[Optional[Any]] = mapped_column(JSONB, nullable=True)
+    pending_decision_packet_json: Mapped[Optional[Any]] = mapped_column(JSONB, nullable=True)
+    pending_clarification_request_json: Mapped[Optional[Any]] = mapped_column(JSONB, nullable=True)
+    pending_analysis_plan_json: Mapped[Optional[Any]] = mapped_column(JSONB, nullable=True)
+    active_intent_revision_id: Mapped[Optional[str]] = mapped_column(
+        String(36),
+        ForeignKey("analysis_intent_revisions.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    active_capability_plan_revision_id: Mapped[Optional[str]] = mapped_column(
+        String(36),
+        ForeignKey("capability_plan_revisions.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    event_trail_json: Mapped[Optional[Any]] = mapped_column(JSONB, nullable=True, default=list)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class AnalysisIntentRevision(Base):
+    __tablename__ = "analysis_intent_revisions"
+    __table_args__ = (
+        UniqueConstraint("thread_id", "revision_index", name="uq_intent_revision_thread_index"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    thread_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("threads.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    project_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("projects.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    revision_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    user_goal: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    stage: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    intent_json: Mapped[Any] = mapped_column(JSONB, nullable=False)
+    readiness_assessment_json: Mapped[Optional[Any]] = mapped_column(JSONB, nullable=True)
+    context_acquisition_json: Mapped[Optional[Any]] = mapped_column(JSONB, nullable=True)
+    trace_snapshot_json: Mapped[Optional[Any]] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class CapabilityPlanRevision(Base):
+    __tablename__ = "capability_plan_revisions"
+    __table_args__ = (
+        UniqueConstraint(
+            "thread_id",
+            "revision_index",
+            name="uq_capability_plan_revision_thread_index",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    thread_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("threads.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    project_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("projects.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    intent_revision_id: Mapped[Optional[str]] = mapped_column(
+        String(36),
+        ForeignKey("analysis_intent_revisions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    revision_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    user_goal: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    capability_plan_json: Mapped[Any] = mapped_column(JSONB, nullable=False)
+    implementation_decisions_json: Mapped[Optional[Any]] = mapped_column(JSONB, nullable=True)
+    decision_packet_json: Mapped[Optional[Any]] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+# ---------------------------------------------------------------------------
 # Analysis jobs
 # ---------------------------------------------------------------------------
 
@@ -277,6 +382,24 @@ class AnalysisJob(Base):
     binding_status: Mapped[Optional[str]] = mapped_column(String(32), nullable=True, default="not_started")
     env_status: Mapped[Optional[str]] = mapped_column(String(32), nullable=True, default="pending")
     env_spec_hash: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    session_state_id: Mapped[Optional[str]] = mapped_column(
+        String(36),
+        ForeignKey("session_states.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    intent_revision_id: Mapped[Optional[str]] = mapped_column(
+        String(36),
+        ForeignKey("analysis_intent_revisions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    capability_plan_revision_id: Mapped[Optional[str]] = mapped_column(
+        String(36),
+        ForeignKey("capability_plan_revisions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     # Phase 1 persistent state machine: track pending auth/repair request for DB-poll resume
     pending_auth_request_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
     pending_repair_request_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
@@ -749,6 +872,161 @@ class ProjectExecutionEvent(Base):
     embedding: Mapped[Optional[list[float]]] = mapped_column(Vector(1536), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class MemoryFact(Base):
+    """Stable project-scoped fact memory persisted separately from raw events."""
+
+    __tablename__ = "memory_facts"
+    __table_args__ = (UniqueConstraint("project_id", "fact_key", name="uq_memory_facts_project_fact_key"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    project_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+    fact_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    fact_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    statement: Mapped[str] = mapped_column(Text, nullable=False)
+    payload_json: Mapped[Optional[Any]] = mapped_column(JSONB, nullable=True)
+    source_event_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("project_execution_events.id", ondelete="SET NULL"), nullable=True
+    )
+    source_episode_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("memory_episodes.id", ondelete="SET NULL"), nullable=True
+    )
+    confidence: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class MemoryEpisode(Base):
+    """Project-scoped reusable execution episode derived from runtime events."""
+
+    __tablename__ = "memory_episodes"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    project_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+    source_event_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("project_execution_events.id", ondelete="SET NULL"), nullable=True
+    )
+    thread_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("threads.id", ondelete="SET NULL"), nullable=True
+    )
+    job_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("analysis_jobs.id", ondelete="SET NULL"), nullable=True
+    )
+    step_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("analysis_step_runs.id", ondelete="SET NULL"), nullable=True
+    )
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    resolution: Mapped[str] = mapped_column(Text, nullable=False)
+    user_contributed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    metadata_json: Mapped[Optional[Any]] = mapped_column(JSONB, nullable=True)
+    embedding: Mapped[Optional[list[float]]] = mapped_column(Vector(1536), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class MemoryPattern(Base):
+    """Persisted structured project memory patterns derived from recent episodes."""
+
+    __tablename__ = "memory_patterns"
+    __table_args__ = (UniqueConstraint("project_id", "pattern_key", name="uq_memory_patterns_project_pattern_key"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    project_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+    pattern_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    pattern_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    recommended_value: Mapped[str] = mapped_column(Text, nullable=False)
+    support_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    user_validated_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    confidence: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    payload_json: Mapped[Optional[Any]] = mapped_column(JSONB, nullable=True)
+    source_episode_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("memory_episodes.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class MemoryPreference(Base):
+    """Persisted structured project memory preferences derived from recent episodes."""
+
+    __tablename__ = "memory_preferences"
+    __table_args__ = (UniqueConstraint("project_id", "preference_key", name="uq_memory_preferences_project_preference_key"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    project_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+    preference_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    preference_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    value: Mapped[str] = mapped_column(Text, nullable=False)
+    basis: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    support_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    confidence: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    payload_json: Mapped[Optional[Any]] = mapped_column(JSONB, nullable=True)
+    source_episode_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("memory_episodes.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class MemoryLink(Base):
+    """Typed relationship edge between memory records and project/runtime entities."""
+
+    __tablename__ = "memory_links"
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id",
+            "memory_type",
+            "memory_id",
+            "entity_type",
+            "entity_id",
+            "link_role",
+            name="uq_memory_links_edge",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    project_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+    memory_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    memory_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    entity_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    entity_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    link_role: Mapped[str] = mapped_column(String(64), nullable=False)
+    strength: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    last_confirmed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
 
 

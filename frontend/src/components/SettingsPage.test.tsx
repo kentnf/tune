@@ -41,6 +41,7 @@ describe('SettingsPage execution preferences', () => {
               pixi_path: 'pixi',
               active_llm_config_id: null,
               auto_authorize_commands: false,
+              developer_show_llm_io_in_chat: false,
             }),
           })
         }
@@ -83,9 +84,12 @@ describe('SettingsPage execution preferences', () => {
     renderSettingsPage()
 
     await screen.findByText('Execution')
-    const checkbox = screen.getByRole('checkbox')
-    fireEvent.click(checkbox)
-    expect(checkbox).toBeChecked()
+    const autoAuthorizeCheckbox = screen.getByRole('checkbox', { name: /Auto-authorize analysis commands/i })
+    const developerTraceCheckbox = screen.getByRole('checkbox', { name: /Show LLM input\/output in chat/i })
+    fireEvent.click(autoAuthorizeCheckbox)
+    fireEvent.click(developerTraceCheckbox)
+    expect(autoAuthorizeCheckbox).toBeChecked()
+    expect(developerTraceCheckbox).toBeChecked()
 
     const saveButtons = await screen.findAllByRole('button', { name: 'Save' })
     fireEvent.click(saveButtons[2])
@@ -96,7 +100,10 @@ describe('SettingsPage execution preferences', () => {
         expect.objectContaining({
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ auto_authorize_commands: true }),
+          body: JSON.stringify({
+            auto_authorize_commands: true,
+            developer_show_llm_io_in_chat: true,
+          }),
         }),
       )
     })

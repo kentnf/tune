@@ -23,12 +23,14 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from tune.core.binding.semantic_retrieval import retrieve_semantic_candidates
 from tune.core.context.builder import PlannerContextBuilder
 from tune.core.context.models import ContextScope
 from tune.core.database import get_session_factory
 from tune.core.llm.gateway import LLMMessage, get_gateway
 from tune.core.metadata.sample_inference import _detect_read_number
 from tune.core.models import AnalysisJob, Experiment, FileRun, KnownPath
+from tune.core.registry.steps import SlotDefinition
 from tune.core.resources.graph_builder import ResourceGraphBuilder
 from tune.core.resources.models import (
     ReadinessIssue,
@@ -231,15 +233,33 @@ class ResourceClarificationService:
         project_id: str,
         issues: list[ReadinessIssue],
         db: AsyncSession | None = None,
+        *,
+        job_id: str | None = None,
     ) -> list[ReadinessIssue]:
         """Enrich issues with any DB-backed dialogue payload before prompting users."""
         if not project_id or not issues:
             return issues
         try:
             if db is not None:
-                return await self._enrich_link_experiment_issues(project_id, issues, db)
+                ctx = await PlannerContextBuilder(db).build(ContextScope(project_id=project_id))
+                issues = await self._enrich_link_experiment_issues(project_id, issues, db, ctx=ctx)
+                return await self._enrich_semantic_resource_issues(
+                    project_id,
+                    issues,
+                    db,
+                    ctx=ctx,
+                    job_id=job_id,
+                )
             async with get_session_factory()() as session:
-                return await self._enrich_link_experiment_issues(project_id, issues, session)
+                ctx = await PlannerContextBuilder(session).build(ContextScope(project_id=project_id))
+                issues = await self._enrich_link_experiment_issues(project_id, issues, session, ctx=ctx)
+                return await self._enrich_semantic_resource_issues(
+                    project_id,
+                    issues,
+                    session,
+                    ctx=ctx,
+                    job_id=job_id,
+                )
         except Exception:
             log.exception(
                 "ResourceClarificationService: failed to prepare clarification issues for project %s",
@@ -319,6 +339,8 @@ class ResourceClarificationService:
         project_id: str,
         issues: list[ReadinessIssue],
         db: AsyncSession,
+        *,
+        ctx=None,
     ) -> list[ReadinessIssue]:
         read_link_issues = [
             issue
@@ -329,7 +351,7 @@ class ResourceClarificationService:
         if not read_link_issues:
             return issues
 
-        ctx = await PlannerContextBuilder(db).build(ContextScope(project_id=project_id))
+        ctx = ctx or await PlannerContextBuilder(db).build(ContextScope(project_id=project_id))
         sample_by_id = {sample.id: sample for sample in ctx.samples}
         file_by_id = {file_info.id: file_info for file_info in ctx.files}
         experiment_candidates = [
@@ -397,6 +419,78 @@ class ResourceClarificationService:
                 )
         return issues
 
+    async def _enrich_semantic_resource_issues(
+        self,
+        project_id: str,
+        issues: list[ReadinessIssue],
+        db: AsyncSession,
+        *,
+        ctx=None,
+        job_id: str | None = None,
+    ) -> list[ReadinessIssue]:
+        issue_binding_keys = {
+            issue.id: await _resolve_issue_binding_key(issue, job_id=job_id, db=db)
+            for issue in issues
+        }
+        semantic_issues = [issue for issue in issues if issue_binding_keys.get(issue.id) is not None]
+        if not semantic_issues:
+            return issues
+
+        ctx = ctx or await PlannerContextBuilder(db).build(ContextScope(project_id=project_id))
+        project_files = _planner_context_project_files(ctx)
+        kp_bindings = _planner_context_known_path_bindings(ctx)
+
+        for issue in semantic_issues:
+            binding_key = issue_binding_keys.get(issue.id)
+            slot = _binding_key_to_clarification_slot(binding_key)
+            if not binding_key or slot is None:
+                continue
+
+            candidates = await retrieve_semantic_candidates(
+                job_id="",
+                dep_keys=[],
+                slot=slot,
+                project_id=project_id,
+                project_files=project_files,
+                kp_bindings=kp_bindings,
+                db=db,
+            )
+            if not candidates:
+                continue
+
+            issue.candidates = [
+                _resource_candidate_from_semantic_candidate(candidate)
+                for candidate in candidates[:6]
+            ]
+            if issue.resolution_type in {None, "provide_path"}:
+                issue.resolution_type = "select_candidate"
+            setattr(issue, "binding_key", binding_key)
+
+            details = dict(issue.details or {})
+            details["semantic_candidates"] = [
+                {
+                    "path": candidate.get("file_path"),
+                    "source_type": candidate.get("source_type"),
+                    "score": candidate.get("score"),
+                    "organism": candidate.get("organism"),
+                    "genome_build": candidate.get("genome_build"),
+                }
+                for candidate in candidates[:6]
+            ]
+            issue.details = details
+
+            if issue.kind in {
+                "missing_reference",
+                "missing_annotation",
+                "missing_index",
+                "missing_input_slot",
+                "missing_concrete_path",
+            }:
+                issue.suggestion = (
+                    "Select one of the detected candidates, or provide a different valid path."
+                )
+        return issues
+
     async def start(
         self,
         issues: list[ReadinessIssue],
@@ -409,7 +503,7 @@ class ResourceClarificationService:
         """Activate resource_clarification state in all project WS sessions
         and stream the first issue prompt.
         """
-        issues = await self.prepare_issues_for_dialogue(project_id, issues)
+        issues = await self.prepare_issues_for_dialogue(project_id, issues, job_id=job_id)
         # Activate state in all sessions
         issues_data = [_issue_to_dict(i) for i in issues]
         for state in session_states:
@@ -451,7 +545,7 @@ class ResourceClarificationService:
         issues: list[ReadinessIssue] = [
             _dict_to_issue(d) for d in raw_issues if isinstance(d, dict)
         ]
-        issues = await self.prepare_issues_for_dialogue(project_id, issues, db)
+        issues = await self.prepare_issues_for_dialogue(project_id, issues, db, job_id=job_id)
         blocking = [i for i in issues if i.severity == "blocking"]
 
         if not blocking:
@@ -510,7 +604,7 @@ class ResourceClarificationService:
             and current_issue.resolution_type == "link_experiment"
         ):
             issue_resolved, response_chunks = await self._handle_link_experiment(
-                action, current_issue, db, lang
+                action, current_issue, project_id, db, lang
             )
         else:
             # Unknown/failed extraction — re-present the issue
@@ -536,7 +630,7 @@ class ResourceClarificationService:
             if recomputed is not None
             else [i for i in issues if i.id != current_issue.id and i.severity == "blocking"]
         )
-        remaining = await self.prepare_issues_for_dialogue(project_id, remaining, db)
+        remaining = await self.prepare_issues_for_dialogue(project_id, remaining, db, job_id=job_id)
 
         if remaining:
             # Update session state with remaining issues and prompt next
@@ -597,6 +691,15 @@ class ResourceClarificationService:
         kp_key = getattr(issue, "binding_key", None) or _issue_kind_to_kp_key(issue.kind)
         if kp_key and candidate.path:
             await _upsert_known_path(project_id, kp_key, candidate.path, db)
+            await _queue_resource_clarification_memory(
+                db,
+                project_id=project_id,
+                issue=issue,
+                resolution=(
+                    f"User selected candidate path '{candidate.path}' for binding_key={kp_key}; "
+                    f"source_type={candidate.source_type or 'unknown'}"
+                ),
+            )
         return True, [{"type": "token", "content": f"✓ Selected: `{candidate.path}`"}]
 
     async def _handle_provide_path(
@@ -623,6 +726,12 @@ class ResourceClarificationService:
 
         if kp_key:
             await _upsert_known_path(project_id, kp_key, path, db)
+            await _queue_resource_clarification_memory(
+                db,
+                project_id=project_id,
+                issue=issue,
+                resolution=f"User provided path '{path}' for binding_key={kp_key}.",
+            )
         return True, [{"type": "token", "content": f"✓ Registered: `{path}`"}]
 
     async def _handle_confirm_auto_build(
@@ -656,6 +765,7 @@ class ResourceClarificationService:
         self,
         action: dict,
         issue: ReadinessIssue,
+        project_id: str,
         db: AsyncSession,
         lang: str = "en",
     ) -> tuple[bool, list[dict]]:
@@ -757,6 +867,15 @@ class ResourceClarificationService:
             read_number=read_number,
             filename=file_info.get("filename"),
             db=db,
+        )
+        await _queue_resource_clarification_memory(
+            db,
+            project_id=project_id,
+            issue=issue,
+            resolution=(
+                f"Linked file_id={file_info.get('file_id')} to experiment_id={experiment['experiment_id']}; "
+                f"read_number={read_number if read_number is not None else 'single'}"
+            ),
         )
 
         read_label = "single-end" if read_number is None else f"R{read_number}"
@@ -985,6 +1104,187 @@ def _issue_kind_to_kp_key(kind: str) -> str | None:
     return _ISSUE_KIND_TO_KNOWN_PATH_KEY.get(kind)
 
 
+def _issue_binding_key(issue: ReadinessIssue) -> str | None:
+    return getattr(issue, "binding_key", None) or _issue_kind_to_kp_key(issue.kind)
+
+
+async def _resolve_issue_binding_key(
+    issue: ReadinessIssue,
+    *,
+    job_id: str | None,
+    db: AsyncSession,
+) -> str | None:
+    binding_key = _issue_binding_key(issue)
+    if binding_key is not None:
+        return binding_key
+    if issue.kind not in {"missing_index", "ambiguous_index"} or not job_id:
+        return None
+    inferred = await _infer_index_binding_key_from_job_plan(
+        job_id=job_id,
+        step_keys=issue.affected_step_keys or [],
+        db=db,
+    )
+    if inferred:
+        setattr(issue, "binding_key", inferred)
+    return inferred
+
+
+async def _infer_index_binding_key_from_job_plan(
+    *,
+    job_id: str,
+    step_keys: list[str],
+    db: AsyncSession,
+) -> str | None:
+    job = (
+        await db.execute(select(AnalysisJob).where(AnalysisJob.id == job_id))
+    ).scalar_one_or_none()
+    if job is None:
+        return None
+    raw_plan = job.resolved_plan_json or job.plan_draft_json or job.plan or []
+    if isinstance(raw_plan, dict):
+        plan = raw_plan.get("steps") or []
+    elif isinstance(raw_plan, list):
+        plan = raw_plan
+    else:
+        plan = []
+
+    binding_keys: set[str] = set()
+    for step in plan:
+        if not isinstance(step, dict):
+            continue
+        if step_keys and step.get("step_key") not in step_keys:
+            continue
+        step_type = str(step.get("step_type") or "")
+        binding_key = _index_binding_key_for_step_type(step_type)
+        if binding_key:
+            binding_keys.add(binding_key)
+    if len(binding_keys) == 1:
+        return next(iter(binding_keys))
+    return None
+
+
+def _index_binding_key_for_step_type(step_type: str) -> str | None:
+    mapping = {
+        "align.hisat2": "hisat2_index",
+        "align.star": "star_genome_dir",
+        "align.bwa": "bwa_index",
+        "align.bowtie2": "bowtie2_index",
+    }
+    return mapping.get(step_type)
+
+
+def _binding_key_to_clarification_slot(binding_key: str | None) -> SlotDefinition | None:
+    if binding_key == "reference_fasta":
+        return SlotDefinition(
+            "reference_fasta",
+            "Reference FASTA",
+            ["fa", "fasta", "fna", "fa.gz", "fasta.gz"],
+            accepted_roles=["reference_fasta"],
+        )
+    if binding_key == "annotation_gtf":
+        return SlotDefinition(
+            "annotation_gtf",
+            "Annotation GTF/GFF",
+            ["gtf", "gff", "gff3", "gtf.gz", "gff.gz", "gff3.gz"],
+            accepted_roles=["annotation_gtf"],
+        )
+    if binding_key in {"hisat2_index", "bwa_index", "bowtie2_index"}:
+        return SlotDefinition(
+            "index_prefix",
+            "Aligner index prefix",
+            ["*"],
+            accepted_roles=[binding_key],
+        )
+    if binding_key == "star_genome_dir":
+        return SlotDefinition(
+            "genome_dir",
+            "STAR genome directory",
+            ["*"],
+            accepted_roles=["star_genome_dir"],
+        )
+    return None
+
+
+def _planner_context_project_files(ctx) -> list[dict]:
+    sample_by_id = {sample.id: sample for sample in getattr(ctx, "samples", [])}
+    project_files = []
+    for file_info in getattr(ctx, "files", []):
+        sample_id = getattr(file_info, "linked_sample_id", None)
+        sample = sample_by_id.get(sample_id)
+        project_files.append(
+            {
+                "id": file_info.id,
+                "path": file_info.path,
+                "filename": file_info.filename,
+                "file_type": file_info.file_type,
+                "linked_sample_id": sample_id,
+                "linked_experiment_id": getattr(file_info, "linked_experiment_id", None),
+                "sample_name": getattr(sample, "sample_name", None) if sample is not None else None,
+                "read_number": getattr(file_info, "read_number", None),
+            }
+        )
+    return project_files
+
+
+def _planner_context_known_path_bindings(ctx) -> dict[str, str]:
+    project = getattr(ctx, "project", None)
+    if project is None:
+        return {}
+    return {
+        item.get("key"): item.get("path")
+        for item in (getattr(project, "known_paths", None) or [])
+        if item.get("key") and item.get("path")
+    }
+
+
+def _resource_candidate_from_semantic_candidate(candidate: dict) -> ResourceCandidate:
+    return ResourceCandidate(
+        path=candidate.get("file_path", ""),
+        organism=candidate.get("organism"),
+        genome_build=candidate.get("genome_build"),
+        source_type=candidate.get("source_type"),
+        confidence=max(min(float(candidate.get("score", 0)) / 100.0, 1.0), 0.0),
+    )
+
+
+async def _queue_resource_clarification_memory(
+    db: AsyncSession,
+    *,
+    project_id: str,
+    issue: ReadinessIssue,
+    resolution: str,
+) -> None:
+    if not project_id:
+        return
+    try:
+        from tune.core.memory.project_memory import queue_execution_event
+
+        await queue_execution_event(
+            db,
+            project_id=project_id,
+            event_type="resource_clarification_resolved",
+            description=(
+                f"Resolved clarification issue '{issue.kind}'"
+                f" ({issue.title or issue.description or 'resource clarification'})."
+            ),
+            resolution=resolution,
+            user_contributed=True,
+            metadata_json={
+                "issue_id": issue.id,
+                "issue_kind": issue.kind,
+                "issue_title": issue.title,
+                "affected_step_keys": list(issue.affected_step_keys or []),
+                "resolution_type": issue.resolution_type,
+            },
+        )
+    except Exception:
+        log.debug(
+            "ResourceClarificationService: failed to queue project memory event for project %s",
+            project_id,
+            exc_info=True,
+        )
+
+
 def _issue_to_dict(issue: ReadinessIssue) -> dict:
     data = {
         "id": issue.id,
@@ -1058,6 +1358,11 @@ def normalize_resource_clarification_payload(
     *,
     language: str = "en",
 ) -> dict | None:
+    from tune.core.decision_packet import (
+        attach_decision_packet,
+        build_resource_clarification_decision_packet,
+    )
+
     if not payload:
         return None
     issues = payload.get("issues") or []
@@ -1070,4 +1375,13 @@ def normalize_resource_clarification_payload(
             _dict_to_issue(normalized["issues"][0]),
             language=language,
         )
-    return normalized
+    return attach_decision_packet(
+        normalized,
+        build_resource_clarification_decision_packet(
+            issues=normalized["issues"],
+            job_id=str(normalized.get("job_id") or ""),
+            project_id=str(normalized.get("project_id") or ""),
+            context_id=str(normalized.get("context_id") or ""),
+            language=language,
+        ),
+    )

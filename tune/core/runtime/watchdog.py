@@ -121,6 +121,14 @@ async def _record_watchdog_auto_resolution(
                 f"pending_types={pending_types or 'request'}"
             ),
             user_contributed=False,
+            thread_id=getattr(job, "thread_id", None),
+            job_id=getattr(job, "id", None),
+            step_id=getattr(job, "current_step_id", None),
+            metadata_json={
+                "issue_kind": issue_kind,
+                "source": "watchdog",
+                "pending_types": pending_types or "request",
+            },
         )
     except Exception:
         log.exception(

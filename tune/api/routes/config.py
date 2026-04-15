@@ -24,6 +24,7 @@ async def get_config_endpoint():
         "port": cfg.port,
         "active_llm_config_id": cfg.active_llm_config_id,
         "auto_authorize_commands": cfg.auto_authorize_commands,
+        "developer_show_llm_io_in_chat": cfg.developer_show_llm_io_in_chat,
     }
 
 
@@ -33,6 +34,7 @@ class ConfigUpdate(BaseModel):
     analysis_dir: str | None = None
     pixi_path: str | None = None
     auto_authorize_commands: bool | None = None
+    developer_show_llm_io_in_chat: bool | None = None
 
 
 @router.put("/")
@@ -86,6 +88,11 @@ async def update_config(body: ConfigUpdate):
             body.auto_authorize_commands
             if body.auto_authorize_commands is not None
             else cfg.auto_authorize_commands
+        ),
+        developer_show_llm_io_in_chat=(
+            body.developer_show_llm_io_in_chat
+            if body.developer_show_llm_io_in_chat is not None
+            else cfg.developer_show_llm_io_in_chat
         ),
     )
 

@@ -11,6 +11,7 @@ interface Config {
   pixi_path: string
   active_llm_config_id: string | null
   auto_authorize_commands: boolean
+  developer_show_llm_io_in_chat: boolean
 }
 
 interface UserProfile {
@@ -101,6 +102,7 @@ export default function SettingsPage() {
   const [pixiPath, setPixiPath] = useState('')
   const [activeConfigId, setActiveConfigId] = useState<string | null>(null)
   const [autoAuthorizeCommands, setAutoAuthorizeCommands] = useState(false)
+  const [developerShowLlmIoInChat, setDeveloperShowLlmIoInChat] = useState(false)
 
   const [workspaceState, setWorkspaceState] = useState<SaveState>('idle')
   const [profileState, setProfileState] = useState<SaveState>('idle')
@@ -123,6 +125,7 @@ export default function SettingsPage() {
         setPixiPath(cfg.pixi_path)
         setActiveConfigId(cfg.active_llm_config_id)
         setAutoAuthorizeCommands(Boolean(cfg.auto_authorize_commands))
+        setDeveloperShowLlmIoInChat(Boolean(cfg.developer_show_llm_io_in_chat))
       })
       .catch(() => {})
 
@@ -182,11 +185,22 @@ export default function SettingsPage() {
       const res = await fetch('/api/config/', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ auto_authorize_commands: autoAuthorizeCommands }),
+        body: JSON.stringify({
+          auto_authorize_commands: autoAuthorizeCommands,
+          developer_show_llm_io_in_chat: developerShowLlmIoInChat,
+        }),
       }).then((r) => r.json())
       if (res.ok) {
         setExecutionState('saved')
-        setConfig((prev) => (prev ? { ...prev, auto_authorize_commands: autoAuthorizeCommands } : prev))
+        setConfig((prev) => (
+          prev
+            ? {
+                ...prev,
+                auto_authorize_commands: autoAuthorizeCommands,
+                developer_show_llm_io_in_chat: developerShowLlmIoInChat,
+              }
+            : prev
+        ))
         setTimeout(() => setExecutionState('idle'), 2000)
       } else {
         setExecutionState('error')
@@ -343,6 +357,22 @@ export default function SettingsPage() {
             </div>
             <div className="mt-1 text-xs text-text-muted">
               {t('settings_auto_authorize_commands_hint')}
+            </div>
+          </div>
+        </label>
+        <label className="flex items-start gap-3 rounded-lg border border-border-subtle bg-surface-overlay px-4 py-3">
+          <input
+            type="checkbox"
+            checked={developerShowLlmIoInChat}
+            onChange={(e) => setDeveloperShowLlmIoInChat(e.target.checked)}
+            className="mt-0.5 h-4 w-4 rounded border-border-subtle bg-surface-base text-accent focus:ring-accent"
+          />
+          <div>
+            <div className="text-sm font-medium text-text-primary">
+              {t('settings_developer_show_llm_io_in_chat')}
+            </div>
+            <div className="mt-1 text-xs text-text-muted">
+              {t('settings_developer_show_llm_io_in_chat_hint')}
             </div>
           </div>
         </label>

@@ -9,6 +9,7 @@ export function useWebSocket(threadId: string | null = null) {
   const [connected, setConnected] = useState(false)
   const listeners = useRef<Set<(msg: WSMessage) => void>>(new Set())
   const threadIdRef = useRef(threadId)
+  const socketThreadIdRef = useRef<string | null>(threadId)
 
   // Build the WS URL with optional thread_id param
   const buildUrl = (tid: string | null) =>
@@ -16,6 +17,7 @@ export function useWebSocket(threadId: string | null = null) {
 
   const connect = useCallback((tid: string | null) => {
     ws.current?.close()
+    socketThreadIdRef.current = tid
     const url = buildUrl(tid)
     const socket = new WebSocket(url)
     socket.onopen = () => setConnected(true)
@@ -31,6 +33,12 @@ export function useWebSocket(threadId: string | null = null) {
     socket.onmessage = (e) => {
       try {
         const msg = JSON.parse(e.data) as WSMessage
+        if (msg.type === 'thread_bound') {
+          const boundThread = msg.thread as { id?: unknown } | undefined
+          if (typeof boundThread?.id === 'string' && boundThread.id.length > 0) {
+            socketThreadIdRef.current = boundThread.id
+          }
+        }
         listeners.current.forEach((fn) => fn(msg))
       } catch {}
     }
@@ -40,7 +48,16 @@ export function useWebSocket(threadId: string | null = null) {
   // Connect / reconnect when threadId changes
   useEffect(() => {
     threadIdRef.current = threadId
-    connect(threadId)
+    const socket = ws.current
+    if (!socket) {
+      connect(threadId)
+      return () => { ws.current?.close() }
+    }
+
+    if (socketThreadIdRef.current !== threadId) {
+      connect(threadId)
+    }
+
     return () => { ws.current?.close() }
   }, [threadId, connect])
 
